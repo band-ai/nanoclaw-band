@@ -72,12 +72,19 @@ async function main(): Promise<void> {
   const __dirname = path.dirname(fileURLToPath(import.meta.url));
   const mcpServerPath = path.join(__dirname, 'mcp-tools', 'index.ts');
 
-  // Build MCP servers config: nanoclaw built-in + any from container.json
+  const mcpEnv = Object.fromEntries(
+    Object.entries(process.env).filter((entry): entry is [string, string] => typeof entry[1] === 'string'),
+  );
+
+  // Build MCP servers config: nanoclaw built-in + any from container.json.
+  // The built-in server is a subprocess of the provider, so it needs the same
+  // container env as the runner for channel-provided tools (Band/Thenvoi, etc.)
+  // to register and for OneCLI proxy variables to reach SDK REST calls.
   const mcpServers: Record<string, { command: string; args: string[]; env: Record<string, string> }> = {
     nanoclaw: {
       command: 'bun',
       args: ['run', mcpServerPath],
-      env: {},
+      env: mcpEnv,
     },
   };
 

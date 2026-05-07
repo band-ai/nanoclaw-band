@@ -22,6 +22,8 @@ function envBool(name: keyof typeof envConfig, fallback = false): boolean {
 
 export type ThenvoiContactStrategy = 'disabled' | 'callback' | 'hub_room';
 
+export const DEFAULT_THENVOI_BASE_URL = 'https://app.thenvoi.com';
+
 export interface ThenvoiConfig {
   agentId: string;
   apiKey: string;
@@ -35,8 +37,8 @@ export interface ThenvoiConfig {
 export function getThenvoiConfig(): ThenvoiConfig | null {
   const agentId = env('THENVOI_AGENT_ID');
   const apiKey = env('THENVOI_API_KEY');
-  const baseUrl = env('THENVOI_BASE_URL');
-  if (!agentId || !apiKey || !baseUrl) return null;
+  const baseUrl = env('THENVOI_BASE_URL') || DEFAULT_THENVOI_BASE_URL;
+  if (!agentId || !apiKey) return null;
 
   const contactStrategy = env('THENVOI_CONTACT_STRATEGY') ?? 'disabled';
   if (contactStrategy !== 'disabled' && contactStrategy !== 'callback' && contactStrategy !== 'hub_room') {

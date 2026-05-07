@@ -1,4 +1,5 @@
 import { ThenvoiLink, type PlatformEvent } from '@thenvoi/sdk';
+import { ThenvoiClient } from '@thenvoi/rest-client';
 
 import type { ChannelAdapter, ChannelSetup, ConversationInfo, InboundRouteResult, OutboundMessage } from './adapter.js';
 import { registerChannelContainerConfig } from './channel-container-registry.js';
@@ -73,15 +74,19 @@ class ThenvoiChannelAdapter implements ChannelAdapter {
   private stopController: AbortController | null = null;
   private eventLoop: Promise<void> | null = null;
   private readonly link: ThenvoiLink;
+  private readonly restClient: ThenvoiClient;
+  private ownerMention: { id: string; name?: string } | null = null;
 
   public constructor(private readonly config: ThenvoiConfig) {
     const wsUrl = wsUrlFromBaseUrl(config.baseUrl);
+    const restUrl = restUrlFromWsUrl(wsUrl);
     this.link = new ThenvoiLink({
       agentId: config.agentId,
       apiKey: config.apiKey,
       wsUrl,
-      restUrl: restUrlFromWsUrl(wsUrl),
+      restUrl,
     });
+    this.restClient = new ThenvoiClient({ apiKey: config.apiKey, baseUrl: restUrl });
   }
 
   public async setup(config: ChannelSetup): Promise<void> {
@@ -131,13 +136,26 @@ class ThenvoiChannelAdapter implements ChannelAdapter {
           ? (message.content as { text: string }).text
           : JSON.stringify(message.content);
 
-    const result = await this.link.rest.createChatMessage(roomId, {
-      content: text,
-      messageType: 'text',
-      metadata: { source: 'nanoclaw_fallback' },
+    const mention = await this.getOwnerMention();
+    const result = await this.restClient.agentApiMessages.createAgentChatMessage(roomId, {
+      message: {
+        content: text,
+        mentions: [mention],
+      },
     });
 
-    return typeof result.id === 'string' ? result.id : undefined;
+    const data = (result as { data?: { id?: unknown } }).data;
+    return typeof data?.id === 'string' ? data.id : undefined;
+  }
+
+  private async getOwnerMention(): Promise<{ id: string; name?: string }> {
+    if (this.ownerMention) return this.ownerMention;
+    const response = await this.restClient.agentApiIdentity.getAgentMe();
+    const data = (response as { data?: { owner_uuid?: unknown; ownerUuid?: unknown } }).data;
+    const ownerId = typeof data?.owner_uuid === 'string' ? data.owner_uuid : typeof data?.ownerUuid === 'string' ? data.ownerUuid : null;
+    if (!ownerId) throw new Error('Band.ai owner identity unavailable for fallback delivery');
+    this.ownerMention = { id: ownerId, name: 'Owner' };
+    return this.ownerMention;
   }
 
   public async syncConversations(): Promise<ConversationInfo[]> {
@@ -168,9 +186,16 @@ class ThenvoiChannelAdapter implements ChannelAdapter {
       if (!signal.aborted) log.warn('Band.ai websocket loop stopped', { err });
     });
 
-    for await (const event of this.link) {
-      if (signal.aborted) return;
-      await this.handleEvent(event);
+    const iterator = this.link[Symbol.asyncIterator]();
+    while (!signal.aborted) {
+      const next = await Promise.race([
+        iterator.next(),
+        new Promise<IteratorResult<PlatformEvent>>((resolve) => {
+          signal.addEventListener('abort', () => resolve({ done: true, value: undefined }), { once: true });
+        }),
+      ]);
+      if (next.done || signal.aborted) return;
+      await this.handleEvent(next.value);
     }
   }
 
@@ -252,7 +277,7 @@ class ThenvoiChannelAdapter implements ChannelAdapter {
   }
 }
 
-registerChannelContainerConfig(THENVOI_CHANNEL_TYPE, ({ messagingGroup }) => {
+registerChannelContainerConfig(THENVOI_CHANNEL_TYPE, ({ messagingGroup, hostEnv }) => {
   const config = getThenvoiConfig();
   if (!config || !messagingGroup) return {};
 
@@ -267,7 +292,7 @@ registerChannelContainerConfig(THENVOI_CHANNEL_TYPE, ({ messagingGroup }) => {
     THENVOI_CONTACT_STRATEGY: config.contactStrategy,
   };
 
-  if (shouldInjectDirectApiKey(config.baseUrl)) {
+  if (shouldInjectDirectApiKey(config.baseUrl) || hostEnv.THENVOI_INJECT_API_KEY === 'true') {
     env.THENVOI_API_KEY = config.apiKey;
   }
 

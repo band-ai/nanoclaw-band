@@ -74,6 +74,28 @@ interface SDKUserMessage {
   session_id: string;
 }
 
+interface SDKToolUseContent {
+  type: 'tool_use';
+  name?: string;
+}
+
+function userVisibleToolNames(message: unknown): string[] {
+  if (!message || typeof message !== 'object') return [];
+  const content = (message as { message?: { content?: unknown } }).message?.content;
+  if (!Array.isArray(content)) return [];
+
+  return content.flatMap((part): string[] => {
+    if (!part || typeof part !== 'object') return [];
+    const item = part as SDKToolUseContent;
+    if (item.type !== 'tool_use' || typeof item.name !== 'string') return [];
+    return isUserVisibleToolName(item.name) ? [item.name] : [];
+  });
+}
+
+function isUserVisibleToolName(name: string): boolean {
+  return name === 'mcp__nanoclaw__send_message' || name === 'mcp__nanoclaw__band_send_message';
+}
+
 /**
  * Push-based async iterable for streaming user messages to the Claude SDK.
  */
@@ -285,7 +307,7 @@ export class ClaudeProvider implements AgentProvider {
         cwd: input.cwd,
         additionalDirectories: this.additionalDirectories,
         resume: input.continuation,
-        pathToClaudeCodeExecutable: '/pnpm/claude',
+        pathToClaudeCodeExecutable: '/pnpm/bin/claude',
         systemPrompt: instructions ? { type: 'preset' as const, preset: 'claude_code' as const, append: instructions } : undefined,
         allowedTools: [
           ...TOOL_ALLOWLIST,
@@ -319,6 +341,10 @@ export class ClaudeProvider implements AgentProvider {
 
         if (message.type === 'system' && message.subtype === 'init') {
           yield { type: 'init', continuation: message.session_id };
+        } else if (message.type === 'assistant') {
+          for (const name of userVisibleToolNames(message)) {
+            yield { type: 'user_visible_tool', name };
+          }
         } else if (message.type === 'result') {
           const text = 'result' in message ? (message as { result?: string }).result ?? null : null;
           yield { type: 'result', text };

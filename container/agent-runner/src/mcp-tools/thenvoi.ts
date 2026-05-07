@@ -35,13 +35,21 @@ function memoryToolsEnabled(): boolean {
 
 let cachedTools: AgentToolsProtocol | null = null;
 
+function apiKey(): string {
+  return env('THENVOI_API_KEY') ?? env('ONECLI_API_KEY') ?? '';
+}
+
+function restUrl(): string | undefined {
+  return env('THENVOI_REST_URL');
+}
+
 function sdkTools(): AgentToolsProtocol {
   if (cachedTools) return cachedTools;
 
   const link = new ThenvoiLink({
     agentId: env('THENVOI_AGENT_ID')!,
-    apiKey: env('THENVOI_API_KEY') ?? env('ONECLI_API_KEY') ?? '',
-    restUrl: env('THENVOI_REST_URL'),
+    apiKey: apiKey(),
+    restUrl: restUrl(),
   });
   cachedTools = new AgentTools({
     roomId: roomId(),

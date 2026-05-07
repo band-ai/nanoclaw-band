@@ -182,7 +182,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
     // can stamp it on outbound rows — needed for a2a return-path routing.
     setCurrentInReplyTo(routing.inReplyTo);
     try {
-      const result = await processQuery(query, routing, processingIds, config.providerName);
+      const result = await processQuery(query, routing, processingIds, config.providerName, signal);
       if (result.continuation && result.continuation !== continuation) {
         continuation = result.continuation;
         setContinuation(config.providerName, continuation);
@@ -263,9 +263,13 @@ async function processQuery(
   routing: RoutingContext,
   initialBatchIds: string[],
   providerName: string,
+  signal?: AbortSignal,
 ): Promise<QueryResult> {
   let queryContinuation: string | undefined;
+  let userVisibleToolUsed = false;
   let done = false;
+  const abortQuery = () => query.abort();
+  signal?.addEventListener('abort', abortQuery, { once: true });
 
   // Concurrent polling: push follow-ups into the active query as they arrive.
   // We do NOT force-end the stream on silence — keeping the query open avoids
@@ -368,16 +372,23 @@ async function processQuery(
         // effectively orphaned and the next message started a blank
         // Claude session with no prior context.
         setContinuation(providerName, event.continuation);
+      } else if (event.type === 'user_visible_tool') {
+        userVisibleToolUsed = true;
       } else if (event.type === 'result') {
         // A result — with or without text — means the turn is done. Mark
         // the initial batch completed now so the host sweep doesn't see
         // stale 'processing' claims while the query stays open for
-        // follow-up pushes. The agent may have responded via MCP
-        // (send_message) mid-turn, or the message may not need a response
-        // at all — either way the turn is finished.
+        // follow-up pushes. If the agent already sent a user-visible MCP
+        // message, the SDK's final text is usually a terse tool result
+        // summary (for example "Sent.") and must not be delivered again by
+        // the fallback path.
         markCompleted(initialBatchIds);
         if (event.text) {
-          dispatchResultText(event.text, routing);
+          if (userVisibleToolUsed) {
+            log(`[tool-result] ${event.text.slice(0, 200)}`);
+          } else {
+            dispatchResultText(event.text, routing);
+          }
         }
       } else if (event.type === 'compacted') {
         // The SDK auto-compacted the conversation. After compaction the
@@ -400,6 +411,7 @@ async function processQuery(
     }
   } finally {
     done = true;
+    signal?.removeEventListener('abort', abortQuery);
     clearInterval(pollHandle);
   }
 
@@ -424,6 +436,9 @@ function handleEvent(event: ProviderEvent, _routing: RoutingContext): void {
       break;
     case 'compacted':
       log(`Compacted: ${event.text}`);
+      break;
+    case 'user_visible_tool':
+      log(`User-visible tool: ${event.name}`);
       break;
   }
 }

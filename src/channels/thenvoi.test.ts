@@ -10,7 +10,21 @@ interface QueuedEvent {
 }
 
 const fakeLinks: FakeThenvoiLink[] = [];
+const fakeRestClients: FakeThenvoiClient[] = [];
 let closeTestDb: (() => void) | null = null;
+
+class FakeThenvoiClient {
+  public readonly agentApiIdentity = {
+    getAgentMe: vi.fn(async () => ({ data: { owner_uuid: 'owner-1' } })),
+  };
+  public readonly agentApiMessages = {
+    createAgentChatMessage: vi.fn(async () => ({ data: { id: 'platform-out-1' } })),
+  };
+
+  public constructor() {
+    fakeRestClients.push(this);
+  }
+}
 
 class FakeThenvoiLink implements AsyncIterable<QueuedEvent> {
   public readonly rest = {
@@ -58,6 +72,10 @@ vi.mock('@thenvoi/sdk', () => ({
   ThenvoiLink: FakeThenvoiLink,
 }));
 
+vi.mock('@thenvoi/rest-client', () => ({
+  ThenvoiClient: FakeThenvoiClient,
+}));
+
 function setThenvoiEnv(): void {
   process.env.THENVOI_AGENT_ID = 'agent-1';
   process.env.THENVOI_API_KEY = 'secret';
@@ -72,6 +90,7 @@ function clearThenvoiEnv(): void {
   delete process.env.THENVOI_MEMORY_LOAD_ON_START;
   delete process.env.THENVOI_MEMORY_CONSOLIDATION;
   delete process.env.THENVOI_CONTACT_STRATEGY;
+  delete process.env.THENVOI_INJECT_API_KEY;
 }
 
 async function waitFor(predicate: () => boolean): Promise<void> {
@@ -86,6 +105,7 @@ describe('thenvoi channel adapter', () => {
   beforeEach(async () => {
     vi.resetModules();
     fakeLinks.length = 0;
+    fakeRestClients.length = 0;
     clearThenvoiEnv();
     const { closeDb, initTestDb, runMigrations } = await import('../db/index.js');
     const db = initTestDb();
@@ -190,10 +210,11 @@ describe('thenvoi channel adapter', () => {
     await expect(
       adapter!.deliver('thenvoi:room-1', null, { kind: 'chat', content: { text: 'hello from agent' } }),
     ).resolves.toBe('platform-out-1');
-    expect(fakeLinks[0].rest.createChatMessage).toHaveBeenCalledWith('room-1', {
-      content: 'hello from agent',
-      messageType: 'text',
-      metadata: { source: 'nanoclaw_fallback' },
+    expect(fakeRestClients[0].agentApiMessages.createAgentChatMessage).toHaveBeenCalledWith('room-1', {
+      message: {
+        content: 'hello from agent',
+        mentions: [{ id: 'owner-1', name: 'Owner' }],
+      },
     });
   });
 
@@ -243,6 +264,41 @@ describe('thenvoi channel adapter', () => {
       }),
     );
     expect(config.env).not.toHaveProperty('THENVOI_API_KEY');
+  });
+
+  it('injects direct Band API key for explicit live validation override', async () => {
+    setThenvoiEnv();
+    process.env.THENVOI_INJECT_API_KEY = 'true';
+    await import('./thenvoi.js');
+    const { getChannelContainerConfig } = await import('./channel-container-registry.js');
+
+    const config = await getChannelContainerConfig('thenvoi')!({
+      session: {
+        id: 'sess-1',
+        agent_group_id: 'ag-1',
+        messaging_group_id: 'mg-1',
+        thread_id: null,
+        agent_provider: null,
+        status: 'active',
+        container_status: 'idle',
+        last_active: null,
+        created_at: new Date().toISOString(),
+      },
+      messagingGroup: {
+        id: 'mg-1',
+        channel_type: 'thenvoi',
+        platform_id: 'thenvoi:room-1',
+        name: 'Room 1',
+        is_group: 1,
+        unknown_sender_policy: 'public',
+        denied_at: null,
+        created_at: new Date().toISOString(),
+      },
+      agentGroupId: 'ag-1',
+      hostEnv: process.env,
+    });
+
+    expect(config.env).toHaveProperty('THENVOI_API_KEY', 'secret');
   });
 
   it('injects direct Band API key only for local HTTP sessions', async () => {
