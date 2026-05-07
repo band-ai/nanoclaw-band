@@ -152,7 +152,12 @@ class ThenvoiChannelAdapter implements ChannelAdapter {
     if (this.ownerMention) return this.ownerMention;
     const response = await this.restClient.agentApiIdentity.getAgentMe();
     const data = (response as { data?: { owner_uuid?: unknown; ownerUuid?: unknown } }).data;
-    const ownerId = typeof data?.owner_uuid === 'string' ? data.owner_uuid : typeof data?.ownerUuid === 'string' ? data.ownerUuid : null;
+    const ownerId =
+      typeof data?.owner_uuid === 'string'
+        ? data.owner_uuid
+        : typeof data?.ownerUuid === 'string'
+          ? data.ownerUuid
+          : null;
     if (!ownerId) throw new Error('Band.ai owner identity unavailable for fallback delivery');
     this.ownerMention = { id: ownerId, name: 'Owner' };
     return this.ownerMention;
