@@ -21,9 +21,11 @@ import {
 } from './config.js';
 import { readContainerConfig, writeContainerConfig } from './container-config.js';
 import { CONTAINER_RUNTIME_BIN, hostGatewayArgs, readonlyMountArgs, stopContainer } from './container-runtime.js';
+import { getChannelContainerConfig } from './channels/channel-container-registry.js';
 import { composeGroupClaudeMd } from './claude-md-compose.js';
 import { getAgentGroup } from './db/agent-groups.js';
 import { getDb, hasTable } from './db/connection.js';
+import { getMessagingGroup } from './db/messaging-groups.js';
 import { initGroupFilesystem } from './group-init.js';
 import { stopTypingRefresh } from './modules/typing/index.js';
 import { log } from './log.js';
@@ -127,10 +129,10 @@ async function spawnContainer(session: Session): Promise<void> {
   // Written at spawn time so the runner can read them from the RO mount.
   ensureRuntimeFields(containerConfig, agentGroup);
 
-  // Resolve the effective provider + any host-side contribution it declares
+  // Resolve the effective provider/channel contributions they declare
   // (extra mounts, env passthrough). Computed once and threaded through both
   // buildMounts and buildContainerArgs so side effects (mkdir, etc.) fire once.
-  const { provider, contribution } = resolveProviderContribution(session, agentGroup, containerConfig);
+  const { provider, contribution } = await resolveContainerContribution(session, agentGroup, containerConfig);
 
   const mounts = buildMounts(agentGroup, session, containerConfig, contribution);
   const containerName = `nanoclaw-v2-${agentGroup.folder}-${Date.now()}`;
@@ -222,21 +224,43 @@ export function resolveProviderName(
   return (sessionProvider || agentGroupProvider || containerConfigProvider || 'claude').toLowerCase();
 }
 
-function resolveProviderContribution(
+async function resolveContainerContribution(
   session: Session,
   agentGroup: AgentGroup,
   containerConfig: import('./container-config.js').ContainerConfig,
-): { provider: string; contribution: ProviderContainerContribution } {
+): Promise<{ provider: string; contribution: ProviderContainerContribution }> {
   const provider = resolveProviderName(session.agent_provider, agentGroup.agent_provider, containerConfig.provider);
-  const fn = getProviderContainerConfig(provider);
-  const contribution = fn
-    ? fn({
+  const providerFn = getProviderContainerConfig(provider);
+  const providerContribution = providerFn
+    ? providerFn({
         sessionDir: sessionDir(agentGroup.id, session.id),
         agentGroupId: agentGroup.id,
         hostEnv: process.env,
       })
     : {};
-  return { provider, contribution };
+
+  const messagingGroup = session.messaging_group_id ? getMessagingGroup(session.messaging_group_id) ?? null : null;
+  const channelFn = messagingGroup ? getChannelContainerConfig(messagingGroup.channel_type) : undefined;
+  const channelContribution = channelFn
+    ? await channelFn({
+        session,
+        messagingGroup,
+        agentGroupId: agentGroup.id,
+        hostEnv: process.env,
+      })
+    : {};
+
+  return { provider, contribution: mergeContainerContributions(providerContribution, channelContribution) };
+}
+
+function mergeContainerContributions(
+  providerContribution: ProviderContainerContribution,
+  channelContribution: ProviderContainerContribution,
+): ProviderContainerContribution {
+  return {
+    mounts: [...(providerContribution.mounts ?? []), ...(channelContribution.mounts ?? [])],
+    env: { ...(providerContribution.env ?? {}), ...(channelContribution.env ?? {}) },
+  };
 }
 
 function buildMounts(
