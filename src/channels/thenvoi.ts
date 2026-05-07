@@ -114,17 +114,22 @@ class ThenvoiChannelAdapter implements ChannelAdapter {
     return this.connected;
   }
 
-  public async deliver(platformId: string, _threadId: string | null, message: OutboundMessage): Promise<string | undefined> {
+  public async deliver(
+    platformId: string,
+    _threadId: string | null,
+    message: OutboundMessage,
+  ): Promise<string | undefined> {
     const roomId = parseThenvoiPlatformId(platformId);
     if (message.kind !== 'chat') {
       return undefined;
     }
 
-    const text = typeof message.content === 'string'
-      ? message.content
-      : typeof (message.content as { text?: unknown }).text === 'string'
-        ? (message.content as { text: string }).text
-        : JSON.stringify(message.content);
+    const text =
+      typeof message.content === 'string'
+        ? message.content
+        : typeof (message.content as { text?: unknown }).text === 'string'
+          ? (message.content as { text: string }).text
+          : JSON.stringify(message.content);
 
     const result = await this.link.rest.createChatMessage(roomId, {
       content: text,
@@ -191,17 +196,20 @@ class ThenvoiChannelAdapter implements ChannelAdapter {
     this.setupConfig?.onMetadata(formatThenvoiPlatformId(id), title, isGroup);
   }
 
-  private async handleMessageCreated(roomId: string | null, payload: {
-    id: string;
-    content: string;
-    message_type: string;
-    sender_id: string;
-    sender_type: string;
-    sender_name?: string | null;
-    chat_room_id?: string | null;
-    inserted_at: string;
-    metadata?: Record<string, unknown> | null;
-  }): Promise<void> {
+  private async handleMessageCreated(
+    roomId: string | null,
+    payload: {
+      id: string;
+      content: string;
+      message_type: string;
+      sender_id: string;
+      sender_type: string;
+      sender_name?: string | null;
+      chat_room_id?: string | null;
+      inserted_at: string;
+      metadata?: Record<string, unknown> | null;
+    },
+  ): Promise<void> {
     if (!this.setupConfig) return;
     if (payload.sender_id === this.config.agentId) return;
     if (payload.message_type !== 'text') return;

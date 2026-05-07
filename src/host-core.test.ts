@@ -424,7 +424,11 @@ describe('router', () => {
     expect(rows).toHaveLength(1);
     expect(JSON.parse(rows[0].content).text).toBe('Hello agent!');
 
-    const ledger = getInboundDelivery({ channelType: 'discord', platformId: 'chan-123', platformMessageId: 'msg-in-1' });
+    const ledger = getInboundDelivery({
+      channelType: 'discord',
+      platformId: 'chan-123',
+      platformMessageId: 'msg-in-1',
+    });
     expect(ledger?.status).toBe('persisted');
     expect(JSON.parse(ledger!.session_ids_json!)).toEqual([session!.id]);
 
@@ -454,9 +458,9 @@ describe('router', () => {
     });
     expect(plainResult).toMatchObject({ status: 'dropped', reason: 'no_messaging_group', retryable: true });
     expect(getMessagingGroupByPlatform('slack', 'C-PLAIN')).toBeUndefined();
-    expect(getInboundDelivery({ channelType: 'slack', platformId: 'C-PLAIN', platformMessageId: 'msg-plain' })?.status).toBe(
-      'retrying',
-    );
+    expect(
+      getInboundDelivery({ channelType: 'slack', platformId: 'C-PLAIN', platformMessageId: 'msg-plain' })?.status,
+    ).toBe('retrying');
 
     // Mention on unknown channel — SHOULD auto-create (next step: channel-registration flow).
     const mentionedResult = await routeInbound({
@@ -500,11 +504,13 @@ describe('router', () => {
     });
 
     expect(result).toMatchObject({ status: 'dropped', reason: 'no_agent_wired_unmentioned', retryable: true });
-    expect(getInboundDelivery({
-      channelType: 'thenvoi',
-      platformId: 'thenvoi:room-unwired',
-      platformMessageId: 'band-msg-unwired-plain',
-    })?.status).toBe('retrying');
+    expect(
+      getInboundDelivery({
+        channelType: 'thenvoi',
+        platformId: 'thenvoi:room-unwired',
+        platformMessageId: 'band-msg-unwired-plain',
+      })?.status,
+    ).toBe('retrying');
   });
 
   it('dedupes repeated platform message ids after persistence', async () => {

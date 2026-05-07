@@ -239,7 +239,7 @@ async function resolveContainerContribution(
       })
     : {};
 
-  const messagingGroup = session.messaging_group_id ? getMessagingGroup(session.messaging_group_id) ?? null : null;
+  const messagingGroup = session.messaging_group_id ? (getMessagingGroup(session.messaging_group_id) ?? null) : null;
   const channelFn = messagingGroup ? getChannelContainerConfig(messagingGroup.channel_type) : undefined;
   const channelContribution = channelFn
     ? await channelFn({

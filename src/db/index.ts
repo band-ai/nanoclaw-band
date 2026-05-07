@@ -12,7 +12,13 @@ export {
   type InboundDeliveryRow,
   type InboundDeliveryStatus,
 } from './inbound-delivery-ledger.js';
-export { deleteModuleState, getModuleState, listModuleState, setModuleState, type ModuleStateRow } from './module-state.js';
+export {
+  deleteModuleState,
+  getModuleState,
+  listModuleState,
+  setModuleState,
+  type ModuleStateRow,
+} from './module-state.js';
 export {
   getOutboundDeliveryMarker,
   recordOutboundDeliveryMarker,

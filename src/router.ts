@@ -345,7 +345,15 @@ export async function routeInbound(event: InboundEvent): Promise<InboundRouteRes
     const scopeOk = engages && (!senderScopeGate || senderScopeGate(event, userId, mg, agent).allowed);
 
     if (engages && accessOk && scopeOk) {
-      const routed = await deliverToAgent(agent, agentGroup, mg, event, userId, adapter?.supportsThreads === true, true);
+      const routed = await deliverToAgent(
+        agent,
+        agentGroup,
+        mg,
+        event,
+        userId,
+        adapter?.supportsThreads === true,
+        true,
+      );
       if (routed) {
         sessionIds.push(routed.sessionId);
         sessionMessageIds.push(routed.sessionMessageId);
@@ -380,7 +388,15 @@ export async function routeInbound(event: InboundEvent): Promise<InboundRouteRes
       // message (which also stages their attachments to disk via
       // writeSessionMessage → extractAttachmentFiles) is exactly what the
       // gate is meant to prevent.
-      const routed = await deliverToAgent(agent, agentGroup, mg, event, userId, adapter?.supportsThreads === true, false);
+      const routed = await deliverToAgent(
+        agent,
+        agentGroup,
+        mg,
+        event,
+        userId,
+        adapter?.supportsThreads === true,
+        false,
+      );
       if (routed) {
         sessionIds.push(routed.sessionId);
         sessionMessageIds.push(routed.sessionMessageId);

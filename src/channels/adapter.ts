@@ -30,7 +30,11 @@ export type InboundRouteResult =
 /** Passed to the adapter at setup time. */
 export interface ChannelSetup {
   /** Called when an inbound message arrives from the platform. */
-  onInbound(platformId: string, threadId: string | null, message: InboundMessage): void | InboundRouteResult | Promise<void | InboundRouteResult>;
+  onInbound(
+    platformId: string,
+    threadId: string | null,
+    message: InboundMessage,
+  ): void | InboundRouteResult | Promise<void | InboundRouteResult>;
 
   /**
    * Called by admin-transport adapters (CLI) that want to route a message to

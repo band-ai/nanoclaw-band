@@ -187,9 +187,9 @@ describe('thenvoi channel adapter', () => {
     }));
 
     const adapter = getChannelAdapter('thenvoi');
-    await expect(adapter!.deliver('thenvoi:room-1', null, { kind: 'chat', content: { text: 'hello from agent' } })).resolves.toBe(
-      'platform-out-1',
-    );
+    await expect(
+      adapter!.deliver('thenvoi:room-1', null, { kind: 'chat', content: { text: 'hello from agent' } }),
+    ).resolves.toBe('platform-out-1');
     expect(fakeLinks[0].rest.createChatMessage).toHaveBeenCalledWith('room-1', {
       content: 'hello from agent',
       messageType: 'text',
@@ -231,15 +231,17 @@ describe('thenvoi channel adapter', () => {
       hostEnv: process.env,
     });
 
-    expect(config.env).toEqual(expect.objectContaining({
-      NANOCLAW_CHANNEL: 'thenvoi',
-      THENVOI_ROOM_ID: 'room-1',
-      THENVOI_AGENT_ID: 'agent-1',
-      THENVOI_REST_URL: 'https://band.example.test',
-      THENVOI_MEMORY_TOOLS: 'true',
-      THENVOI_MEMORY_LOAD_ON_START: 'true',
-      THENVOI_MEMORY_CONSOLIDATION: 'false',
-    }));
+    expect(config.env).toEqual(
+      expect.objectContaining({
+        NANOCLAW_CHANNEL: 'thenvoi',
+        THENVOI_ROOM_ID: 'room-1',
+        THENVOI_AGENT_ID: 'agent-1',
+        THENVOI_REST_URL: 'https://band.example.test',
+        THENVOI_MEMORY_TOOLS: 'true',
+        THENVOI_MEMORY_LOAD_ON_START: 'true',
+        THENVOI_MEMORY_CONSOLIDATION: 'false',
+      }),
+    );
     expect(config.env).not.toHaveProperty('THENVOI_API_KEY');
   });
 
@@ -275,10 +277,12 @@ describe('thenvoi channel adapter', () => {
       hostEnv: process.env,
     });
 
-    expect(config.env).toEqual(expect.objectContaining({
-      THENVOI_REST_URL: 'http://host.docker.internal:4000',
-      THENVOI_API_KEY: 'secret',
-    }));
+    expect(config.env).toEqual(
+      expect.objectContaining({
+        THENVOI_REST_URL: 'http://host.docker.internal:4000',
+        THENVOI_API_KEY: 'secret',
+      }),
+    );
   });
 
   it('does not mark Band messages processed after retryable drops', async () => {

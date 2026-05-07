@@ -8,7 +8,9 @@ export interface ChannelContainerContext {
   hostEnv: NodeJS.ProcessEnv;
 }
 
-export type ChannelContainerConfigFn = (ctx: ChannelContainerContext) => ProviderContainerContribution | Promise<ProviderContainerContribution>;
+export type ChannelContainerConfigFn = (
+  ctx: ChannelContainerContext,
+) => ProviderContainerContribution | Promise<ProviderContainerContribution>;
 
 const registry = new Map<string, ChannelContainerConfigFn>();
 

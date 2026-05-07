@@ -117,7 +117,11 @@ export function markInboundDeliveryDropped(
   drop: { reason: string; intentional: boolean; retryable?: boolean },
 ): InboundDeliveryRow {
   const ts = now();
-  const status: InboundDeliveryStatus = drop.intentional ? 'intentionally_dropped' : drop.retryable ? 'retrying' : 'dead_lettered';
+  const status: InboundDeliveryStatus = drop.intentional
+    ? 'intentionally_dropped'
+    : drop.retryable
+      ? 'retrying'
+      : 'dead_lettered';
   getDb()
     .prepare(
       `UPDATE inbound_delivery_ledger SET
