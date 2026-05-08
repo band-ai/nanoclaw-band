@@ -1,5 +1,5 @@
 ---
-name: add-band-ai
+name: add-band
 description: Add Band.ai channel integration. Uses the Thenvoi SDK identifiers internally while presenting Band.ai to users.
 ---
 
