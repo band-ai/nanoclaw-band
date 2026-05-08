@@ -30,10 +30,15 @@ function mainControlRoom(): boolean {
 }
 
 function memoryToolsEnabled(): boolean {
-  return env('THENVOI_MEMORY_TOOLS') === 'true';
+  return env('THENVOI_MEMORY_TOOLS') === 'true' && !memoryDisabledForRun;
+}
+
+function isMemoryTool(sdkToolName: string): boolean {
+  return sdkToolName.includes('memory') || sdkToolName.includes('memories');
 }
 
 let cachedTools: AgentToolsProtocol | null = null;
+let memoryDisabledForRun = false;
 
 function apiKey(): string {
   return env('THENVOI_API_KEY') ?? env('ONECLI_API_KEY') ?? '';
@@ -90,6 +95,28 @@ function isSdkToolError(value: unknown): value is { message?: string; legacyMess
   return Boolean(value && typeof value === 'object' && 'errorType' in value);
 }
 
+function isUnavailableMemoryResult(value: unknown): boolean {
+  if (!value || typeof value !== 'object') return false;
+  const result = value as { status?: unknown; errorType?: unknown; message?: unknown; legacyMessage?: unknown };
+  const haystack = [result.status, result.errorType, result.message, result.legacyMessage]
+    .filter((part): part is string => typeof part === 'string')
+    .join(' ')
+    .toLowerCase();
+  return haystack.includes('404') || haystack.includes('not found') || haystack.includes('unsupported');
+}
+
+function memoryDisabledResult(toolName: string): CallToolResult {
+  return {
+    content: [
+      {
+        type: 'text',
+        text: `${toBandToolName(toolName)} is disabled because the Band.ai memory API is unavailable for this run.`,
+      },
+    ],
+    isError: true,
+  };
+}
+
 function blockedInMainRoom(sdkToolName: string): CallToolResult | null {
   if (!mainControlRoom() || !MUTATION_TOOLS_BLOCKED_IN_MAIN_ROOM.has(sdkToolName)) return null;
   return {
@@ -135,7 +162,12 @@ function buildBandToolDefinitions(): McpToolDefinition[] {
         async handler(args) {
           const blocked = blockedInMainRoom(sdkToolName);
           if (blocked) return blocked;
+          if (isMemoryTool(sdkToolName) && memoryDisabledForRun) return memoryDisabledResult(sdkToolName);
           const result = await sdkTools().executeToolCall(sdkToolName, args);
+          if (isMemoryTool(sdkToolName) && isUnavailableMemoryResult(result)) {
+            memoryDisabledForRun = true;
+            return memoryDisabledResult(sdkToolName);
+          }
           return formatToolResult(result);
         },
       },

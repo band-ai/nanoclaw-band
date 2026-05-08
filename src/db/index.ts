@@ -54,6 +54,8 @@ export {
   findSessionByAgentGroup,
   getSessionsByAgentGroup,
   getActiveSessions,
+  getActiveSessionsByMessagingGroup,
+  closeActiveSessionsForMessagingGroup,
   getRunningSessions,
   updateSession,
   deleteSession,

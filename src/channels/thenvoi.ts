@@ -5,11 +5,24 @@ import type { ChannelAdapter, ChannelSetup, ConversationInfo, InboundRouteResult
 import { registerChannelContainerConfig } from './channel-container-registry.js';
 import { registerChannelAdapter } from './channel-registry.js';
 import { markInboundDeliveryProcessed } from '../db/inbound-delivery-ledger.js';
+import { getMessagingGroupByPlatform, createMessagingGroup, updateMessagingGroup } from '../db/messaging-groups.js';
+import { closeActiveSessionsForMessagingGroup } from '../db/sessions.js';
+import { getModuleState, setModuleState, deleteModuleState } from '../db/module-state.js';
 import { log } from '../log.js';
 import { getThenvoiConfig, type ThenvoiConfig } from '../modules/thenvoi-config.js';
 
 export const THENVOI_CHANNEL_TYPE = 'thenvoi';
 export const THENVOI_PLATFORM_PREFIX = 'thenvoi:';
+
+const THENVOI_MODULE_NAME = 'thenvoi';
+const MAIN_ROOM_STATE_KEY = 'main-room';
+const MAIN_ROOM_NAME = 'Main Control Room';
+
+interface ThenvoiMainRoomState {
+  roomId: string;
+  platformId: string;
+  updatedAt: string;
+}
 
 interface ThenvoiMessageContent {
   text: string;
@@ -62,6 +75,80 @@ function shouldInjectDirectApiKey(baseUrl: string): boolean {
 
 function isProcessableRouteResult(result: void | InboundRouteResult): result is InboundRouteResult {
   return result?.status === 'persisted' || (result?.status === 'dropped' && result.intentional);
+}
+
+function now(): string {
+  return new Date().toISOString();
+}
+
+function safeRoomTitle(room: Record<string, unknown>, fallback: string): string {
+  return typeof room.title === 'string' && room.title.length > 0 ? room.title : fallback;
+}
+
+function isOwnerDirectRoom(room: Record<string, unknown>): boolean {
+  if (room.is_main === true || room.isMain === true || room.main === true) return true;
+  if (room.type === 'direct' || room.kind === 'direct' || room.room_type === 'direct') return true;
+
+  const participants = Array.isArray(room.participants) ? room.participants : [];
+  if (participants.length !== 2) return false;
+  const ids = participants.flatMap((participant) => {
+    if (!participant || typeof participant !== 'object') return [];
+    const value = participant as Record<string, unknown>;
+    return typeof value.id === 'string' ? [value.id] : typeof value.uuid === 'string' ? [value.uuid] : [];
+  });
+  return ids.length === 2;
+}
+
+function getMainRoomState(): ThenvoiMainRoomState | undefined {
+  return getModuleState<ThenvoiMainRoomState>(THENVOI_MODULE_NAME, MAIN_ROOM_STATE_KEY);
+}
+
+function setMainRoom(roomId: string): void {
+  setModuleState(THENVOI_MODULE_NAME, MAIN_ROOM_STATE_KEY, {
+    roomId,
+    platformId: formatThenvoiPlatformId(roomId),
+    updatedAt: now(),
+  } satisfies ThenvoiMainRoomState);
+}
+
+function isMainRoomPlatformId(platformId: string): boolean {
+  return getMainRoomState()?.platformId === platformId;
+}
+
+function upsertDiscoveredMessagingGroup(roomId: string, room: Record<string, unknown>, forceMain = false): void {
+  const platformId = formatThenvoiPlatformId(roomId);
+  const isMain = forceMain || isOwnerDirectRoom(room);
+  const name = isMain ? MAIN_ROOM_NAME : safeRoomTitle(room, roomId);
+  const isGroup = isMain ? 0 : room.type === 'direct' ? 0 : 1;
+  const existing = getMessagingGroupByPlatform(THENVOI_CHANNEL_TYPE, platformId);
+
+  if (!existing) {
+    createMessagingGroup({
+      id: `mg-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+      channel_type: THENVOI_CHANNEL_TYPE,
+      platform_id: platformId,
+      name,
+      is_group: isGroup,
+      unknown_sender_policy: 'request_approval',
+      denied_at: null,
+      created_at: now(),
+    });
+  } else {
+    updateMessagingGroup(existing.id, { name, is_group: isGroup });
+  }
+
+  if (isMain) setMainRoom(roomId);
+}
+
+function closeSessionsForRoom(roomId: string, reason: string): void {
+  const mg = getMessagingGroupByPlatform(THENVOI_CHANNEL_TYPE, formatThenvoiPlatformId(roomId));
+  if (!mg) return;
+  const closed = closeActiveSessionsForMessagingGroup(mg.id);
+  if (closed > 0) log.info('Band.ai closed stale room sessions', { roomId, reason, closed });
+}
+
+function clearMainRoomIfMatches(roomId: string): void {
+  if (getMainRoomState()?.roomId === roomId) deleteModuleState(THENVOI_MODULE_NAME, MAIN_ROOM_STATE_KEY);
 }
 
 class ThenvoiChannelAdapter implements ChannelAdapter {
@@ -167,16 +254,27 @@ class ThenvoiChannelAdapter implements ChannelAdapter {
     const rooms = await this.link.listAllChats({ pageSize: 50 });
     const conversations: ConversationInfo[] = [];
 
+    const seenRoomIds = new Set<string>();
     for (const room of rooms) {
-      const roomId = typeof room.id === 'string' ? room.id : undefined;
+      const roomRecord = room as Record<string, unknown>;
+      const roomId = typeof roomRecord.id === 'string' ? roomRecord.id : undefined;
       if (!roomId) continue;
+      seenRoomIds.add(roomId);
 
       await this.link.subscribeRoom(roomId);
-      const title = typeof room.title === 'string' ? room.title : undefined;
-      const isGroup = room.type !== 'direct';
+      upsertDiscoveredMessagingGroup(roomId, roomRecord);
+      const main = getMainRoomState()?.roomId === roomId;
+      const title = main ? MAIN_ROOM_NAME : typeof roomRecord.title === 'string' ? roomRecord.title : undefined;
+      const isGroup = main ? false : roomRecord.type !== 'direct';
       const platformId = formatThenvoiPlatformId(roomId);
       conversations.push({ platformId, name: title ?? roomId, isGroup });
       this.setupConfig?.onMetadata(platformId, title, isGroup);
+    }
+
+    const state = getMainRoomState();
+    if (state && !seenRoomIds.has(state.roomId)) {
+      clearMainRoomIfMatches(state.roomId);
+      closeSessionsForRoom(state.roomId, 'main_room_missing_during_sync');
     }
 
     return conversations;
@@ -209,6 +307,14 @@ class ThenvoiChannelAdapter implements ChannelAdapter {
       case 'room_added':
         await this.handleRoomAdded(event.roomId, event.payload);
         break;
+      case 'room_removed':
+      case 'room_deleted':
+      case 'participant_removed':
+        this.handleRoomInvalidated(event.roomId, event.payload, event.type);
+        break;
+      case 'participant_added':
+        this.handleParticipantAdded(event.roomId, event.payload);
+        break;
       case 'message_created':
         await this.handleMessageCreated(event.roomId, event.payload);
         break;
@@ -221,9 +327,33 @@ class ThenvoiChannelAdapter implements ChannelAdapter {
     const id = roomId ?? (typeof payload.id === 'string' ? payload.id : null);
     if (!id) return;
     await this.link.subscribeRoom(id);
-    const title = typeof payload.title === 'string' ? payload.title : undefined;
-    const isGroup = payload.type !== 'direct';
+    upsertDiscoveredMessagingGroup(id, payload);
+    const main = getMainRoomState()?.roomId === id;
+    const title = main ? MAIN_ROOM_NAME : typeof payload.title === 'string' ? payload.title : undefined;
+    const isGroup = main ? false : payload.type !== 'direct';
     this.setupConfig?.onMetadata(formatThenvoiPlatformId(id), title, isGroup);
+  }
+
+  private handleRoomInvalidated(roomId: string | null, payload: Record<string, unknown>, reason: string): void {
+    const id =
+      roomId ??
+      (typeof payload.id === 'string'
+        ? payload.id
+        : typeof payload.chat_room_id === 'string'
+          ? payload.chat_room_id
+          : null);
+    if (!id) return;
+    closeSessionsForRoom(id, reason);
+    clearMainRoomIfMatches(id);
+  }
+
+  private handleParticipantAdded(roomId: string | null, payload: Record<string, unknown>): void {
+    const id = roomId ?? (typeof payload.chat_room_id === 'string' ? payload.chat_room_id : null);
+    if (!id) return;
+    const before = getMainRoomState()?.roomId === id;
+    upsertDiscoveredMessagingGroup(id, payload);
+    const after = getMainRoomState()?.roomId === id;
+    if (before !== after) closeSessionsForRoom(id, 'main_room_privilege_changed');
   }
 
   private async handleMessageCreated(
@@ -248,6 +378,11 @@ class ThenvoiChannelAdapter implements ChannelAdapter {
     if (!resolvedRoomId) return;
 
     const platformId = formatThenvoiPlatformId(resolvedRoomId);
+    upsertDiscoveredMessagingGroup(
+      resolvedRoomId,
+      { id: resolvedRoomId, title: resolvedRoomId, type: 'group' },
+      getMainRoomState()?.roomId === resolvedRoomId,
+    );
     const content: ThenvoiMessageContent = {
       text: payload.content,
       sender: payload.sender_id,
@@ -295,6 +430,7 @@ registerChannelContainerConfig(THENVOI_CHANNEL_TYPE, ({ messagingGroup, hostEnv 
     THENVOI_MEMORY_LOAD_ON_START: String(config.memoryLoadOnStart),
     THENVOI_MEMORY_CONSOLIDATION: 'false',
     THENVOI_CONTACT_STRATEGY: config.contactStrategy,
+    THENVOI_IS_MAIN_CONTROL_ROOM: String(isMainRoomPlatformId(messagingGroup.platform_id)),
   };
 
   if (shouldInjectDirectApiKey(config.baseUrl) || hostEnv.THENVOI_INJECT_API_KEY === 'true') {

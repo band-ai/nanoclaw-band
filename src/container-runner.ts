@@ -49,6 +49,34 @@ import type { AgentGroup, Session } from './types.js';
 
 const onecli = new OneCLI({ url: ONECLI_URL, apiKey: ONECLI_API_KEY });
 
+function composeNetworkName(): string | undefined {
+  return process.env.NANOCLAW_DOCKER_NETWORK || undefined;
+}
+
+function composeOneCliHostname(): string | undefined {
+  return process.env.NANOCLAW_ONECLI_HOSTNAME || undefined;
+}
+
+export function toHostPath(
+  hostPath: string,
+  projectRoot = process.cwd(),
+  hostProjectRoot = process.env.NANOCLAW_HOST_PATH,
+): string {
+  if (!hostProjectRoot) return hostPath;
+  const absolutePath = path.resolve(hostPath);
+  const absoluteProjectRoot = path.resolve(projectRoot);
+  if (absolutePath === absoluteProjectRoot) return hostProjectRoot;
+  if (!absolutePath.startsWith(`${absoluteProjectRoot}${path.sep}`)) return hostPath;
+  return path.join(hostProjectRoot, path.relative(absoluteProjectRoot, absolutePath));
+}
+
+export function rewriteOneCliProxyArgs(args: string[], hostname = composeOneCliHostname()): void {
+  if (!hostname) return;
+  for (let i = 0; i < args.length; i += 1) {
+    args[i] = args[i].replace(/host\.docker\.internal/g, hostname);
+  }
+}
+
 /** Active containers tracked by session ID. */
 const activeContainers = new Map<string, { process: ChildProcess; containerName: string }>();
 
@@ -355,7 +383,7 @@ function buildMounts(
     mounts.push(...providerContribution.mounts);
   }
 
-  return mounts;
+  return mounts.map((mount) => ({ ...mount, hostPath: toHostPath(mount.hostPath, projectRoot) }));
 }
 
 /**

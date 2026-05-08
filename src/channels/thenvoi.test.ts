@@ -341,6 +341,92 @@ describe('thenvoi channel adapter', () => {
     );
   });
 
+  it('marks discovered direct Band room as the main control room for container env', async () => {
+    setThenvoiEnv();
+    await import('./thenvoi.js');
+    const { initChannelAdapters } = await import('./channel-registry.js');
+    const result: InboundRouteResult = {
+      status: 'persisted',
+      platformMessageId: 'unused',
+      sessionIds: [],
+      sessionMessageIds: [],
+    };
+
+    await initChannelAdapters(() => ({
+      onInbound: async () => result,
+      onInboundEvent: async () => result,
+      onMetadata: () => {},
+      onAction: () => {},
+    }));
+
+    const { getModuleState, getMessagingGroupByPlatform } = await import('../db/index.js');
+    expect(getModuleState('thenvoi', 'main-room')).toMatchObject({ roomId: 'room-1', platformId: 'thenvoi:room-1' });
+
+    const mg = getMessagingGroupByPlatform('thenvoi', 'thenvoi:room-1')!;
+    const { getChannelContainerConfig } = await import('./channel-container-registry.js');
+    const config = await getChannelContainerConfig('thenvoi')!({
+      session: {
+        id: 'sess-main',
+        agent_group_id: 'ag-1',
+        messaging_group_id: mg.id,
+        thread_id: null,
+        agent_provider: null,
+        status: 'active',
+        container_status: 'idle',
+        last_active: null,
+        created_at: new Date().toISOString(),
+      },
+      messagingGroup: mg,
+      agentGroupId: 'ag-1',
+      hostEnv: process.env,
+    });
+
+    expect(config.env).toHaveProperty('THENVOI_IS_MAIN_CONTROL_ROOM', 'true');
+  });
+
+  it('closes active sessions when a Band room lifecycle event invalidates room privilege', async () => {
+    setThenvoiEnv();
+    await import('./thenvoi.js');
+    const { initChannelAdapters } = await import('./channel-registry.js');
+    const result: InboundRouteResult = {
+      status: 'persisted',
+      platformMessageId: 'unused',
+      sessionIds: [],
+      sessionMessageIds: [],
+    };
+
+    await initChannelAdapters(() => ({
+      onInbound: async () => result,
+      onInboundEvent: async () => result,
+      onMetadata: () => {},
+      onAction: () => {},
+    }));
+
+    const { createAgentGroup, createSession, getMessagingGroupByPlatform, getSession } = await import('../db/index.js');
+    createAgentGroup({
+      id: 'ag-1',
+      name: 'Agent 1',
+      folder: 'agent-1',
+      agent_provider: null,
+      created_at: new Date().toISOString(),
+    });
+    const mg = getMessagingGroupByPlatform('thenvoi', 'thenvoi:room-1')!;
+    createSession({
+      id: 'sess-room-1',
+      agent_group_id: 'ag-1',
+      messaging_group_id: mg.id,
+      thread_id: null,
+      agent_provider: null,
+      status: 'active',
+      container_status: 'idle',
+      last_active: null,
+      created_at: new Date().toISOString(),
+    });
+
+    fakeLinks[0].emit({ type: 'participant_removed', roomId: 'room-1', payload: { participant_id: 'agent-1' } });
+    await waitFor(() => getSession('sess-room-1')?.status === 'closed');
+  });
+
   it('does not mark Band messages processed after retryable drops', async () => {
     setThenvoiEnv();
     await import('./thenvoi.js');
