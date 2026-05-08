@@ -109,7 +109,7 @@ RUN --mount=type=cache,target=/root/.cache/pnpm \
 
 RUN --mount=type=cache,target=/root/.cache/pnpm \
     pnpm install -g "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}" && \
-    node /pnpm/global/v11/7-*/node_modules/@anthropic-ai/claude-code/install.cjs
+    node "$(pnpm root -g)/@anthropic-ai/claude-code/install.cjs"
 
 # ---- Entrypoint --------------------------------------------------------------
 COPY entrypoint.sh /app/entrypoint.sh
