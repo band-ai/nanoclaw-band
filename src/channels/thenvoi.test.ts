@@ -20,6 +20,24 @@ class FakeThenvoiClient {
   public readonly agentApiMessages = {
     createAgentChatMessage: vi.fn(async () => ({ data: { id: 'platform-out-1' } })),
   };
+  public readonly agentApiContacts = {
+    respondToAgentContactRequest: vi.fn(async () => ({ data: { ok: true } })),
+  };
+  public readonly agentApiChats = {
+    createAgentChat: vi.fn(async () => ({ data: { id: 'hub-room-1', inserted_at: '', updated_at: '' } })),
+  };
+  public readonly agentApiParticipants = {
+    addAgentChatParticipant: vi.fn(async () => ({ data: { ok: true } })),
+  };
+  public readonly agentApiEvents = {
+    createAgentChatEvent: vi.fn(async () => ({ data: { ok: true } })),
+  };
+  public readonly agentApiMemories = {
+    listAgentMemories: vi.fn(
+      async (_args: { subject_id: string; scope: string }) =>
+        ({ data: { data: [] as Array<{ type?: string; content?: string }> } }),
+    ),
+  };
 
   public constructor() {
     fakeRestClients.push(this);
@@ -260,7 +278,7 @@ describe('thenvoi channel adapter', () => {
         THENVOI_REST_URL: 'https://band.example.test',
         THENVOI_MEMORY_TOOLS: 'true',
         THENVOI_MEMORY_LOAD_ON_START: 'true',
-        THENVOI_MEMORY_CONSOLIDATION: 'false',
+        THENVOI_MEMORY_CONSOLIDATION: 'true',
       }),
     );
     expect(config.env).not.toHaveProperty('THENVOI_API_KEY');
@@ -463,5 +481,345 @@ describe('thenvoi channel adapter', () => {
     await new Promise((resolve) => setTimeout(resolve, 0));
     expect(fakeLinks[0].markProcessing).not.toHaveBeenCalled();
     expect(fakeLinks[0].markProcessed).not.toHaveBeenCalled();
+  });
+
+  it('forwards THENVOI_OWNER_ID into the container env when set', async () => {
+    setThenvoiEnv();
+    process.env.THENVOI_OWNER_ID = 'owner-uuid-from-env';
+    await import('./thenvoi.js');
+    const { getChannelContainerConfig } = await import('./channel-container-registry.js');
+
+    const config = await getChannelContainerConfig('thenvoi')!({
+      session: {
+        id: 'sess-1',
+        agent_group_id: 'ag-1',
+        messaging_group_id: 'mg-1',
+        thread_id: null,
+        agent_provider: null,
+        status: 'active',
+        container_status: 'idle',
+        last_active: null,
+        created_at: new Date().toISOString(),
+      },
+      messagingGroup: {
+        id: 'mg-1',
+        channel_type: 'thenvoi',
+        platform_id: 'thenvoi:room-1',
+        name: 'Room 1',
+        is_group: 1,
+        unknown_sender_policy: 'public',
+        denied_at: null,
+        created_at: new Date().toISOString(),
+      },
+      agentGroupId: 'ag-1',
+      hostEnv: process.env,
+    });
+
+    expect(config.env).toHaveProperty('THENVOI_OWNER_ID', 'owner-uuid-from-env');
+    delete process.env.THENVOI_OWNER_ID;
+  });
+
+  it('auto-approves contact requests under callback strategy', async () => {
+    setThenvoiEnv();
+    process.env.THENVOI_CONTACT_STRATEGY = 'callback';
+    await import('./thenvoi.js');
+    const { initChannelAdapters } = await import('./channel-registry.js');
+    const result: InboundRouteResult = {
+      status: 'persisted',
+      platformMessageId: 'unused',
+      sessionIds: [],
+      sessionMessageIds: [],
+    };
+
+    await initChannelAdapters(() => ({
+      onInbound: async () => result,
+      onInboundEvent: async () => result,
+      onMetadata: () => {},
+      onAction: () => {},
+    }));
+
+    fakeLinks[0].emit({
+      type: 'contact_request_received',
+      roomId: null,
+      payload: {
+        id: 'req-1',
+        from_handle: 'jane',
+        from_name: 'Jane Doe',
+        status: 'pending',
+        inserted_at: new Date().toISOString(),
+      },
+    });
+
+    await waitFor(() => fakeRestClients[0].agentApiContacts.respondToAgentContactRequest.mock.calls.length === 1);
+    expect(fakeRestClients[0].agentApiContacts.respondToAgentContactRequest).toHaveBeenCalledWith({
+      action: 'approve',
+      request_id: 'req-1',
+    });
+  });
+
+  it('deduplicates repeated contact events under callback strategy', async () => {
+    setThenvoiEnv();
+    process.env.THENVOI_CONTACT_STRATEGY = 'callback';
+    await import('./thenvoi.js');
+    const { initChannelAdapters } = await import('./channel-registry.js');
+    const result: InboundRouteResult = {
+      status: 'persisted',
+      platformMessageId: 'unused',
+      sessionIds: [],
+      sessionMessageIds: [],
+    };
+
+    await initChannelAdapters(() => ({
+      onInbound: async () => result,
+      onInboundEvent: async () => result,
+      onMetadata: () => {},
+      onAction: () => {},
+    }));
+
+    const payload = {
+      id: 'req-dup',
+      from_handle: 'jane',
+      from_name: 'Jane Doe',
+      status: 'pending',
+      inserted_at: new Date().toISOString(),
+    };
+
+    fakeLinks[0].emit({ type: 'contact_request_received', roomId: null, payload });
+    fakeLinks[0].emit({ type: 'contact_request_received', roomId: null, payload });
+
+    await waitFor(() => fakeRestClients[0].agentApiContacts.respondToAgentContactRequest.mock.calls.length >= 1);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(fakeRestClients[0].agentApiContacts.respondToAgentContactRequest).toHaveBeenCalledTimes(1);
+  });
+
+  it('creates a hub room and routes contact events into it under hub_room strategy', async () => {
+    setThenvoiEnv();
+    process.env.THENVOI_CONTACT_STRATEGY = 'hub_room';
+    await import('./thenvoi.js');
+    const { initChannelAdapters } = await import('./channel-registry.js');
+    const onInbound = vi.fn(
+      async (_platformId: string, _threadId: string | null) =>
+        ({
+          status: 'persisted',
+          platformMessageId: 'unused',
+          sessionIds: [],
+          sessionMessageIds: [],
+        }) satisfies InboundRouteResult,
+    );
+
+    await initChannelAdapters(() => ({
+      onInbound,
+      onInboundEvent: async () => ({
+        status: 'persisted',
+        platformMessageId: 'unused',
+        sessionIds: [],
+        sessionMessageIds: [],
+      }),
+      onMetadata: () => {},
+      onAction: () => {},
+    }));
+
+    fakeLinks[0].emit({
+      type: 'contact_request_received',
+      roomId: null,
+      payload: {
+        id: 'req-hub-1',
+        from_handle: 'jane',
+        from_name: 'Jane Doe',
+        status: 'pending',
+        inserted_at: new Date().toISOString(),
+      },
+    });
+
+    await waitFor(() => fakeRestClients[0].agentApiChats.createAgentChat.mock.calls.length === 1);
+    await waitFor(() => fakeRestClients[0].agentApiParticipants.addAgentChatParticipant.mock.calls.length === 1);
+    await waitFor(() => onInbound.mock.calls.some(([platformId]) => platformId === 'thenvoi:hub-room-1'));
+    await waitFor(() => fakeRestClients[0].agentApiEvents.createAgentChatEvent.mock.calls.length === 1);
+
+    expect(fakeRestClients[0].agentApiParticipants.addAgentChatParticipant).toHaveBeenCalledWith('hub-room-1', {
+      participant: { participant_id: 'owner-1', role: 'member' },
+    });
+
+    const { getModuleState, getMessagingGroupByPlatform } = await import('../db/index.js');
+    expect(getModuleState('thenvoi', 'hub-room')).toMatchObject({ roomId: 'hub-room-1' });
+    const mg = getMessagingGroupByPlatform('thenvoi', 'thenvoi:hub-room-1');
+    expect(mg).toMatchObject({ name: 'Contact Hub', unknown_sender_policy: 'public' });
+  });
+
+  it('reuses an existing hub room across contact events without recreating it', async () => {
+    setThenvoiEnv();
+    process.env.THENVOI_CONTACT_STRATEGY = 'hub_room';
+    await import('./thenvoi.js');
+    const { initChannelAdapters } = await import('./channel-registry.js');
+
+    await initChannelAdapters(() => ({
+      onInbound: async () => ({
+        status: 'persisted',
+        platformMessageId: 'unused',
+        sessionIds: [],
+        sessionMessageIds: [],
+      }),
+      onInboundEvent: async () => ({
+        status: 'persisted',
+        platformMessageId: 'unused',
+        sessionIds: [],
+        sessionMessageIds: [],
+      }),
+      onMetadata: () => {},
+      onAction: () => {},
+    }));
+
+    fakeLinks[0].emit({
+      type: 'contact_added',
+      roomId: null,
+      payload: {
+        id: 'contact-1',
+        handle: 'jane',
+        name: 'Jane Doe',
+        type: 'human',
+        inserted_at: new Date().toISOString(),
+      },
+    });
+    fakeLinks[0].emit({
+      type: 'contact_added',
+      roomId: null,
+      payload: {
+        id: 'contact-2',
+        handle: 'bob',
+        name: 'Bob Roe',
+        type: 'human',
+        inserted_at: new Date().toISOString(),
+      },
+    });
+
+    await waitFor(() => fakeRestClients[0].agentApiEvents.createAgentChatEvent.mock.calls.length === 2);
+    expect(fakeRestClients[0].agentApiChats.createAgentChat).toHaveBeenCalledTimes(1);
+  });
+
+  it('drops contact events under disabled strategy without calling REST', async () => {
+    setThenvoiEnv();
+    await import('./thenvoi.js');
+    const { initChannelAdapters } = await import('./channel-registry.js');
+
+    await initChannelAdapters(() => ({
+      onInbound: async () => ({
+        status: 'persisted',
+        platformMessageId: 'unused',
+        sessionIds: [],
+        sessionMessageIds: [],
+      }),
+      onInboundEvent: async () => ({
+        status: 'persisted',
+        platformMessageId: 'unused',
+        sessionIds: [],
+        sessionMessageIds: [],
+      }),
+      onMetadata: () => {},
+      onAction: () => {},
+    }));
+
+    fakeLinks[0].emit({
+      type: 'contact_request_received',
+      roomId: null,
+      payload: {
+        id: 'req-disabled',
+        from_handle: 'jane',
+        from_name: 'Jane Doe',
+        status: 'pending',
+        inserted_at: new Date().toISOString(),
+      },
+    });
+
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(fakeRestClients[0].agentApiContacts.respondToAgentContactRequest).not.toHaveBeenCalled();
+    expect(fakeRestClients[0].agentApiChats.createAgentChat).not.toHaveBeenCalled();
+  });
+
+  it('injects participant memories on participant_added when memory load-on-start is enabled', async () => {
+    setThenvoiEnv();
+    process.env.THENVOI_MEMORY_LOAD_ON_START = 'true';
+    await import('./thenvoi.js');
+    const { initChannelAdapters } = await import('./channel-registry.js');
+
+    const onInbound = vi.fn(
+      async (_platformId: string, _threadId: string | null, _message: unknown) =>
+        ({
+          status: 'persisted',
+          platformMessageId: 'unused',
+          sessionIds: [],
+          sessionMessageIds: [],
+        }) satisfies InboundRouteResult,
+    );
+    await initChannelAdapters(() => ({
+      onInbound,
+      onInboundEvent: async () => ({
+        status: 'persisted',
+        platformMessageId: 'unused',
+        sessionIds: [],
+        sessionMessageIds: [],
+      }),
+      onMetadata: () => {},
+      onAction: () => {},
+    }));
+
+    fakeRestClients[0].agentApiMemories.listAgentMemories.mockResolvedValueOnce({
+      data: {
+        data: [
+          { type: 'semantic', content: 'Prefers dark mode' },
+          { type: 'episodic', content: 'Mentioned a deadline on 2026-04-01' },
+        ],
+      },
+    });
+
+    fakeLinks[0].emit({
+      type: 'participant_added',
+      roomId: 'room-1',
+      payload: { id: 'user-42', name: 'Jane', type: 'User', handle: 'jane' },
+    });
+
+    await waitFor(() => fakeRestClients[0].agentApiMemories.listAgentMemories.mock.calls.length === 1);
+    await waitFor(() => onInbound.mock.calls.some(([platformId]) => platformId === 'thenvoi:room-1'));
+
+    expect(fakeRestClients[0].agentApiMemories.listAgentMemories).toHaveBeenCalledWith({
+      subject_id: 'user-42',
+      scope: 'subject',
+    });
+    const call = onInbound.mock.calls.find(([platformId]) => platformId === 'thenvoi:room-1')!;
+    const message = call[2] as { content: { text: string; senderId: string } };
+    expect(message.content.senderId).toBe('system');
+    expect(message.content.text).toContain('Jane joined the room');
+    expect(message.content.text).toContain('Prefers dark mode');
+  });
+
+  it('does not fetch participant memories when load-on-start is disabled', async () => {
+    setThenvoiEnv();
+    await import('./thenvoi.js');
+    const { initChannelAdapters } = await import('./channel-registry.js');
+
+    await initChannelAdapters(() => ({
+      onInbound: async () => ({
+        status: 'persisted',
+        platformMessageId: 'unused',
+        sessionIds: [],
+        sessionMessageIds: [],
+      }),
+      onInboundEvent: async () => ({
+        status: 'persisted',
+        platformMessageId: 'unused',
+        sessionIds: [],
+        sessionMessageIds: [],
+      }),
+      onMetadata: () => {},
+      onAction: () => {},
+    }));
+
+    fakeLinks[0].emit({
+      type: 'participant_added',
+      roomId: 'room-1',
+      payload: { id: 'user-42', name: 'Jane', type: 'User', handle: 'jane' },
+    });
+
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(fakeRestClients[0].agentApiMemories.listAgentMemories).not.toHaveBeenCalled();
   });
 });

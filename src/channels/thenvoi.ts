@@ -17,11 +17,22 @@ export const THENVOI_PLATFORM_PREFIX = 'thenvoi:';
 const THENVOI_MODULE_NAME = 'thenvoi';
 const MAIN_ROOM_STATE_KEY = 'main-room';
 const MAIN_ROOM_NAME = 'Main Control Room';
+const HUB_ROOM_STATE_KEY = 'hub-room';
+const HUB_ROOM_NAME = 'Contact Hub';
+const SYNTHETIC_CONTACT_SENDER_ID = 'contact-events';
+const SYNTHETIC_CONTACT_SENDER_NAME = 'Contact Events';
+const MAX_CONTACT_DEDUP = 1000;
 
 interface ThenvoiMainRoomState {
   roomId: string;
   platformId: string;
   updatedAt: string;
+}
+
+interface ThenvoiHubRoomState {
+  roomId: string;
+  platformId: string;
+  createdAt: string;
 }
 
 interface ThenvoiMessageContent {
@@ -115,6 +126,47 @@ function isMainRoomPlatformId(platformId: string): boolean {
   return getMainRoomState()?.platformId === platformId;
 }
 
+function getHubRoomState(): ThenvoiHubRoomState | undefined {
+  return getModuleState<ThenvoiHubRoomState>(THENVOI_MODULE_NAME, HUB_ROOM_STATE_KEY);
+}
+
+function setHubRoom(roomId: string): void {
+  setModuleState(THENVOI_MODULE_NAME, HUB_ROOM_STATE_KEY, {
+    roomId,
+    platformId: formatThenvoiPlatformId(roomId),
+    createdAt: now(),
+  } satisfies ThenvoiHubRoomState);
+}
+
+function clearHubRoom(): void {
+  deleteModuleState(THENVOI_MODULE_NAME, HUB_ROOM_STATE_KEY);
+}
+
+function ensureHubMessagingGroup(roomId: string): void {
+  const platformId = formatThenvoiPlatformId(roomId);
+  const existing = getMessagingGroupByPlatform(THENVOI_CHANNEL_TYPE, platformId);
+  if (existing) {
+    if (existing.unknown_sender_policy !== 'public' || existing.name !== HUB_ROOM_NAME) {
+      updateMessagingGroup(existing.id, {
+        name: HUB_ROOM_NAME,
+        is_group: 1,
+        unknown_sender_policy: 'public',
+      });
+    }
+    return;
+  }
+  createMessagingGroup({
+    id: `mg-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+    channel_type: THENVOI_CHANNEL_TYPE,
+    platform_id: platformId,
+    name: HUB_ROOM_NAME,
+    is_group: 1,
+    unknown_sender_policy: 'public',
+    denied_at: null,
+    created_at: now(),
+  });
+}
+
 function upsertDiscoveredMessagingGroup(roomId: string, room: Record<string, unknown>, forceMain = false): void {
   const platformId = formatThenvoiPlatformId(roomId);
   const isMain = forceMain || isOwnerDirectRoom(room);
@@ -163,6 +215,9 @@ class ThenvoiChannelAdapter implements ChannelAdapter {
   private readonly link: ThenvoiLink;
   private readonly restClient: ThenvoiClient;
   private ownerMention: { id: string; name?: string } | null = null;
+  private hubRoomInitPromise: Promise<string | null> | null = null;
+  private readonly contactDedup = new Set<string>();
+  private readonly contactDedupOrder: string[] = [];
 
   public constructor(private readonly config: ThenvoiConfig) {
     const wsUrl = wsUrlFromBaseUrl(config.baseUrl);
@@ -172,6 +227,7 @@ class ThenvoiChannelAdapter implements ChannelAdapter {
       apiKey: config.apiKey,
       wsUrl,
       restUrl,
+      capabilities: { contacts: config.contactStrategy !== 'disabled' },
     });
     this.restClient = new ThenvoiClient({ apiKey: config.apiKey, baseUrl: restUrl });
   }
@@ -314,9 +370,16 @@ class ThenvoiChannelAdapter implements ChannelAdapter {
         break;
       case 'participant_added':
         this.handleParticipantAdded(event.roomId, event.payload);
+        await this.maybeInjectParticipantMemories(event.roomId, event.payload);
         break;
       case 'message_created':
         await this.handleMessageCreated(event.roomId, event.payload);
+        break;
+      case 'contact_request_received':
+      case 'contact_request_updated':
+      case 'contact_added':
+      case 'contact_removed':
+        await this.handleContactEvent(event);
         break;
       default:
         break;
@@ -354,6 +417,75 @@ class ThenvoiChannelAdapter implements ChannelAdapter {
     upsertDiscoveredMessagingGroup(id, payload);
     const after = getMainRoomState()?.roomId === id;
     if (before !== after) closeSessionsForRoom(id, 'main_room_privilege_changed');
+  }
+
+  /**
+   * When a new participant joins a Band room, fetch up to 10 of their stored
+   * memories and inject them into the room as a synthetic system message so
+   * the next agent turn has context. No-op unless `THENVOI_MEMORY_LOAD_ON_START`
+   * is enabled and the room is wired (i.e. has a messaging_group row).
+   *
+   * Failure is non-fatal — the room still functions without preloaded memory.
+   */
+  private async maybeInjectParticipantMemories(
+    roomId: string | null,
+    payload: Record<string, unknown>,
+  ): Promise<void> {
+    if (!this.config.memoryLoadOnStart || !this.setupConfig) return;
+    const resolvedRoomId =
+      roomId ?? (typeof payload.chat_room_id === 'string' ? payload.chat_room_id : null);
+    if (!resolvedRoomId) return;
+
+    const platformId = formatThenvoiPlatformId(resolvedRoomId);
+    if (!getMessagingGroupByPlatform(THENVOI_CHANNEL_TYPE, platformId)) return;
+
+    const participantId = typeof payload.id === 'string' ? payload.id : null;
+    const participantName = typeof payload.name === 'string' ? payload.name : 'Someone';
+    if (!participantId) return;
+
+    try {
+      const response = await this.restClient.agentApiMemories.listAgentMemories({
+        subject_id: participantId,
+        scope: 'subject',
+      });
+      const data = (response as { data?: { data?: Array<{ type?: string; content?: string }> } }).data;
+      const items = (data?.data ?? []).slice(0, 10);
+      if (items.length === 0) return;
+
+      const memoryLines = items.map((m) => `- [${m.type ?? 'memory'}] ${m.content ?? ''}`).join('\n');
+      const text = `[System]: ${participantName} joined the room. Here's what you know about them:\n${memoryLines}`;
+
+      const syntheticId = `participant-join-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+      const messageContent: ThenvoiMessageContent = {
+        text,
+        sender: 'system',
+        senderId: 'system',
+        senderName: 'System',
+        senderType: 'System',
+        roomId: resolvedRoomId,
+        metadata: { participantJoinedId: participantId, participantJoinedName: participantName },
+      };
+
+      await this.setupConfig.onInbound(platformId, null, {
+        id: syntheticId,
+        kind: 'chat',
+        content: messageContent,
+        timestamp: now(),
+        isMention: true,
+        isGroup: true,
+      });
+      log.info('Band.ai injected participant memories', {
+        roomId: resolvedRoomId,
+        participantId,
+        memoryCount: items.length,
+      });
+    } catch (err) {
+      log.warn('Band.ai failed to inject participant memories', {
+        err,
+        roomId: resolvedRoomId,
+        participantId,
+      });
+    }
   }
 
   private async handleMessageCreated(
@@ -415,6 +547,209 @@ class ThenvoiChannelAdapter implements ChannelAdapter {
       log.warn('Band.ai failed to mark message processed', { roomId: resolvedRoomId, messageId: payload.id, err });
     }
   }
+
+  private dedupContactEvent(event: PlatformEvent): boolean {
+    const payload = event.payload as { id?: unknown; status?: unknown } | undefined;
+    const id = typeof payload?.id === 'string' ? payload.id : 'unknown';
+    const status = typeof payload?.status === 'string' ? `:${payload.status}` : '';
+    const key = `${event.type}:${id}${status}`;
+    if (this.contactDedup.has(key)) return false;
+    this.contactDedup.add(key);
+    this.contactDedupOrder.push(key);
+    while (this.contactDedup.size > MAX_CONTACT_DEDUP) {
+      const oldest = this.contactDedupOrder.shift();
+      if (oldest) this.contactDedup.delete(oldest);
+    }
+    return true;
+  }
+
+  private async handleContactEvent(event: PlatformEvent): Promise<void> {
+    if (
+      event.type !== 'contact_request_received' &&
+      event.type !== 'contact_request_updated' &&
+      event.type !== 'contact_added' &&
+      event.type !== 'contact_removed'
+    ) {
+      return;
+    }
+    if (!this.dedupContactEvent(event)) return;
+
+    const strategy = this.config.contactStrategy;
+    if (strategy === 'disabled') {
+      log.warn('Band.ai contact event received (strategy=disabled)', {
+        type: event.type,
+        payload: event.payload,
+      });
+      return;
+    }
+
+    if (strategy === 'callback') {
+      await this.handleContactCallback(event);
+      return;
+    }
+
+    if (strategy === 'hub_room') {
+      await this.handleContactHubRoom(event);
+      return;
+    }
+  }
+
+  private async handleContactCallback(event: PlatformEvent): Promise<void> {
+    if (event.type !== 'contact_request_received') {
+      log.info('Band.ai callback strategy ignoring non-request contact event', { type: event.type });
+      return;
+    }
+    const payload = event.payload as { id: string; from_handle?: string };
+    log.info('Band.ai auto-approving contact request (callback strategy)', {
+      requestId: payload.id,
+      from: payload.from_handle,
+    });
+    try {
+      await this.restClient.agentApiContacts.respondToAgentContactRequest({
+        action: 'approve',
+        request_id: payload.id,
+      });
+    } catch (err) {
+      log.error('Band.ai failed to auto-approve contact request', { requestId: payload.id, err });
+    }
+  }
+
+  private async handleContactHubRoom(event: PlatformEvent): Promise<void> {
+    if (!this.setupConfig) return;
+    const roomId = await this.ensureHubRoom();
+    if (!roomId) {
+      log.warn('Band.ai hub room unavailable; dropping contact event', { type: event.type });
+      return;
+    }
+    const platformId = formatThenvoiPlatformId(roomId);
+    const content = formatContactEvent(event);
+
+    const syntheticId = `contact-evt-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    const messageContent: ThenvoiMessageContent = {
+      text: content,
+      sender: SYNTHETIC_CONTACT_SENDER_ID,
+      senderId: SYNTHETIC_CONTACT_SENDER_ID,
+      senderName: SYNTHETIC_CONTACT_SENDER_NAME,
+      senderType: 'System',
+      roomId,
+      metadata: { contactEventType: event.type, contactPayload: event.payload },
+    };
+
+    try {
+      await this.setupConfig.onInbound(platformId, null, {
+        id: syntheticId,
+        kind: 'chat',
+        content: messageContent,
+        timestamp: now(),
+        isMention: true,
+        isGroup: true,
+      });
+    } catch (err) {
+      log.warn('Band.ai failed to inject contact event into hub room', { err, type: event.type });
+    }
+
+    try {
+      await this.restClient.agentApiEvents.createAgentChatEvent(roomId, {
+        event: {
+          content,
+          message_type: 'task',
+          metadata: { contactEventType: event.type },
+        },
+      });
+    } catch (err) {
+      log.warn('Band.ai failed to persist contact event to platform', { err, roomId });
+    }
+  }
+
+  private async ensureHubRoom(): Promise<string | null> {
+    const persisted = getHubRoomState();
+    if (persisted) {
+      ensureHubMessagingGroup(persisted.roomId);
+      return persisted.roomId;
+    }
+    if (this.hubRoomInitPromise) return this.hubRoomInitPromise;
+
+    this.hubRoomInitPromise = (async () => {
+      try {
+        const response = await this.restClient.agentApiChats.createAgentChat({ chat: {} });
+        const data = (response as { data?: { id?: unknown } }).data;
+        const newRoomId = typeof data?.id === 'string' ? data.id : null;
+        if (!newRoomId) {
+          log.warn('Band.ai hub room creation returned no id');
+          return null;
+        }
+
+        const ownerId = await this.resolveOwnerId();
+        if (ownerId) {
+          try {
+            await this.restClient.agentApiParticipants.addAgentChatParticipant(newRoomId, {
+              participant: { participant_id: ownerId, role: 'member' },
+            });
+          } catch (err) {
+            log.warn('Band.ai failed to add owner to hub room', { err, ownerId, roomId: newRoomId });
+          }
+        } else {
+          log.warn('Band.ai hub room created without owner; owner will not see it');
+        }
+
+        setHubRoom(newRoomId);
+        ensureHubMessagingGroup(newRoomId);
+        try {
+          await this.link.subscribeRoom(newRoomId);
+        } catch (err) {
+          log.warn('Band.ai failed to subscribe to new hub room', { err, roomId: newRoomId });
+        }
+        log.info('Band.ai contact hub room created', { roomId: newRoomId });
+        return newRoomId;
+      } catch (err) {
+        log.error('Band.ai failed to create hub room', { err });
+        return null;
+      }
+    })();
+
+    try {
+      return await this.hubRoomInitPromise;
+    } finally {
+      this.hubRoomInitPromise = null;
+    }
+  }
+
+  private async resolveOwnerId(): Promise<string | null> {
+    if (this.config.ownerId) return this.config.ownerId;
+    try {
+      const response = await this.restClient.agentApiIdentity.getAgentMe();
+      const data = (response as { data?: { owner_uuid?: unknown; ownerUuid?: unknown } }).data;
+      if (typeof data?.owner_uuid === 'string') return data.owner_uuid;
+      if (typeof data?.ownerUuid === 'string') return data.ownerUuid;
+    } catch (err) {
+      log.warn('Band.ai failed to resolve owner UUID', { err });
+    }
+    return null;
+  }
+}
+
+function formatContactEvent(event: PlatformEvent): string {
+  switch (event.type) {
+    case 'contact_request_received': {
+      const p = event.payload as { id: string; from_name: string; from_handle: string; message?: string | null };
+      const msg = p.message ? `\nMessage: "${p.message}"` : '';
+      return `[Contact Request] ${p.from_name} (@${p.from_handle}) wants to connect.${msg}\nRequest ID: ${p.id}`;
+    }
+    case 'contact_request_updated': {
+      const p = event.payload as { id: string; status: string };
+      return `[Contact Update] Request ${p.id} status changed to: ${p.status}`;
+    }
+    case 'contact_added': {
+      const p = event.payload as { id: string; name: string; handle: string; type: string };
+      return `[Contact Added] ${p.name} (@${p.handle}), type: ${p.type}. ID: ${p.id}`;
+    }
+    case 'contact_removed': {
+      const p = event.payload as { id: string };
+      return `[Contact Removed] Contact ${p.id} was removed.`;
+    }
+    default:
+      return `[Contact Event] ${(event as { type: string }).type}`;
+  }
 }
 
 registerChannelContainerConfig(THENVOI_CHANNEL_TYPE, ({ messagingGroup, hostEnv }) => {
@@ -428,10 +763,14 @@ registerChannelContainerConfig(THENVOI_CHANNEL_TYPE, ({ messagingGroup, hostEnv 
     THENVOI_REST_URL: containerReachableRestUrl(config.baseUrl),
     THENVOI_MEMORY_TOOLS: String(config.memoryTools),
     THENVOI_MEMORY_LOAD_ON_START: String(config.memoryLoadOnStart),
-    THENVOI_MEMORY_CONSOLIDATION: 'false',
+    THENVOI_MEMORY_CONSOLIDATION: String(config.memoryConsolidation),
     THENVOI_CONTACT_STRATEGY: config.contactStrategy,
     THENVOI_IS_MAIN_CONTROL_ROOM: String(isMainRoomPlatformId(messagingGroup.platform_id)),
   };
+
+  if (config.ownerId) {
+    env.THENVOI_OWNER_ID = config.ownerId;
+  }
 
   if (shouldInjectDirectApiKey(config.baseUrl) || hostEnv.THENVOI_INJECT_API_KEY === 'true') {
     env.THENVOI_API_KEY = config.apiKey;

@@ -20,7 +20,7 @@ import {
   TIMEZONE,
 } from './config.js';
 import { readContainerConfig, writeContainerConfig } from './container-config.js';
-import { CONTAINER_RUNTIME_BIN, hostGatewayArgs, readonlyMountArgs, stopContainer } from './container-runtime.js';
+import { CONTAINER_RUNTIME_BIN, hostGatewayArgs, readonlyMountArgs, stopContainerAsync } from './container-runtime.js';
 import { getChannelContainerConfig } from './channels/channel-container-registry.js';
 import { composeGroupClaudeMd } from './claude-md-compose.js';
 import { getAgentGroup } from './db/agent-groups.js';
@@ -220,6 +220,18 @@ async function spawnContainer(session: Session): Promise<void> {
   });
 }
 
+/**
+ * Stop grace period for graceful container shutdown. The container's SIGTERM
+ * handler may run end-of-session work (Band.ai memory consolidation, in-flight
+ * provider query wind-down) that we don't want SIGKILLed mid-call. There's
+ * no upper bound on agent work — set this generously and let the container
+ * exit on its own when done.
+ *
+ * The stop is dispatched async (`stopContainerAsync`) so this wait does NOT
+ * block the host's sweep loop or any caller of `killContainer`.
+ */
+const STOP_GRACE_SEC = 30 * 60;
+
 /** Kill a container for a session. */
 export function killContainer(sessionId: string, reason: string): void {
   const entry = activeContainers.get(sessionId);
@@ -227,7 +239,7 @@ export function killContainer(sessionId: string, reason: string): void {
 
   log.info('Killing container', { sessionId, reason, containerName: entry.containerName });
   try {
-    stopContainer(entry.containerName);
+    stopContainerAsync(entry.containerName, STOP_GRACE_SEC);
   } catch {
     entry.process.kill('SIGKILL');
   }

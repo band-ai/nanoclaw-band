@@ -4,6 +4,7 @@ const envConfig = readEnvFile([
   'THENVOI_AGENT_ID',
   'THENVOI_API_KEY',
   'THENVOI_BASE_URL',
+  'THENVOI_OWNER_ID',
   'THENVOI_MEMORY_TOOLS',
   'THENVOI_MEMORY_LOAD_ON_START',
   'THENVOI_MEMORY_CONSOLIDATION',
@@ -28,6 +29,7 @@ export interface ThenvoiConfig {
   agentId: string;
   apiKey: string;
   baseUrl: string;
+  ownerId: string | undefined;
   memoryTools: boolean;
   memoryLoadOnStart: boolean;
   memoryConsolidation: boolean;
@@ -49,6 +51,7 @@ export function getThenvoiConfig(): ThenvoiConfig | null {
     agentId,
     apiKey,
     baseUrl,
+    ownerId: env('THENVOI_OWNER_ID'),
     memoryTools: envBool('THENVOI_MEMORY_TOOLS'),
     memoryLoadOnStart: envBool('THENVOI_MEMORY_LOAD_ON_START'),
     memoryConsolidation: envBool('THENVOI_MEMORY_CONSOLIDATION'),
