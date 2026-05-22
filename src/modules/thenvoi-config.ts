@@ -9,6 +9,7 @@ const envConfig = readEnvFile([
   'THENVOI_MEMORY_LOAD_ON_START',
   'THENVOI_MEMORY_CONSOLIDATION',
   'THENVOI_CONTACT_STRATEGY',
+  'THENVOI_CONTACT_AGENT_GROUP_ID',
 ]);
 
 function env(name: keyof typeof envConfig): string | undefined {
@@ -34,6 +35,7 @@ export interface ThenvoiConfig {
   memoryLoadOnStart: boolean;
   memoryConsolidation: boolean;
   contactStrategy: ThenvoiContactStrategy;
+  contactAgentGroupId: string | undefined;
 }
 
 export function getThenvoiConfig(): ThenvoiConfig | null {
@@ -56,5 +58,6 @@ export function getThenvoiConfig(): ThenvoiConfig | null {
     memoryLoadOnStart: envBool('THENVOI_MEMORY_LOAD_ON_START'),
     memoryConsolidation: envBool('THENVOI_MEMORY_CONSOLIDATION'),
     contactStrategy,
+    contactAgentGroupId: env('THENVOI_CONTACT_AGENT_GROUP_ID'),
   };
 }

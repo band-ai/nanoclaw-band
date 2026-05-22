@@ -138,6 +138,9 @@ THENVOI_MEMORY_CONSOLIDATION=false
 # Contact-event strategy: disabled | hub_room.
 # See "Contact strategies" below.
 THENVOI_CONTACT_STRATEGY=disabled
+# Optional. Agent group that should handle Contact Hub synthetic messages.
+# If unset and exactly one agent group exists, NanoClaw uses that group.
+THENVOI_CONTACT_AGENT_GROUP_ID=
 ```
 
 For normal hosted Band.ai, leave `THENVOI_BASE_URL` unset or set it to `https://app.thenvoi.com`. Direct `THENVOI_API_KEY` injection into agent containers is only for local HTTP validation or explicit `THENVOI_INJECT_API_KEY=true`; hosted HTTPS sessions should use OneCLI secret injection.
@@ -153,7 +156,7 @@ For normal hosted Band.ai, leave `THENVOI_BASE_URL` unset or set it to `https://
 `THENVOI_CONTACT_STRATEGY` controls what the host does with `contact_request_received`, `contact_request_updated`, `contact_added`, and `contact_removed` events emitted by Band:
 
 - `disabled` (default) — events are dropped silently. The agent never sees contacts; outbound contact tools still work.
-- `hub_room` — lazily provision a per-agent "Contact Hub" Band chat room, add `THENVOI_OWNER_ID` (or the value resolved from `GET /agent/me`) as a member, persist its room id in `data/v2.db` module state, and forward every contact event into the hub as a synthetic message. The owner replies in the hub.
+- `hub_room` — lazily provision a per-agent "Contact Hub" Band chat room, add `THENVOI_OWNER_ID` (or the value resolved from `GET /agent/me`) as a member, persist its room id in `data/v2.db` module state, wire it to `THENVOI_CONTACT_AGENT_GROUP_ID` (or the only agent group when exactly one exists), and forward every contact event into the hub as a synthetic message. The owner replies in the hub.
 
 Sync the environment file if this instance uses `data/env/env`:
 

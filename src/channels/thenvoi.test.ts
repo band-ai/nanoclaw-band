@@ -107,6 +107,7 @@ function clearThenvoiEnv(): void {
   delete process.env.THENVOI_MEMORY_LOAD_ON_START;
   delete process.env.THENVOI_MEMORY_CONSOLIDATION;
   delete process.env.THENVOI_CONTACT_STRATEGY;
+  delete process.env.THENVOI_CONTACT_AGENT_GROUP_ID;
   delete process.env.THENVOI_INJECT_API_KEY;
 }
 
@@ -585,6 +586,16 @@ describe('thenvoi channel adapter', () => {
   it('creates a hub room and routes contact events into it under hub_room strategy', async () => {
     setThenvoiEnv();
     process.env.THENVOI_CONTACT_STRATEGY = 'hub_room';
+    process.env.THENVOI_CONTACT_AGENT_GROUP_ID = 'ag-contact';
+    const { createAgentGroup } = await import('../db/index.js');
+    createAgentGroup({
+      id: 'ag-contact',
+      name: 'Contact Agent',
+      folder: 'contact-agent',
+      agent_provider: null,
+      created_at: new Date().toISOString(),
+    });
+
     await import('./thenvoi.js');
     const { initChannelAdapters } = await import('./channel-registry.js');
     const onInbound = vi.fn(
@@ -630,10 +641,16 @@ describe('thenvoi channel adapter', () => {
       participant: { participant_id: 'owner-1', role: 'member' },
     });
 
-    const { getModuleState, getMessagingGroupByPlatform } = await import('../db/index.js');
+    const { getModuleState, getMessagingGroupByPlatform, getMessagingGroupAgentByPair } =
+      await import('../db/index.js');
     expect(getModuleState('thenvoi', 'hub-room')).toMatchObject({ roomId: 'hub-room-1' });
     const mg = getMessagingGroupByPlatform('thenvoi', 'thenvoi:hub-room-1');
     expect(mg).toMatchObject({ name: 'Contact Hub', unknown_sender_policy: 'public' });
+    expect(getMessagingGroupAgentByPair(mg!.id, 'ag-contact')).toMatchObject({
+      agent_group_id: 'ag-contact',
+      engage_mode: 'mention',
+      session_mode: 'shared',
+    });
   });
 
   it('reuses an existing hub room across contact events without recreating it', async () => {

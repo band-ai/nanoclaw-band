@@ -4,8 +4,15 @@ import { ThenvoiClient } from '@thenvoi/rest-client';
 import type { ChannelAdapter, ChannelSetup, ConversationInfo, InboundRouteResult, OutboundMessage } from './adapter.js';
 import { registerChannelContainerConfig } from './channel-container-registry.js';
 import { registerChannelAdapter } from './channel-registry.js';
+import { getAllAgentGroups, getAgentGroup } from '../db/agent-groups.js';
 import { markInboundDeliveryProcessed } from '../db/inbound-delivery-ledger.js';
-import { getMessagingGroupByPlatform, createMessagingGroup, updateMessagingGroup } from '../db/messaging-groups.js';
+import {
+  getMessagingGroupByPlatform,
+  createMessagingGroup,
+  updateMessagingGroup,
+  createMessagingGroupAgent,
+  getMessagingGroupAgentByPair,
+} from '../db/messaging-groups.js';
 import { closeActiveSessionsForMessagingGroup } from '../db/sessions.js';
 import { getModuleState, setModuleState, deleteModuleState } from '../db/module-state.js';
 import { log } from '../log.js';
@@ -152,10 +159,12 @@ function setHubRoom(roomId: string): void {
   } satisfies ThenvoiHubRoomState);
 }
 
-function ensureHubMessagingGroup(roomId: string): void {
+function ensureHubMessagingGroup(roomId: string, agentGroupId: string | null): void {
   const platformId = formatThenvoiPlatformId(roomId);
+  let messagingGroupId: string;
   const existing = getMessagingGroupByPlatform(THENVOI_CHANNEL_TYPE, platformId);
   if (existing) {
+    messagingGroupId = existing.id;
     if (existing.unknown_sender_policy !== 'public' || existing.name !== HUB_ROOM_NAME) {
       updateMessagingGroup(existing.id, {
         name: HUB_ROOM_NAME,
@@ -163,16 +172,32 @@ function ensureHubMessagingGroup(roomId: string): void {
         unknown_sender_policy: 'public',
       });
     }
-    return;
+  } else {
+    messagingGroupId = `mg-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    createMessagingGroup({
+      id: messagingGroupId,
+      channel_type: THENVOI_CHANNEL_TYPE,
+      platform_id: platformId,
+      name: HUB_ROOM_NAME,
+      is_group: 1,
+      unknown_sender_policy: 'public',
+      denied_at: null,
+      created_at: now(),
+    });
   }
-  createMessagingGroup({
-    id: `mg-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-    channel_type: THENVOI_CHANNEL_TYPE,
-    platform_id: platformId,
-    name: HUB_ROOM_NAME,
-    is_group: 1,
-    unknown_sender_policy: 'public',
-    denied_at: null,
+
+  if (!agentGroupId) return;
+  if (getMessagingGroupAgentByPair(messagingGroupId, agentGroupId)) return;
+  createMessagingGroupAgent({
+    id: `mga-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+    messaging_group_id: messagingGroupId,
+    agent_group_id: agentGroupId,
+    engage_mode: 'mention',
+    engage_pattern: null,
+    sender_scope: 'all',
+    ignored_message_policy: 'drop',
+    session_mode: 'shared',
+    priority: 0,
     created_at: now(),
   });
 }
@@ -581,13 +606,7 @@ class ThenvoiChannelAdapter implements ChannelAdapter {
     if (!this.dedupContactEvent(event)) return;
 
     const strategy = this.config.contactStrategy;
-    if (strategy === 'disabled') {
-      log.warn('Band.ai contact event received (strategy=disabled)', {
-        type: event.type,
-        payload: event.payload,
-      });
-      return;
-    }
+    if (strategy === 'disabled') return;
 
     if (strategy === 'hub_room') {
       await this.handleContactHubRoom(event);
@@ -641,10 +660,27 @@ class ThenvoiChannelAdapter implements ChannelAdapter {
     }
   }
 
+  private resolveHubAgentGroupId(): string | null {
+    if (this.config.contactAgentGroupId) {
+      if (getAgentGroup(this.config.contactAgentGroupId)) return this.config.contactAgentGroupId;
+      log.warn('Band.ai contact hub agent group not found; hub messages will not wake an agent', {
+        agentGroupId: this.config.contactAgentGroupId,
+      });
+      return null;
+    }
+
+    const agentGroups = getAllAgentGroups();
+    if (agentGroups.length === 1) return agentGroups[0].id;
+    log.warn('Band.ai contact hub has no unambiguous agent group; set THENVOI_CONTACT_AGENT_GROUP_ID', {
+      agentGroupCount: agentGroups.length,
+    });
+    return null;
+  }
+
   private async ensureHubRoom(): Promise<string | null> {
     const persisted = getHubRoomState();
     if (persisted) {
-      ensureHubMessagingGroup(persisted.roomId);
+      ensureHubMessagingGroup(persisted.roomId, this.resolveHubAgentGroupId());
       return persisted.roomId;
     }
     if (this.hubRoomInitPromise) return this.hubRoomInitPromise;
@@ -673,7 +709,7 @@ class ThenvoiChannelAdapter implements ChannelAdapter {
         }
 
         setHubRoom(newRoomId);
-        ensureHubMessagingGroup(newRoomId);
+        ensureHubMessagingGroup(newRoomId, this.resolveHubAgentGroupId());
         try {
           await this.link.subscribeRoom(newRoomId);
         } catch (err) {
