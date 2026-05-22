@@ -73,7 +73,9 @@ export function toHostPath(
 export function rewriteOneCliProxyArgs(args: string[], hostname = composeOneCliHostname()): void {
   if (!hostname) return;
   for (let i = 0; i < args.length; i += 1) {
-    args[i] = args[i].replace(/host\.docker\.internal/g, hostname);
+    if (/^https?_proxy=/i.test(args[i])) {
+      args[i] = args[i].replace(/host\.docker\.internal/g, hostname);
+    }
   }
 }
 
@@ -551,6 +553,7 @@ async function buildContainerArgs(
   if (!onecliApplied) {
     throw new Error('OneCLI gateway not applied — refusing to spawn container without credentials');
   }
+  rewriteOneCliProxyArgs(args);
   log.info('OneCLI gateway applied', { containerName });
 
   const networkName = composeNetworkName();
