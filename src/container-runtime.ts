@@ -2,7 +2,7 @@
  * Container runtime abstraction for NanoClaw.
  * All runtime-specific logic lives here so swapping runtimes means changing one file.
  */
-import { execSync, spawn } from 'child_process';
+import { type ChildProcess, execSync, spawn } from 'child_process';
 import os from 'os';
 
 import { CONTAINER_INSTALL_LABEL } from './config.js';
@@ -50,7 +50,7 @@ export function stopContainer(name: string, timeoutSec: number = 1): void {
  * consolidation) doesn't block the host's sweep loop. The runtime still
  * SIGTERMs first, waits up to `timeoutSec`, then SIGKILLs.
  */
-export function stopContainerAsync(name: string, timeoutSec: number): void {
+export function stopContainerAsync(name: string, timeoutSec: number): ChildProcess {
   if (!/^[a-zA-Z0-9][a-zA-Z0-9_.-]*$/.test(name)) {
     throw new Error(`Invalid container name: ${name}`);
   }
@@ -61,8 +61,8 @@ export function stopContainerAsync(name: string, timeoutSec: number): void {
     stdio: 'ignore',
     detached: true,
   });
-  child.on('error', () => {});
   child.unref();
+  return child;
 }
 
 /** Ensure the container runtime is running, starting it if needed. */

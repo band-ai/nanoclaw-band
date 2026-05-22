@@ -8,11 +8,6 @@ on:
         required: false
         type: string
         default: main
-      mirror_branch:
-        description: Branch in thenvoi/nanoclaw-thenvoi that should mirror upstream
-        required: false
-        type: string
-        default: sync-upstream-2
       dry_run:
         description: Validate without pushing the mirror branch
         required: false
@@ -22,7 +17,7 @@ on:
     - cron: '17 6 * * *'
 
 concurrency:
-  group: upstream-sync-${{ github.event.inputs.mirror_branch || 'sync-upstream-2' }}
+  group: upstream-sync-sync-upstream-2
   cancel-in-progress: false
 
 permissions:
@@ -36,7 +31,7 @@ jobs:
     env:
       UPSTREAM_REPO: qwibitai/nanoclaw
       UPSTREAM_REF_INPUT: ${{ github.event.inputs.upstream_ref }}
-      MIRROR_BRANCH_INPUT: ${{ github.event.inputs.mirror_branch }}
+      MIRROR_BRANCH: sync-upstream-2
       DRY_RUN_INPUT: ${{ github.event.inputs.dry_run }}
     steps:
       - name: Check out fork
@@ -57,7 +52,7 @@ jobs:
         run: |
           set -euo pipefail
           upstream_ref="${UPSTREAM_REF_INPUT:-main}"
-          mirror_branch="${MIRROR_BRANCH_INPUT:-sync-upstream-2}"
+          mirror_branch="${MIRROR_BRANCH}"
 
           git remote add upstream "https://github.com/${UPSTREAM_REPO}.git" 2>/dev/null || git remote set-url upstream "https://github.com/${UPSTREAM_REPO}.git"
           git fetch upstream "${upstream_ref}" --tags

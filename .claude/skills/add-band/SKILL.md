@@ -104,7 +104,7 @@ THENVOI_MEMORY_TOOLS=false
 THENVOI_MEMORY_LOAD_ON_START=false
 THENVOI_MEMORY_CONSOLIDATION=false
 
-# Contact-event strategy: disabled | callback | hub_room.
+# Contact-event strategy: disabled | hub_room.
 # See "Contact strategies" below.
 THENVOI_CONTACT_STRATEGY=disabled
 ```
@@ -115,14 +115,13 @@ For normal hosted Band.ai, leave `THENVOI_BASE_URL` unset or set it to `https://
 
 - `THENVOI_MEMORY_TOOLS` — exposes `mcp__nanoclaw__band_list_memories`, `band_store_memory`, `band_supersede_memory`, etc. to the agent. The other two memory knobs are no-ops without this enabled.
 - `THENVOI_MEMORY_LOAD_ON_START` — at container startup, fetch each room participant's stored memories via the SDK (`thenvoi_list_memories`, scope=`subject`, top 10 per participant) and append them to the system prompt as `## Existing Memories About Room Participants`. Also injects a synthetic `[System]` message into the room when a new participant joins mid-session (`participant_added`), with up to 10 of that participant's memories. Failure is non-fatal: the agent still starts.
-- `THENVOI_MEMORY_CONSOLIDATION` — after the poll loop exits (typically on SIGTERM from `docker stop` when the host kills the container), run a one-shot consolidation pass against the same provider session. The pass is forbidden from sending chat messages or `<message to="…">` blocks; it only calls memory tools and emits thought events. Output is drained, not delivered. The host's `killContainer()` uses a 30-minute SIGTERM grace window so the pass has time to finish before SIGKILL.
+- `THENVOI_MEMORY_CONSOLIDATION` — after the poll loop exits (typically on SIGTERM from `docker stop` when the host kills the container), run a one-shot consolidation pass against the same provider session. The pass is forbidden from sending chat messages or `<message to="…">` blocks; only memory tools are available at runtime. Output is drained, not delivered. No-op unless `THENVOI_MEMORY_TOOLS` is also enabled.
 
 #### Contact strategies
 
 `THENVOI_CONTACT_STRATEGY` controls what the host does with `contact_request_received`, `contact_request_updated`, `contact_added`, and `contact_removed` events emitted by Band:
 
 - `disabled` (default) — events are dropped silently. The agent never sees contacts; outbound contact tools still work.
-- `callback` — `contact_request_received` events are auto-approved via `agentApiContacts.respondToAgentContactRequest({ action: 'approve', request_id })`. Other contact events are ignored.
 - `hub_room` — lazily provision a per-agent "Contact Hub" Band chat room, add `THENVOI_OWNER_ID` (or the value resolved from `GET /agent/me`) as a member, persist its room id in `data/v2.db` module state, and forward every contact event into the hub as a synthetic message. The owner replies in the hub.
 
 Sync the environment file if this instance uses `data/env/env`:
@@ -170,7 +169,7 @@ For v1-style Band parity, use an engagement policy that responds in the selected
 - Memory tools gated by `THENVOI_MEMORY_TOOLS` and disabled for the run if the Band memory API is unavailable
 - Optional participant-memory pre-load at startup (`THENVOI_MEMORY_LOAD_ON_START`)
 - Optional end-of-session memory consolidation pass (`THENVOI_MEMORY_CONSOLIDATION`)
-- Contact-event handling: drop, auto-approve callback, or hub-room forwarding (`THENVOI_CONTACT_STRATEGY`)
+- Contact-event handling: drop or hub-room forwarding (`THENVOI_CONTACT_STRATEGY`)
 - Hosted Band sessions avoid direct API-key env injection; local HTTP validation can opt in
 
 ## Troubleshooting

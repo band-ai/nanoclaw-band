@@ -25,7 +25,11 @@ interface MemoryItem {
 }
 
 function shouldLoad(): boolean {
-  return process.env.THENVOI_MEMORY_LOAD_ON_START === 'true' && process.env.NANOCLAW_CHANNEL === 'thenvoi';
+  return (
+    process.env.THENVOI_MEMORY_TOOLS === 'true' &&
+    process.env.THENVOI_MEMORY_LOAD_ON_START === 'true' &&
+    process.env.NANOCLAW_CHANNEL === 'thenvoi'
+  );
 }
 
 export async function loadParticipantMemories(): Promise<string> {

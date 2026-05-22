@@ -33,6 +33,10 @@ function memoryToolsEnabled(): boolean {
   return env('THENVOI_MEMORY_TOOLS') === 'true' && !memoryDisabledForRun;
 }
 
+function consolidationMode(): boolean {
+  return env('NANOCLAW_MEMORY_CONSOLIDATION_ACTIVE') === 'true';
+}
+
 function isMemoryTool(sdkToolName: string): boolean {
   return sdkToolName.includes('memory') || sdkToolName.includes('memories');
 }
@@ -117,6 +121,19 @@ function memoryDisabledResult(toolName: string): CallToolResult {
   };
 }
 
+function blockedDuringConsolidation(sdkToolName: string): CallToolResult | null {
+  if (!consolidationMode() || isMemoryTool(sdkToolName)) return null;
+  return {
+    content: [
+      {
+        type: 'text',
+        text: `${toBandToolName(sdkToolName)} is blocked during Band.ai memory consolidation. Only memory tools are available in this mode.`,
+      },
+    ],
+    isError: true,
+  };
+}
+
 function blockedInMainRoom(sdkToolName: string): CallToolResult | null {
   if (!mainControlRoom() || !MUTATION_TOOLS_BLOCKED_IN_MAIN_ROOM.has(sdkToolName)) return null;
   return {
@@ -160,6 +177,8 @@ function buildBandToolDefinitions(): McpToolDefinition[] {
       {
         tool,
         async handler(args) {
+          const consolidationBlocked = blockedDuringConsolidation(sdkToolName);
+          if (consolidationBlocked) return consolidationBlocked;
           const blocked = blockedInMainRoom(sdkToolName);
           if (blocked) return blocked;
           if (isMemoryTool(sdkToolName) && memoryDisabledForRun) return memoryDisabledResult(sdkToolName);

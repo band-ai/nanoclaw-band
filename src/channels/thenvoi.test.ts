@@ -1,6 +1,6 @@
 import { beforeEach, afterEach, describe, expect, it, vi } from 'vitest';
 
-import type { InboundRouteResult } from './adapter.js';
+import type { InboundMessage, InboundRouteResult } from './adapter.js';
 import type { InboundDeliveryKey } from '../db/index.js';
 
 interface QueuedEvent {
@@ -33,10 +33,9 @@ class FakeThenvoiClient {
     createAgentChatEvent: vi.fn(async () => ({ data: { ok: true } })),
   };
   public readonly agentApiMemories = {
-    listAgentMemories: vi.fn(
-      async (_args: { subject_id: string; scope: string }) =>
-        ({ data: { data: [] as Array<{ type?: string; content?: string }> } }),
-    ),
+    listAgentMemories: vi.fn(async (_args: { subject_id: string; scope: string }) => ({
+      data: { data: [] as Array<{ type?: string; content?: string }> },
+    })),
   };
 
   public constructor() {
@@ -190,6 +189,7 @@ describe('thenvoi channel adapter', () => {
         sender_type: 'User',
         sender_name: 'User One',
         inserted_at: new Date().toISOString(),
+        metadata: { mentions: [{ id: 'agent-1' }] },
       },
     });
 
@@ -197,13 +197,59 @@ describe('thenvoi channel adapter', () => {
     expect(onInbound).toHaveBeenCalledWith(
       'thenvoi:room-1',
       null,
-      expect.objectContaining({ id: 'msg-1', content: expect.objectContaining({ text: 'hello' }) }),
+      expect.objectContaining({
+        id: 'msg-1',
+        content: expect.objectContaining({ text: 'hello' }),
+        isMention: true,
+      }),
     );
     expect(fakeLinks[0].markProcessing).toHaveBeenCalledWith('room-1', 'msg-1');
     expect(fakeLinks[0].markProcessed).toHaveBeenCalledWith('room-1', 'msg-1');
     expect(
       getInboundDelivery({ channelType: 'thenvoi', platformId: 'thenvoi:room-1', platformMessageId: 'msg-1' })?.status,
     ).toBe('processed');
+  });
+
+  it('does not mark unmentioned Band room messages as mentions', async () => {
+    setThenvoiEnv();
+    await import('./thenvoi.js');
+    const { initChannelAdapters } = await import('./channel-registry.js');
+    const result: InboundRouteResult = {
+      status: 'dropped',
+      platformMessageId: 'msg-unmentioned',
+      reason: 'no_agent_engaged',
+      audited: true,
+      retryable: false,
+      intentional: false,
+    };
+    const onInbound = vi.fn(async (_platformId: string, _threadId: string | null, _message: InboundMessage) => result);
+
+    await initChannelAdapters(() => ({
+      onInbound,
+      onInboundEvent: async () => result,
+      onMetadata: () => {},
+      onAction: () => {},
+    }));
+
+    fakeLinks[0].emit({
+      type: 'message_created',
+      roomId: 'room-1',
+      payload: {
+        id: 'msg-unmentioned',
+        content: 'room chatter',
+        message_type: 'text',
+        sender_id: 'user-1',
+        sender_type: 'User',
+        sender_name: 'User One',
+        inserted_at: new Date().toISOString(),
+        metadata: { mentions: [{ id: 'someone-else' }] },
+      },
+    });
+
+    await waitFor(() => onInbound.mock.calls.length === 1);
+    expect(onInbound.mock.calls[0][2]).toEqual(expect.objectContaining({ isMention: false }));
+    expect(fakeLinks[0].markProcessing).not.toHaveBeenCalled();
+    expect(fakeLinks[0].markProcessed).not.toHaveBeenCalled();
   });
 
   it('delivers generic outbound chat rows through Band REST fallback', async () => {
@@ -519,77 +565,21 @@ describe('thenvoi channel adapter', () => {
     delete process.env.THENVOI_OWNER_ID;
   });
 
-  it('auto-approves contact requests under callback strategy', async () => {
+  it('rejects the removed callback contact strategy instead of auto-approving requests', async () => {
     setThenvoiEnv();
     process.env.THENVOI_CONTACT_STRATEGY = 'callback';
     await import('./thenvoi.js');
-    const { initChannelAdapters } = await import('./channel-registry.js');
-    const result: InboundRouteResult = {
-      status: 'persisted',
-      platformMessageId: 'unused',
-      sessionIds: [],
-      sessionMessageIds: [],
-    };
+    const { getChannelAdapter, initChannelAdapters } = await import('./channel-registry.js');
 
     await initChannelAdapters(() => ({
-      onInbound: async () => result,
-      onInboundEvent: async () => result,
+      onInbound: async () => undefined,
+      onInboundEvent: async () => undefined,
       onMetadata: () => {},
       onAction: () => {},
     }));
 
-    fakeLinks[0].emit({
-      type: 'contact_request_received',
-      roomId: null,
-      payload: {
-        id: 'req-1',
-        from_handle: 'jane',
-        from_name: 'Jane Doe',
-        status: 'pending',
-        inserted_at: new Date().toISOString(),
-      },
-    });
-
-    await waitFor(() => fakeRestClients[0].agentApiContacts.respondToAgentContactRequest.mock.calls.length === 1);
-    expect(fakeRestClients[0].agentApiContacts.respondToAgentContactRequest).toHaveBeenCalledWith({
-      action: 'approve',
-      request_id: 'req-1',
-    });
-  });
-
-  it('deduplicates repeated contact events under callback strategy', async () => {
-    setThenvoiEnv();
-    process.env.THENVOI_CONTACT_STRATEGY = 'callback';
-    await import('./thenvoi.js');
-    const { initChannelAdapters } = await import('./channel-registry.js');
-    const result: InboundRouteResult = {
-      status: 'persisted',
-      platformMessageId: 'unused',
-      sessionIds: [],
-      sessionMessageIds: [],
-    };
-
-    await initChannelAdapters(() => ({
-      onInbound: async () => result,
-      onInboundEvent: async () => result,
-      onMetadata: () => {},
-      onAction: () => {},
-    }));
-
-    const payload = {
-      id: 'req-dup',
-      from_handle: 'jane',
-      from_name: 'Jane Doe',
-      status: 'pending',
-      inserted_at: new Date().toISOString(),
-    };
-
-    fakeLinks[0].emit({ type: 'contact_request_received', roomId: null, payload });
-    fakeLinks[0].emit({ type: 'contact_request_received', roomId: null, payload });
-
-    await waitFor(() => fakeRestClients[0].agentApiContacts.respondToAgentContactRequest.mock.calls.length >= 1);
-    await new Promise((resolve) => setTimeout(resolve, 0));
-    expect(fakeRestClients[0].agentApiContacts.respondToAgentContactRequest).toHaveBeenCalledTimes(1);
+    expect(getChannelAdapter('thenvoi')).toBeUndefined();
+    expect(fakeRestClients).toHaveLength(0);
   });
 
   it('creates a hub room and routes contact events into it under hub_room strategy', async () => {

@@ -83,13 +83,11 @@ describe('stopContainerAsync', () => {
 
     stopContainerAsync('nanoclaw-band-789', 1800);
 
-    expect(mockSpawn).toHaveBeenCalledWith(
-      CONTAINER_RUNTIME_BIN,
-      ['stop', '-t', '1800', 'nanoclaw-band-789'],
-      { stdio: 'ignore', detached: true },
-    );
+    expect(mockSpawn).toHaveBeenCalledWith(CONTAINER_RUNTIME_BIN, ['stop', '-t', '1800', 'nanoclaw-band-789'], {
+      stdio: 'ignore',
+      detached: true,
+    });
     expect(child.unref).toHaveBeenCalled();
-    expect(child.on).toHaveBeenCalledWith('error', expect.any(Function));
   });
 
   it('rejects names with shell metacharacters', () => {

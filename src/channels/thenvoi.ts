@@ -88,6 +88,20 @@ function isProcessableRouteResult(result: void | InboundRouteResult): result is 
   return result?.status === 'persisted' || (result?.status === 'dropped' && result.intentional);
 }
 
+function mentionReferencesAgent(mention: unknown, agentId: string): boolean {
+  if (typeof mention === 'string') return mention === agentId;
+  if (!mention || typeof mention !== 'object') return false;
+  const value = mention as Record<string, unknown>;
+  return [value.id, value.uuid, value.agent_id, value.agentId, value.participant_id, value.participantId].some(
+    (candidate) => candidate === agentId,
+  );
+}
+
+function metadataMentionsAgent(metadata: Record<string, unknown> | null | undefined, agentId: string): boolean {
+  const mentions = metadata?.mentions;
+  return Array.isArray(mentions) && mentions.some((mention) => mentionReferencesAgent(mention, agentId));
+}
+
 function now(): string {
   return new Date().toISOString();
 }
@@ -136,10 +150,6 @@ function setHubRoom(roomId: string): void {
     platformId: formatThenvoiPlatformId(roomId),
     createdAt: now(),
   } satisfies ThenvoiHubRoomState);
-}
-
-function clearHubRoom(): void {
-  deleteModuleState(THENVOI_MODULE_NAME, HUB_ROOM_STATE_KEY);
 }
 
 function ensureHubMessagingGroup(roomId: string): void {
@@ -427,13 +437,9 @@ class ThenvoiChannelAdapter implements ChannelAdapter {
    *
    * Failure is non-fatal — the room still functions without preloaded memory.
    */
-  private async maybeInjectParticipantMemories(
-    roomId: string | null,
-    payload: Record<string, unknown>,
-  ): Promise<void> {
+  private async maybeInjectParticipantMemories(roomId: string | null, payload: Record<string, unknown>): Promise<void> {
     if (!this.config.memoryLoadOnStart || !this.setupConfig) return;
-    const resolvedRoomId =
-      roomId ?? (typeof payload.chat_room_id === 'string' ? payload.chat_room_id : null);
+    const resolvedRoomId = roomId ?? (typeof payload.chat_room_id === 'string' ? payload.chat_room_id : null);
     if (!resolvedRoomId) return;
 
     const platformId = formatThenvoiPlatformId(resolvedRoomId);
@@ -530,7 +536,7 @@ class ThenvoiChannelAdapter implements ChannelAdapter {
       kind: 'chat',
       content,
       timestamp: payload.inserted_at,
-      isMention: true,
+      isMention: metadataMentionsAgent(payload.metadata, this.config.agentId),
     });
 
     if (!isProcessableRouteResult(result)) return;
@@ -583,34 +589,8 @@ class ThenvoiChannelAdapter implements ChannelAdapter {
       return;
     }
 
-    if (strategy === 'callback') {
-      await this.handleContactCallback(event);
-      return;
-    }
-
     if (strategy === 'hub_room') {
       await this.handleContactHubRoom(event);
-      return;
-    }
-  }
-
-  private async handleContactCallback(event: PlatformEvent): Promise<void> {
-    if (event.type !== 'contact_request_received') {
-      log.info('Band.ai callback strategy ignoring non-request contact event', { type: event.type });
-      return;
-    }
-    const payload = event.payload as { id: string; from_handle?: string };
-    log.info('Band.ai auto-approving contact request (callback strategy)', {
-      requestId: payload.id,
-      from: payload.from_handle,
-    });
-    try {
-      await this.restClient.agentApiContacts.respondToAgentContactRequest({
-        action: 'approve',
-        request_id: payload.id,
-      });
-    } catch (err) {
-      log.error('Band.ai failed to auto-approve contact request', { requestId: payload.id, err });
     }
   }
 

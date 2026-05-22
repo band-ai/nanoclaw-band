@@ -82,6 +82,8 @@ Required values:
 - the `nanoclaw` service currently runs as root inside the host container so it can use the Docker socket reliably across hosts; agent containers still run with their normal per-invocation user handling
 - `NANOCLAW_CONFIG_DIR` must point at your host NanoClaw config dir
 - `NANOCLAW_BUILD_HASH` should be set to the current commit hash
+- `COMPOSE_ONECLI_IMAGE` must be a pinned OneCLI image tag or digest, not `latest`
+- `COMPOSE_POSTGRES_PASSWORD` must be changed to a non-default value
 
 Typical local example:
 
@@ -93,10 +95,11 @@ NANOCLAW_SHARED_TMP=/tmp/nanoclaw-shared
 NANOCLAW_DOCKER_NETWORK=nanoclaw-compose
 NANOCLAW_BUILD_HASH=$(git rev-parse HEAD)
 COMPOSE_CONTAINER_IMAGE=nanoclaw-agent:latest
+COMPOSE_ONECLI_IMAGE=ghcr.io/onecli/onecli:REPLACE_WITH_PINNED_VERSION
 COMPOSE_ONECLI_DASHBOARD_PORT=10254
 COMPOSE_ONECLI_GATEWAY_PORT=10255
 COMPOSE_POSTGRES_USER=onecli
-COMPOSE_POSTGRES_PASSWORD=onecli
+COMPOSE_POSTGRES_PASSWORD=replace-me-with-random-password
 COMPOSE_POSTGRES_DB=onecli
 ```
 

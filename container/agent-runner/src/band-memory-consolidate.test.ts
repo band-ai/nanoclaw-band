@@ -3,7 +3,7 @@ import { describe, expect, test, beforeEach, afterEach, mock } from 'bun:test';
 import { runMemoryConsolidation } from './band-memory-consolidate.js';
 import type { AgentProvider, AgentQuery, ProviderEvent } from './providers/types.js';
 
-const ENV_KEYS = ['THENVOI_MEMORY_CONSOLIDATION', 'NANOCLAW_CHANNEL'];
+const ENV_KEYS = ['THENVOI_MEMORY_TOOLS', 'THENVOI_MEMORY_CONSOLIDATION', 'NANOCLAW_CHANNEL'];
 let snapshot: Record<string, string | undefined>;
 
 beforeEach(() => {
@@ -50,6 +50,7 @@ describe('runMemoryConsolidation', () => {
   });
 
   test('skips when channel is not thenvoi', async () => {
+    process.env.THENVOI_MEMORY_TOOLS = 'true';
     process.env.THENVOI_MEMORY_CONSOLIDATION = 'true';
     process.env.NANOCLAW_CHANNEL = 'discord';
     const { provider, query } = makeProvider([]);
@@ -59,6 +60,7 @@ describe('runMemoryConsolidation', () => {
   });
 
   test('skips when no continuation is available', async () => {
+    process.env.THENVOI_MEMORY_TOOLS = 'true';
     process.env.THENVOI_MEMORY_CONSOLIDATION = 'true';
     process.env.NANOCLAW_CHANNEL = 'thenvoi';
     const { provider, query } = makeProvider([]);
@@ -68,6 +70,7 @@ describe('runMemoryConsolidation', () => {
   });
 
   test('drains events and forwards continuation to provider', async () => {
+    process.env.THENVOI_MEMORY_TOOLS = 'true';
     process.env.THENVOI_MEMORY_CONSOLIDATION = 'true';
     process.env.NANOCLAW_CHANNEL = 'thenvoi';
     const events: ProviderEvent[] = [
@@ -78,10 +81,17 @@ describe('runMemoryConsolidation', () => {
 
     await runMemoryConsolidation({ provider, providerName: 'claude', cwd: '/workspace/agent', continuation: 'sess-1' });
     expect(query).toHaveBeenCalledTimes(1);
-    const callArg = query.mock.calls[0][0] as { continuation: string; cwd: string; prompt: string };
+    const callArg = query.mock.calls[0][0] as {
+      continuation: string;
+      cwd: string;
+      env: Record<string, string>;
+      prompt: string;
+    };
     expect(callArg.continuation).toBe('sess-1');
     expect(callArg.cwd).toBe('/workspace/agent');
+    expect(callArg.env.NANOCLAW_MEMORY_CONSOLIDATION_ACTIVE).toBe('true');
     expect(callArg.prompt).toContain('memory consolidation mode');
     expect(callArg.prompt).toContain('mcp__nanoclaw__band_list_memories');
+    expect(callArg.prompt).toContain('Do not store user- or agent-specific memories');
   });
 });

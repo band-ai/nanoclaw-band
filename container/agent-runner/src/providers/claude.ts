@@ -11,6 +11,16 @@ function log(msg: string): void {
   console.error(`[claude-provider] ${msg}`);
 }
 
+function mergeEnv(...sources: Array<Record<string, string | undefined>>): Record<string, string> {
+  const merged: Record<string, string> = {};
+  for (const source of sources) {
+    for (const [key, value] of Object.entries(source)) {
+      if (value !== undefined) merged[key] = value;
+    }
+  }
+  return merged;
+}
+
 // Deferred SDK builtins that either sidestep nanoclaw's own scheduling or
 // don't fit our async message-passing model (they're designed for Claude
 // Code's interactive UI and would hang here).
@@ -300,6 +310,13 @@ export class ClaudeProvider implements AgentProvider {
     stream.push(input.prompt);
 
     const instructions = input.systemContext?.instructions;
+    const queryEnv = mergeEnv(this.env, input.env ?? {});
+    const mcpServers = Object.fromEntries(
+      Object.entries(this.mcpServers).map(([name, server]) => [
+        name,
+        { ...server, env: mergeEnv(server.env, input.env ?? {}) },
+      ]),
+    );
 
     const sdkResult = sdkQuery({
       prompt: stream,
@@ -314,11 +331,11 @@ export class ClaudeProvider implements AgentProvider {
           ...Object.keys(this.mcpServers).map(mcpAllowPattern),
         ],
         disallowedTools: SDK_DISALLOWED_TOOLS,
-        env: this.env,
+        env: queryEnv,
         permissionMode: 'bypassPermissions',
         allowDangerouslySkipPermissions: true,
         settingSources: ['project', 'user'],
-        mcpServers: this.mcpServers,
+        mcpServers,
         hooks: {
           PreToolUse: [{ hooks: [preToolUseHook] }],
           PostToolUse: [{ hooks: [postToolUseHook] }],

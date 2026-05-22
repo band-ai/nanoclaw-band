@@ -7,6 +7,7 @@ function clearEnv(): void {
   delete process.env.THENVOI_API_KEY;
   delete process.env.THENVOI_IS_MAIN_CONTROL_ROOM;
   delete process.env.THENVOI_MEMORY_TOOLS;
+  delete process.env.NANOCLAW_MEMORY_CONSOLIDATION_ACTIVE;
 }
 
 beforeEach(() => {
@@ -51,5 +52,23 @@ describe('Band.ai MCP tools', () => {
     expect(result.isError).toBe(true);
     expect(result.content[0].type).toBe('text');
     expect(result.content[0].text).toContain('blocked in the Band.ai main control room');
+  });
+
+  it('blocks non-memory Band tools during memory consolidation', async () => {
+    process.env.THENVOI_ROOM_ID = 'room-1';
+    process.env.THENVOI_AGENT_ID = 'agent-1';
+    process.env.THENVOI_REST_URL = 'https://band.example.test';
+    process.env.THENVOI_MEMORY_TOOLS = 'true';
+    process.env.NANOCLAW_MEMORY_CONSOLIDATION_ACTIVE = 'true';
+
+    await import('./thenvoi.js');
+    const { getRegisteredTool } = await import('./server.js');
+    const tool = getRegisteredTool('band_send_message');
+
+    const result = await tool!.handler({ content: 'should not send', mentions: [{ id: 'owner-1' }] });
+
+    expect(result.isError).toBe(true);
+    expect(result.content[0].type).toBe('text');
+    expect(result.content[0].text).toContain('blocked during Band.ai memory consolidation');
   });
 });

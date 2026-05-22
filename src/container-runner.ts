@@ -77,8 +77,15 @@ export function rewriteOneCliProxyArgs(args: string[], hostname = composeOneCliH
   }
 }
 
+interface ActiveContainer {
+  process: ChildProcess;
+  containerName: string;
+  state: 'running' | 'stopping';
+  stopReason?: string;
+}
+
 /** Active containers tracked by session ID. */
-const activeContainers = new Map<string, { process: ChildProcess; containerName: string }>();
+const activeContainers = new Map<string, ActiveContainer>();
 
 /**
  * In-flight wake promises, keyed by session id. Deduplicates concurrent
@@ -111,9 +118,17 @@ export function isContainerRunning(sessionId: string): boolean {
  * can branch on the boolean.
  */
 export function wakeContainer(session: Session): Promise<boolean> {
-  if (activeContainers.has(session.id)) {
+  const active = activeContainers.get(session.id);
+  if (active?.state === 'running') {
     log.debug('Container already running', { sessionId: session.id });
     return Promise.resolve(true);
+  }
+  if (active?.state === 'stopping') {
+    log.debug('Container is stopping; wake will retry after shutdown', {
+      sessionId: session.id,
+      reason: active.stopReason,
+    });
+    return Promise.resolve(false);
   }
   const existing = wakePromises.get(session.id);
   if (existing) {
@@ -160,7 +175,7 @@ async function spawnContainer(session: Session): Promise<void> {
   // Resolve the effective provider/channel contributions they declare
   // (extra mounts, env passthrough). Computed once and threaded through both
   // buildMounts and buildContainerArgs so side effects (mkdir, etc.) fire once.
-  const { provider, contribution } = await resolveContainerContribution(session, agentGroup, containerConfig);
+  const contribution = await resolveContainerContribution(session, agentGroup, containerConfig);
 
   const mounts = buildMounts(agentGroup, session, containerConfig, contribution);
   const containerName = `nanoclaw-v2-${agentGroup.folder}-${Date.now()}`;
@@ -172,7 +187,6 @@ async function spawnContainer(session: Session): Promise<void> {
     containerName,
     agentGroup,
     containerConfig,
-    provider,
     contribution,
     agentIdentifier,
   );
@@ -187,7 +201,7 @@ async function spawnContainer(session: Session): Promise<void> {
 
   const container = spawn(CONTAINER_RUNTIME_BIN, args, { stdio: ['ignore', 'pipe', 'pipe'] });
 
-  activeContainers.set(session.id, { process: container, containerName });
+  activeContainers.set(session.id, { process: container, containerName, state: 'running' });
   markContainerRunning(session.id);
 
   // Log stderr
@@ -221,26 +235,42 @@ async function spawnContainer(session: Session): Promise<void> {
 }
 
 /**
- * Stop grace period for graceful container shutdown. The container's SIGTERM
- * handler may run end-of-session work (Band.ai memory consolidation, in-flight
- * provider query wind-down) that we don't want SIGKILLed mid-call. There's
- * no upper bound on agent work — set this generously and let the container
- * exit on its own when done.
- *
- * The stop is dispatched async (`stopContainerAsync`) so this wait does NOT
- * block the host's sweep loop or any caller of `killContainer`.
+ * Stop grace periods for container shutdown. Most kill reasons are recovery
+ * paths (stuck claim, absolute ceiling, rebuild) and should not leave the host
+ * blocked behind a dying container for minutes. A future explicitly graceful
+ * caller can opt into the longer path by including "graceful" in its reason.
  */
-const STOP_GRACE_SEC = 30 * 60;
+const FAST_STOP_GRACE_SEC = 10;
+const GRACEFUL_STOP_GRACE_SEC = 30 * 60;
+
+function stopGraceForReason(reason: string): number {
+  return reason.includes('graceful') ? GRACEFUL_STOP_GRACE_SEC : FAST_STOP_GRACE_SEC;
+}
 
 /** Kill a container for a session. */
 export function killContainer(sessionId: string, reason: string): void {
   const entry = activeContainers.get(sessionId);
   if (!entry) return;
 
-  log.info('Killing container', { sessionId, reason, containerName: entry.containerName });
+  const timeoutSec = stopGraceForReason(reason);
+  entry.state = 'stopping';
+  entry.stopReason = reason;
+  log.info('Stopping container', { sessionId, reason, containerName: entry.containerName, timeoutSec });
+
   try {
-    stopContainerAsync(entry.containerName, STOP_GRACE_SEC);
-  } catch {
+    const stopper = stopContainerAsync(entry.containerName, timeoutSec);
+    stopper.on('error', (err) => {
+      log.warn('docker stop failed; falling back to SIGKILL', { sessionId, reason, err });
+      entry.process.kill('SIGKILL');
+    });
+    stopper.on('close', (code) => {
+      if (code !== 0) {
+        log.warn('docker stop exited non-zero; falling back to SIGKILL', { sessionId, reason, code });
+        entry.process.kill('SIGKILL');
+      }
+    });
+  } catch (err) {
+    log.warn('Failed to start docker stop; falling back to SIGKILL', { sessionId, reason, err });
     entry.process.kill('SIGKILL');
   }
 }
@@ -268,7 +298,7 @@ async function resolveContainerContribution(
   session: Session,
   agentGroup: AgentGroup,
   containerConfig: import('./container-config.js').ContainerConfig,
-): Promise<{ provider: string; contribution: ProviderContainerContribution }> {
+): Promise<ProviderContainerContribution> {
   const provider = resolveProviderName(session.agent_provider, agentGroup.agent_provider, containerConfig.provider);
   const providerFn = getProviderContainerConfig(provider);
   const providerContribution = providerFn
@@ -290,7 +320,7 @@ async function resolveContainerContribution(
       })
     : {};
 
-  return { provider, contribution: mergeContainerContributions(providerContribution, channelContribution) };
+  return mergeContainerContributions(providerContribution, channelContribution);
 }
 
 function mergeContainerContributions(
@@ -493,7 +523,6 @@ async function buildContainerArgs(
   containerName: string,
   agentGroup: AgentGroup,
   containerConfig: import('./container-config.js').ContainerConfig,
-  provider: string,
   providerContribution: ProviderContainerContribution,
   agentIdentifier?: string,
 ): Promise<string[]> {
@@ -523,6 +552,9 @@ async function buildContainerArgs(
     throw new Error('OneCLI gateway not applied — refusing to spawn container without credentials');
   }
   log.info('OneCLI gateway applied', { containerName });
+
+  const networkName = composeNetworkName();
+  if (networkName) args.push('--network', networkName);
 
   // Host gateway
   args.push(...hostGatewayArgs());

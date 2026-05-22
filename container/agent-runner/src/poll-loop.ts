@@ -390,6 +390,7 @@ async function processQuery(
             dispatchResultText(event.text, routing);
           }
         }
+        userVisibleToolUsed = false;
       } else if (event.type === 'compacted') {
         // The SDK auto-compacted the conversation. After compaction the
         // model often drops the learned `<message to="…">` wrapping
