@@ -22,7 +22,9 @@ Skip to **Credentials** if all of these are already in place:
 - `container/agent-runner/src/band-memory-load.ts` and `container/agent-runner/src/band-memory-consolidate.ts` exist
 - `@thenvoi/sdk` and `@thenvoi/rest-client` are listed in `package.json`
 - `@thenvoi/sdk` and `@thenvoi/rest-client` are listed in `container/agent-runner/package.json`
+- `docker-compose.yml`, `Dockerfile.host`, `container/Dockerfile`, and `.env.compose.template` exist
 - `container/agent-runner/src/providers/claude.ts` contains `CLAUDE_CODE_EXECUTABLE`
+- `container/agent-runner/src/providers/mock.ts` wraps default replies in `<message to="...">` when a prompt has a source destination
 - `src/container-runner.ts` calls `rewriteOneCliProxyArgs(args)` after OneCLI applies container config
 
 Otherwise continue. Every step below is safe to re-run.
@@ -44,9 +46,12 @@ Band touches channel ingestion, route idempotency, outbound delivery markers, co
 ```bash
 git checkout origin/migrate/band-v2-foundation -- \
   .dockerignore \
+  .env.compose.template \
   .env.example \
   .gitignore \
   Dockerfile.host \
+  docker-compose.yml \
+  docs/docker-compose-deployment.md \
   container/Dockerfile \
   container/agent-runner/bun.lock \
   container/agent-runner/package.json \
@@ -61,8 +66,10 @@ git checkout origin/migrate/band-v2-foundation -- \
   container/agent-runner/src/mcp-tools/thenvoi.instructions.md \
   container/agent-runner/src/mcp-tools/thenvoi.test.ts \
   container/agent-runner/src/mcp-tools/thenvoi.ts \
+  container/agent-runner/src/poll-loop.test.ts \
   container/agent-runner/src/poll-loop.ts \
   container/agent-runner/src/providers/claude.ts \
+  container/agent-runner/src/providers/mock.ts \
   container/agent-runner/src/providers/types.ts \
   package.json \
   pnpm-lock.yaml \
