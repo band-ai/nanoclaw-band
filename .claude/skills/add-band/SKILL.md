@@ -14,11 +14,16 @@ Adds Band.ai chat support to NanoClaw. Thenvoi remains the load-bearing internal
 Skip to **Credentials** if all of these are already in place:
 
 - `src/channels/thenvoi.ts` exists
+- `src/channels/channel-container-registry.ts` exists
 - `src/channels/index.ts` contains `import './thenvoi.js';`
+- `src/db/inbound-delivery-ledger.ts`, `src/db/module-state.ts`, and `src/db/outbound-delivery-markers.ts` exist
 - `container/agent-runner/src/mcp-tools/thenvoi.ts` exists
 - `container/agent-runner/src/mcp-tools/index.ts` contains `import './thenvoi.js';`
+- `container/agent-runner/src/band-memory-load.ts` and `container/agent-runner/src/band-memory-consolidate.ts` exist
 - `@thenvoi/sdk` and `@thenvoi/rest-client` are listed in `package.json`
 - `@thenvoi/sdk` and `@thenvoi/rest-client` are listed in `container/agent-runner/package.json`
+- `container/agent-runner/src/providers/claude.ts` contains `CLAUDE_CODE_EXECUTABLE`
+- `src/container-runner.ts` calls `rewriteOneCliProxyArgs(args)` after OneCLI applies container config
 
 Otherwise continue. Every step below is safe to re-run.
 
@@ -32,59 +37,78 @@ git fetch origin migrate/band-v2-foundation
 
 If this integration has landed under a different branch name, use that branch in the `git show` commands below.
 
-### 2. Copy host-side Band files
+### 2. Copy the Band runtime file set
+
+Band touches channel ingestion, route idempotency, outbound delivery markers, container env projection, and the agent-runner MCP/tools loop. Copy the whole tested file set from the integration branch instead of only the obvious `thenvoi.ts` files; a partial copy can compile but fail at runtime, or fail typecheck because shared route contracts drifted.
 
 ```bash
-git show origin/migrate/band-v2-foundation:src/channels/thenvoi.ts > src/channels/thenvoi.ts
-git show origin/migrate/band-v2-foundation:src/modules/thenvoi-config.ts > src/modules/thenvoi-config.ts
-git show origin/migrate/band-v2-foundation:src/db/migrations/014-route-foundation-state.ts > src/db/migrations/014-route-foundation-state.ts
-git show origin/migrate/band-v2-foundation:src/db/inbound-delivery-ledger.ts > src/db/inbound-delivery-ledger.ts
-git show origin/migrate/band-v2-foundation:src/db/module-state.ts > src/db/module-state.ts
-git show origin/migrate/band-v2-foundation:src/db/outbound-delivery-markers.ts > src/db/outbound-delivery-markers.ts
+git checkout origin/migrate/band-v2-foundation -- \
+  .dockerignore \
+  .env.example \
+  .gitignore \
+  Dockerfile.host \
+  container/Dockerfile \
+  container/agent-runner/bun.lock \
+  container/agent-runner/package.json \
+  container/agent-runner/src/band-memory-consolidate.test.ts \
+  container/agent-runner/src/band-memory-consolidate.ts \
+  container/agent-runner/src/band-memory-load.test.ts \
+  container/agent-runner/src/band-memory-load.ts \
+  container/agent-runner/src/index.ts \
+  container/agent-runner/src/integration.test.ts \
+  container/agent-runner/src/mcp-tools/index.ts \
+  container/agent-runner/src/mcp-tools/server.ts \
+  container/agent-runner/src/mcp-tools/thenvoi.instructions.md \
+  container/agent-runner/src/mcp-tools/thenvoi.test.ts \
+  container/agent-runner/src/mcp-tools/thenvoi.ts \
+  container/agent-runner/src/poll-loop.ts \
+  container/agent-runner/src/providers/claude.ts \
+  container/agent-runner/src/providers/types.ts \
+  package.json \
+  pnpm-lock.yaml \
+  src/channels/adapter.ts \
+  src/channels/channel-container-registry.test.ts \
+  src/channels/channel-container-registry.ts \
+  src/channels/cli.ts \
+  src/channels/index.ts \
+  src/channels/thenvoi.test.ts \
+  src/channels/thenvoi.ts \
+  src/circuit-breaker.test.ts \
+  src/circuit-breaker.ts \
+  src/container-runner.test.ts \
+  src/container-runner.ts \
+  src/container-runtime.test.ts \
+  src/container-runtime.ts \
+  src/db/db-v2.test.ts \
+  src/db/inbound-delivery-ledger.ts \
+  src/db/index.ts \
+  src/db/migrations/014-route-foundation-state.ts \
+  src/db/migrations/index.ts \
+  src/db/module-state.ts \
+  src/db/outbound-delivery-markers.ts \
+  src/db/schema.ts \
+  src/db/session-db.test.ts \
+  src/db/session-db.ts \
+  src/db/sessions.ts \
+  src/host-core.test.ts \
+  src/index.ts \
+  src/modules/agent-to-agent/agent-route.test.ts \
+  src/modules/thenvoi-config.ts \
+  src/providers/claude.ts \
+  src/providers/index.ts \
+  src/router.ts
 ```
 
-Also copy any related test files if this is a development checkout:
+This command also brings in the self-registration imports, migration registration, and db barrel exports. If the checkout has local changes in any listed file, review `git diff` first and merge deliberately instead of blindly overwriting.
+
+### 3. Install packages from the copied lockfiles
 
 ```bash
-git show origin/migrate/band-v2-foundation:src/channels/thenvoi.test.ts > src/channels/thenvoi.test.ts
+pnpm install --frozen-lockfile
+cd container/agent-runner && bun install --frozen-lockfile
 ```
 
-### 3. Copy container Band tools
-
-```bash
-git show origin/migrate/band-v2-foundation:container/agent-runner/src/mcp-tools/thenvoi.ts > container/agent-runner/src/mcp-tools/thenvoi.ts
-git show origin/migrate/band-v2-foundation:container/agent-runner/src/mcp-tools/thenvoi.instructions.md > container/agent-runner/src/mcp-tools/thenvoi.instructions.md
-git show origin/migrate/band-v2-foundation:container/agent-runner/src/mcp-tools/thenvoi.test.ts > container/agent-runner/src/mcp-tools/thenvoi.test.ts
-```
-
-### 4. Register imports and migrations
-
-Append these imports if they are not already present:
-
-```typescript
-// src/channels/index.ts
-import './thenvoi.js';
-
-// container/agent-runner/src/mcp-tools/index.ts
-import './thenvoi.js';
-```
-
-In `src/db/migrations/index.ts`, import `migration014` and include it in the `migrations` array after the existing core migrations:
-
-```typescript
-import { migration014 } from './014-route-foundation-state.js';
-```
-
-In `src/db/index.ts`, export the inbound delivery ledger, module state, and outbound delivery marker helpers copied above.
-
-### 5. Install packages
-
-```bash
-pnpm add @thenvoi/sdk@0.1.6 @thenvoi/rest-client@0.0.113
-cd container/agent-runner && bun add @thenvoi/sdk@0.1.6 @thenvoi/rest-client@0.0.113
-```
-
-### 6. Configure environment
+### 4. Configure environment
 
 Add the agent credentials to `.env`:
 
@@ -130,7 +154,7 @@ Sync the environment file if this instance uses `data/env/env`:
 mkdir -p data/env && cp .env data/env/env
 ```
 
-### 7. Build and test
+### 5. Build and test
 
 ```bash
 pnpm install
