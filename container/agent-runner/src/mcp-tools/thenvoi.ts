@@ -6,7 +6,37 @@ import type { AgentToolsProtocol } from '@thenvoi/sdk';
 import { registerTools } from './server.js';
 import type { McpToolDefinition } from './types.js';
 
-const MUTATION_TOOLS_BLOCKED_IN_MAIN_ROOM = new Set([
+const BAND_TOOL_REGISTRY = [
+  { sdkName: 'thenvoi_send_message', bandName: 'band_send_message' },
+  { sdkName: 'thenvoi_send_event', bandName: 'band_send_event' },
+  { sdkName: 'thenvoi_get_participants', bandName: 'band_get_participants' },
+  { sdkName: 'thenvoi_add_participant', bandName: 'band_add_participant' },
+  { sdkName: 'thenvoi_remove_participant', bandName: 'band_remove_participant' },
+  { sdkName: 'thenvoi_lookup_peers', bandName: 'band_lookup_peers' },
+  { sdkName: 'thenvoi_create_chatroom', bandName: 'band_create_chatroom' },
+  { sdkName: 'thenvoi_list_contacts', bandName: 'band_list_contacts' },
+  { sdkName: 'thenvoi_add_contact', bandName: 'band_add_contact' },
+  { sdkName: 'thenvoi_remove_contact', bandName: 'band_remove_contact' },
+  { sdkName: 'thenvoi_list_contact_requests', bandName: 'band_list_contact_requests' },
+  { sdkName: 'thenvoi_respond_contact_request', bandName: 'band_respond_contact_request' },
+  { sdkName: 'thenvoi_list_memories', bandName: 'band_list_memories' },
+  { sdkName: 'thenvoi_store_memory', bandName: 'band_store_memory' },
+  { sdkName: 'thenvoi_get_memory', bandName: 'band_get_memory' },
+  { sdkName: 'thenvoi_supersede_memory', bandName: 'band_supersede_memory' },
+  { sdkName: 'thenvoi_archive_memory', bandName: 'band_archive_memory' },
+] as const;
+
+type BandToolRegistryEntry = (typeof BAND_TOOL_REGISTRY)[number];
+type SdkToolName = BandToolRegistryEntry['sdkName'];
+
+const BAND_TOOL_BY_SDK_NAME = new Map<string, BandToolRegistryEntry>(
+  BAND_TOOL_REGISTRY.map((entry) => [entry.sdkName, entry]),
+);
+const BAND_TOOL_BY_MCP_NAME = new Map<string, BandToolRegistryEntry>(
+  BAND_TOOL_REGISTRY.map((entry) => [entry.bandName, entry]),
+);
+
+const MUTATION_TOOLS_BLOCKED_IN_MAIN_ROOM = new Set<SdkToolName>([
   'thenvoi_add_participant',
   'thenvoi_remove_participant',
   'thenvoi_create_chatroom',
@@ -37,7 +67,7 @@ function consolidationMode(): boolean {
   return env('NANOCLAW_MEMORY_CONSOLIDATION_ACTIVE') === 'true';
 }
 
-function isMemoryTool(sdkToolName: string): boolean {
+function isMemoryTool(sdkToolName: SdkToolName): boolean {
   return sdkToolName.includes('memory') || sdkToolName.includes('memories');
 }
 
@@ -72,12 +102,12 @@ function sdkTools(): AgentToolsProtocol {
   return cachedTools;
 }
 
-function toBandToolName(sdkToolName: string): string {
-  return sdkToolName.replace(/^thenvoi_/, 'band_');
+function toBandToolName(sdkToolName: SdkToolName): string {
+  return BAND_TOOL_BY_SDK_NAME.get(sdkToolName)!.bandName;
 }
 
-function toSdkToolName(bandToolName: string): string {
-  return bandToolName.replace(/^band_/, 'thenvoi_');
+function toSdkToolName(bandToolName: string): SdkToolName | null {
+  return BAND_TOOL_BY_MCP_NAME.get(bandToolName)?.sdkName ?? null;
 }
 
 function formatToolResult(result: unknown): CallToolResult {
@@ -109,7 +139,7 @@ function isUnavailableMemoryResult(value: unknown): boolean {
   return haystack.includes('404') || haystack.includes('not found') || haystack.includes('unsupported');
 }
 
-function memoryDisabledResult(toolName: string): CallToolResult {
+function memoryDisabledResult(toolName: SdkToolName): CallToolResult {
   return {
     content: [
       {
@@ -121,7 +151,7 @@ function memoryDisabledResult(toolName: string): CallToolResult {
   };
 }
 
-function blockedDuringConsolidation(sdkToolName: string): CallToolResult | null {
+function blockedDuringConsolidation(sdkToolName: SdkToolName): CallToolResult | null {
   if (!consolidationMode() || isMemoryTool(sdkToolName)) return null;
   return {
     content: [
@@ -134,7 +164,7 @@ function blockedDuringConsolidation(sdkToolName: string): CallToolResult | null 
   };
 }
 
-function blockedInMainRoom(sdkToolName: string): CallToolResult | null {
+function blockedInMainRoom(sdkToolName: SdkToolName): CallToolResult | null {
   if (!mainControlRoom() || !MUTATION_TOOLS_BLOCKED_IN_MAIN_ROOM.has(sdkToolName)) return null;
   return {
     content: [
@@ -147,19 +177,20 @@ function blockedInMainRoom(sdkToolName: string): CallToolResult | null {
   };
 }
 
-function normalizeDescription(description: unknown): string {
+function normalizeDescription(description: unknown, registryEntry: BandToolRegistryEntry): string {
   const text = typeof description === 'string' ? description : 'Band.ai platform tool.';
-  return text.replace(/Thenvoi/g, 'Band.ai').replace(/thenvoi_/g, 'band_');
+  return text.replace(/Thenvoi/g, 'Band.ai').replaceAll(registryEntry.sdkName, registryEntry.bandName);
 }
 
 function sdkSchemaToMcpTool(schema: Record<string, unknown>): Tool | null {
   const sdkName = typeof schema.name === 'string' ? schema.name : undefined;
+  const registryEntry = sdkName ? BAND_TOOL_BY_SDK_NAME.get(sdkName) : undefined;
   const inputSchema = schema.input_schema && typeof schema.input_schema === 'object' ? schema.input_schema : undefined;
-  if (!sdkName || !sdkName.startsWith('thenvoi_') || !inputSchema) return null;
+  if (!registryEntry || !inputSchema) return null;
 
   return {
-    name: toBandToolName(sdkName),
-    description: normalizeDescription(schema.description),
+    name: registryEntry.bandName,
+    description: normalizeDescription(schema.description, registryEntry),
     inputSchema: inputSchema as Tool['inputSchema'],
   };
 }
@@ -173,6 +204,7 @@ function buildBandToolDefinitions(): McpToolDefinition[] {
     if (!tool) return [];
 
     const sdkToolName = toSdkToolName(tool.name);
+    if (!sdkToolName) return [];
     return [
       {
         tool,
