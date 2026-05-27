@@ -117,18 +117,31 @@ function safeRoomTitle(room: Record<string, unknown>, fallback: string): string 
   return typeof room.title === 'string' && room.title.length > 0 ? room.title : fallback;
 }
 
-function isOwnerDirectRoom(room: Record<string, unknown>): boolean {
+function collectParticipantIds(value: unknown): string[] {
+  if (!value || typeof value !== 'object') return [];
+  const participant = value as Record<string, unknown>;
+  const ids: string[] = [];
+  for (const key of ['id', 'uuid', 'user_id', 'userId', 'agent_id', 'agentId', 'participant_id', 'participantId']) {
+    const candidate = participant[key];
+    if (typeof candidate === 'string') ids.push(candidate);
+  }
+  for (const key of ['user', 'agent', 'participant']) {
+    ids.push(...collectParticipantIds(participant[key]));
+  }
+  return ids;
+}
+
+function isOwnerAgentDirectRoom(room: Record<string, unknown>, config: ThenvoiConfig): boolean {
   if (room.is_main === true || room.isMain === true || room.main === true) return true;
-  if (room.type === 'direct' || room.kind === 'direct' || room.room_type === 'direct') return true;
 
   const participants = Array.isArray(room.participants) ? room.participants : [];
-  if (participants.length !== 2) return false;
-  const ids = participants.flatMap((participant) => {
-    if (!participant || typeof participant !== 'object') return [];
-    const value = participant as Record<string, unknown>;
-    return typeof value.id === 'string' ? [value.id] : typeof value.uuid === 'string' ? [value.uuid] : [];
-  });
-  return ids.length === 2;
+  if (participants.length !== 2 || !config.ownerId) return false;
+
+  const participantIds = participants.map((participant) => new Set(collectParticipantIds(participant)));
+  return (
+    participantIds.some((ids) => ids.has(config.agentId)) &&
+    participantIds.some((ids) => ids.has(config.ownerId as string))
+  );
 }
 
 function getMainRoomState(): ThenvoiMainRoomState | undefined {
@@ -202,9 +215,14 @@ function ensureHubMessagingGroup(roomId: string, agentGroupId: string | null): v
   });
 }
 
-function upsertDiscoveredMessagingGroup(roomId: string, room: Record<string, unknown>, forceMain = false): void {
+function upsertDiscoveredMessagingGroup(
+  roomId: string,
+  room: Record<string, unknown>,
+  config: ThenvoiConfig,
+  forceMain = false,
+): void {
   const platformId = formatThenvoiPlatformId(roomId);
-  const isMain = forceMain || isOwnerDirectRoom(room);
+  const isMain = forceMain || isOwnerAgentDirectRoom(room, config);
   const name = isMain ? MAIN_ROOM_NAME : safeRoomTitle(room, roomId);
   const isGroup = isMain ? 0 : room.type === 'direct' ? 0 : 1;
   const existing = getMessagingGroupByPlatform(THENVOI_CHANNEL_TYPE, platformId);
@@ -353,7 +371,7 @@ class ThenvoiChannelAdapter implements ChannelAdapter {
       seenRoomIds.add(roomId);
 
       await this.link.subscribeRoom(roomId);
-      upsertDiscoveredMessagingGroup(roomId, roomRecord);
+      upsertDiscoveredMessagingGroup(roomId, roomRecord, this.config);
       const main = getMainRoomState()?.roomId === roomId;
       const title = main ? MAIN_ROOM_NAME : typeof roomRecord.title === 'string' ? roomRecord.title : undefined;
       const isGroup = main ? false : roomRecord.type !== 'direct';
@@ -425,7 +443,7 @@ class ThenvoiChannelAdapter implements ChannelAdapter {
     const id = roomId ?? (typeof payload.id === 'string' ? payload.id : null);
     if (!id) return;
     await this.link.subscribeRoom(id);
-    upsertDiscoveredMessagingGroup(id, payload);
+    upsertDiscoveredMessagingGroup(id, payload, this.config);
     const main = getMainRoomState()?.roomId === id;
     const title = main ? MAIN_ROOM_NAME : typeof payload.title === 'string' ? payload.title : undefined;
     const isGroup = main ? false : payload.type !== 'direct';
@@ -448,10 +466,13 @@ class ThenvoiChannelAdapter implements ChannelAdapter {
   private handleParticipantAdded(roomId: string | null, payload: Record<string, unknown>): void {
     const id = roomId ?? (typeof payload.chat_room_id === 'string' ? payload.chat_room_id : null);
     if (!id) return;
-    const before = getMainRoomState()?.roomId === id;
-    upsertDiscoveredMessagingGroup(id, payload);
-    const after = getMainRoomState()?.roomId === id;
-    if (before !== after) closeSessionsForRoom(id, 'main_room_privilege_changed');
+
+    // participant_added payloads describe only the participant that joined, not the
+    // full room. Do not upsert room metadata from that partial shape.
+    if (getMainRoomState()?.roomId === id) {
+      clearMainRoomIfMatches(id);
+      closeSessionsForRoom(id, 'main_room_participant_added');
+    }
   }
 
   /**
@@ -544,6 +565,7 @@ class ThenvoiChannelAdapter implements ChannelAdapter {
     upsertDiscoveredMessagingGroup(
       resolvedRoomId,
       { id: resolvedRoomId, title: resolvedRoomId, type: 'group' },
+      this.config,
       getMainRoomState()?.roomId === resolvedRoomId,
     );
     const content: ThenvoiMessageContent = {

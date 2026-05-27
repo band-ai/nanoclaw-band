@@ -11,6 +11,7 @@ interface QueuedEvent {
 
 const fakeLinks: FakeThenvoiLink[] = [];
 const fakeRestClients: FakeThenvoiClient[] = [];
+let fakeChats: Record<string, unknown>[] = [{ id: 'room-1', title: 'Room 1', type: 'direct' }];
 let closeTestDb: (() => void) | null = null;
 
 class FakeThenvoiClient {
@@ -53,7 +54,7 @@ class FakeThenvoiLink implements AsyncIterable<QueuedEvent> {
   public readonly disconnect = vi.fn(async () => {});
   public readonly subscribeAgentRooms = vi.fn(async () => {});
   public readonly subscribeRoom = vi.fn(async (_roomId: string) => {});
-  public readonly listAllChats = vi.fn(async () => [{ id: 'room-1', title: 'Room 1', type: 'direct' }]);
+  public readonly listAllChats = vi.fn(async () => fakeChats);
   private queue: QueuedEvent[] = [];
   private waiters: Array<(event: IteratorResult<QueuedEvent>) => void> = [];
 
@@ -108,6 +109,7 @@ function clearThenvoiEnv(): void {
   delete process.env.THENVOI_MEMORY_CONSOLIDATION;
   delete process.env.THENVOI_CONTACT_STRATEGY;
   delete process.env.THENVOI_CONTACT_AGENT_GROUP_ID;
+  delete process.env.THENVOI_OWNER_ID;
   delete process.env.THENVOI_INJECT_API_KEY;
 }
 
@@ -124,6 +126,7 @@ describe('thenvoi channel adapter', () => {
     vi.resetModules();
     fakeLinks.length = 0;
     fakeRestClients.length = 0;
+    fakeChats = [{ id: 'room-1', title: 'Room 1', type: 'direct' }];
     clearThenvoiEnv();
     const { closeDb, initTestDb, runMigrations } = await import('../db/index.js');
     const db = initTestDb();
@@ -406,8 +409,17 @@ describe('thenvoi channel adapter', () => {
     );
   });
 
-  it('marks discovered direct Band room as the main control room for container env', async () => {
+  it('marks discovered owner-agent direct Band room as the main control room for container env', async () => {
     setThenvoiEnv();
+    process.env.THENVOI_OWNER_ID = 'owner-1';
+    fakeChats = [
+      {
+        id: 'room-1',
+        title: 'Room 1',
+        type: 'direct',
+        participants: [{ id: 'agent-1' }, { id: 'owner-1' }],
+      },
+    ];
     await import('./thenvoi.js');
     const { initChannelAdapters } = await import('./channel-registry.js');
     const result: InboundRouteResult = {
@@ -447,6 +459,104 @@ describe('thenvoi channel adapter', () => {
     });
 
     expect(config.env).toHaveProperty('THENVOI_IS_MAIN_CONTROL_ROOM', 'true');
+  });
+
+  it('does not mark a direct room as main without owner-agent participant proof', async () => {
+    setThenvoiEnv();
+    process.env.THENVOI_OWNER_ID = 'owner-1';
+    fakeChats = [
+      {
+        id: 'room-1',
+        title: 'Room 1',
+        type: 'direct',
+        participants: [{ id: 'agent-1' }, { id: 'other-user' }],
+      },
+    ];
+    await import('./thenvoi.js');
+    const { initChannelAdapters } = await import('./channel-registry.js');
+    const result: InboundRouteResult = {
+      status: 'persisted',
+      platformMessageId: 'unused',
+      sessionIds: [],
+      sessionMessageIds: [],
+    };
+
+    await initChannelAdapters(() => ({
+      onInbound: async () => result,
+      onInboundEvent: async () => result,
+      onMetadata: () => {},
+      onAction: () => {},
+    }));
+
+    const { getModuleState, getMessagingGroupByPlatform } = await import('../db/index.js');
+    expect(getModuleState('thenvoi', 'main-room')).toBeUndefined();
+    expect(getMessagingGroupByPlatform('thenvoi', 'thenvoi:room-1')).toMatchObject({
+      name: 'Room 1',
+      is_group: 0,
+    });
+  });
+
+  it('does not rewrite room metadata from partial participant_added payloads', async () => {
+    setThenvoiEnv();
+    process.env.THENVOI_OWNER_ID = 'owner-1';
+    fakeChats = [
+      {
+        id: 'room-1',
+        title: 'Room 1',
+        type: 'direct',
+        participants: [{ id: 'agent-1' }, { id: 'owner-1' }],
+      },
+    ];
+    await import('./thenvoi.js');
+    const { initChannelAdapters } = await import('./channel-registry.js');
+    const result: InboundRouteResult = {
+      status: 'persisted',
+      platformMessageId: 'unused',
+      sessionIds: [],
+      sessionMessageIds: [],
+    };
+
+    await initChannelAdapters(() => ({
+      onInbound: async () => result,
+      onInboundEvent: async () => result,
+      onMetadata: () => {},
+      onAction: () => {},
+    }));
+
+    const { createAgentGroup, createSession, getMessagingGroupByPlatform, getModuleState, getSession } =
+      await import('../db/index.js');
+    createAgentGroup({
+      id: 'ag-1',
+      name: 'Agent 1',
+      folder: 'agent-1',
+      agent_provider: null,
+      created_at: new Date().toISOString(),
+    });
+    const mg = getMessagingGroupByPlatform('thenvoi', 'thenvoi:room-1')!;
+    createSession({
+      id: 'sess-room-1',
+      agent_group_id: 'ag-1',
+      messaging_group_id: mg.id,
+      thread_id: null,
+      agent_provider: null,
+      status: 'active',
+      container_status: 'idle',
+      last_active: null,
+      created_at: new Date().toISOString(),
+    });
+
+    fakeLinks[0].emit({
+      type: 'participant_added',
+      roomId: 'room-1',
+      payload: { id: 'user-42', name: 'Jane', type: 'User', handle: 'jane' },
+    });
+
+    await waitFor(() => getSession('sess-room-1')?.status === 'closed');
+    expect(getModuleState('thenvoi', 'main-room')).toBeUndefined();
+    expect(getMessagingGroupByPlatform('thenvoi', 'thenvoi:room-1')).toMatchObject({
+      name: 'Main Control Room',
+      is_group: 0,
+    });
   });
 
   it('closes active sessions when a Band room lifecycle event invalidates room privilege', async () => {
