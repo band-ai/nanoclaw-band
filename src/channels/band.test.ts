@@ -430,9 +430,10 @@ describe('band channel adapter', () => {
       }),
     });
     expect(msgId).toBe('platform-out-1');
-    const sent = fakeRestClients[0].agentApiMessages.createAgentChatMessage.mock.calls.at(-1)![1] as {
-      message: { content: string };
-    };
+    const calls = fakeRestClients[0].agentApiMessages.createAgentChatMessage.mock.calls as unknown as Array<
+      [string, { message: { content: string } }]
+    >;
+    const sent = calls.at(-1)![1];
     expect(sent.message.content).toContain('@[[owner-1]]');
     expect(sent.message.content).toContain('/approve');
 
