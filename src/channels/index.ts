@@ -7,4 +7,6 @@
 // self-registration import below.
 
 import './cli.js';
-import './thenvoi.js';
+import './band.js';
+import './telegram.js';
+import './whatsapp.js';

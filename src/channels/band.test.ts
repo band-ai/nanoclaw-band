@@ -9,9 +9,10 @@ interface QueuedEvent {
   payload: Record<string, unknown>;
 }
 
-const fakeLinks: FakeThenvoiLink[] = [];
+const fakeLinks: FakeBandLink[] = [];
 const fakeRestClients: FakeThenvoiClient[] = [];
 let fakeChats: Record<string, unknown>[] = [{ id: 'room-1', title: 'Room 1', type: 'direct' }];
+let fakeParticipants: Record<string, unknown[]> = {};
 let closeTestDb: (() => void) | null = null;
 
 class FakeThenvoiClient {
@@ -29,6 +30,7 @@ class FakeThenvoiClient {
   };
   public readonly agentApiParticipants = {
     addAgentChatParticipant: vi.fn(async () => ({ data: { ok: true } })),
+    listAgentChatParticipants: vi.fn(async (chatId: string) => ({ data: fakeParticipants[chatId] ?? [] })),
   };
   public readonly agentApiEvents = {
     createAgentChatEvent: vi.fn(async () => ({ data: { ok: true } })),
@@ -44,7 +46,7 @@ class FakeThenvoiClient {
   }
 }
 
-class FakeThenvoiLink implements AsyncIterable<QueuedEvent> {
+class FakeBandLink implements AsyncIterable<QueuedEvent> {
   public readonly rest = {
     createChatMessage: vi.fn(async () => ({ id: 'platform-out-1' })),
   };
@@ -55,6 +57,7 @@ class FakeThenvoiLink implements AsyncIterable<QueuedEvent> {
   public readonly subscribeAgentRooms = vi.fn(async () => {});
   public readonly subscribeRoom = vi.fn(async (_roomId: string) => {});
   public readonly listAllChats = vi.fn(async () => fakeChats);
+  public readonly getNextMessage = vi.fn(async (_roomId: string): Promise<Record<string, unknown> | null> => null);
   private queue: QueuedEvent[] = [];
   private waiters: Array<(event: IteratorResult<QueuedEvent>) => void> = [];
 
@@ -86,31 +89,48 @@ class FakeThenvoiLink implements AsyncIterable<QueuedEvent> {
   }
 }
 
-vi.mock('@thenvoi/sdk', () => ({
-  ThenvoiLink: FakeThenvoiLink,
+vi.mock('@band-ai/sdk', () => ({
+  BandLink: FakeBandLink,
 }));
 
 vi.mock('@thenvoi/rest-client', () => ({
   ThenvoiClient: FakeThenvoiClient,
 }));
 
-function setThenvoiEnv(): void {
-  process.env.THENVOI_AGENT_ID = 'agent-1';
-  process.env.THENVOI_API_KEY = 'secret';
-  process.env.THENVOI_BASE_URL = 'https://band.example.test';
+// Isolate config resolution from the real on-disk .env. band-config.ts
+// captures readEnvFile() at module load and getBandConfig() uses it as the
+// fallback below process.env (`process.env[name] || envConfig[name]`). Without
+// this mock, a configured .env leaks real BAND_*/THENVOI_* values into tests that
+// clear process.env to assert empty/default states (missing creds, disabled
+// contact strategy), so those tests fail on any installed/configured host.
+// With readEnvFile stubbed to {}, process.env (managed in before/afterEach) is
+// the sole source of config — which is what these tests already assume.
+vi.mock('../env.js', () => ({
+  readEnvFile: () => ({}),
+}));
+
+function setBandEnv(): void {
+  process.env.BAND_AGENT_ID = 'agent-1';
+  process.env.BAND_API_KEY = 'secret';
+  process.env.BAND_BASE_URL = 'https://band.example.test';
 }
 
-function clearThenvoiEnv(): void {
-  delete process.env.THENVOI_AGENT_ID;
-  delete process.env.THENVOI_API_KEY;
-  delete process.env.THENVOI_BASE_URL;
-  delete process.env.THENVOI_MEMORY_TOOLS;
-  delete process.env.THENVOI_MEMORY_LOAD_ON_START;
-  delete process.env.THENVOI_MEMORY_CONSOLIDATION;
-  delete process.env.THENVOI_CONTACT_STRATEGY;
-  delete process.env.THENVOI_CONTACT_AGENT_GROUP_ID;
-  delete process.env.THENVOI_OWNER_ID;
-  delete process.env.THENVOI_INJECT_API_KEY;
+function clearBandEnv(): void {
+  for (const suffix of [
+    'AGENT_ID',
+    'API_KEY',
+    'BASE_URL',
+    'MEMORY_TOOLS',
+    'MEMORY_LOAD_ON_START',
+    'MEMORY_CONSOLIDATION',
+    'CONTACT_STRATEGY',
+    'CONTACT_AGENT_GROUP_ID',
+    'OWNER_ID',
+    'INJECT_API_KEY',
+  ]) {
+    delete process.env[`BAND_${suffix}`];
+    delete process.env[`THENVOI_${suffix}`];
+  }
 }
 
 async function waitFor(predicate: () => boolean): Promise<void> {
@@ -121,13 +141,14 @@ async function waitFor(predicate: () => boolean): Promise<void> {
   expect(predicate()).toBe(true);
 }
 
-describe('thenvoi channel adapter', () => {
+describe('band channel adapter', () => {
   beforeEach(async () => {
     vi.resetModules();
     fakeLinks.length = 0;
     fakeRestClients.length = 0;
     fakeChats = [{ id: 'room-1', title: 'Room 1', type: 'direct' }];
-    clearThenvoiEnv();
+    fakeParticipants = {};
+    clearBandEnv();
     const { closeDb, initTestDb, runMigrations } = await import('../db/index.js');
     const db = initTestDb();
     runMigrations(db);
@@ -137,11 +158,11 @@ describe('thenvoi channel adapter', () => {
   afterEach(() => {
     closeTestDb?.();
     closeTestDb = null;
-    clearThenvoiEnv();
+    clearBandEnv();
   });
 
   it('skips adapter registration when credentials are missing', async () => {
-    await import('./thenvoi.js');
+    await import('./band.js');
     const { initChannelAdapters, getActiveAdapters } = await import('./channel-registry.js');
 
     await initChannelAdapters(() => ({
@@ -151,12 +172,29 @@ describe('thenvoi channel adapter', () => {
       onAction: () => {},
     }));
 
-    expect(getActiveAdapters().some((adapter) => adapter.channelType === 'thenvoi')).toBe(false);
+    expect(getActiveAdapters().some((adapter) => adapter.channelType === 'band')).toBe(false);
+  });
+
+  it('registers the adapter from legacy THENVOI_* env vars', async () => {
+    process.env.THENVOI_AGENT_ID = 'agent-1';
+    process.env.THENVOI_API_KEY = 'secret';
+    process.env.THENVOI_BASE_URL = 'https://band.example.test';
+    await import('./band.js');
+    const { initChannelAdapters, getActiveAdapters } = await import('./channel-registry.js');
+
+    await initChannelAdapters(() => ({
+      onInbound: () => {},
+      onInboundEvent: () => {},
+      onMetadata: () => {},
+      onAction: () => {},
+    }));
+
+    expect(getActiveAdapters().some((adapter) => adapter.channelType === 'band')).toBe(true);
   });
 
   it('marks Band messages processed only after a persisted route result', async () => {
-    setThenvoiEnv();
-    await import('./thenvoi.js');
+    setBandEnv();
+    await import('./band.js');
     const { initChannelAdapters } = await import('./channel-registry.js');
     const result: InboundRouteResult = {
       status: 'persisted',
@@ -166,7 +204,7 @@ describe('thenvoi channel adapter', () => {
     };
     const { beginInboundDelivery, getInboundDelivery, markInboundDeliveryPersisted } = await import('../db/index.js');
     const onInbound = vi.fn(async (platformId: string, threadId: string | null) => {
-      const key: InboundDeliveryKey = { channelType: 'thenvoi', platformId, platformMessageId: 'msg-1' };
+      const key: InboundDeliveryKey = { channelType: 'band', platformId, platformMessageId: 'msg-1' };
       beginInboundDelivery(key, threadId);
       markInboundDeliveryPersisted(key, {
         sessionIds: result.sessionIds,
@@ -199,7 +237,7 @@ describe('thenvoi channel adapter', () => {
 
     await waitFor(() => fakeLinks[0].markProcessed.mock.calls.length === 1);
     expect(onInbound).toHaveBeenCalledWith(
-      'thenvoi:room-1',
+      'band:room-1',
       null,
       expect.objectContaining({
         id: 'msg-1',
@@ -210,13 +248,80 @@ describe('thenvoi channel adapter', () => {
     expect(fakeLinks[0].markProcessing).toHaveBeenCalledWith('room-1', 'msg-1');
     expect(fakeLinks[0].markProcessed).toHaveBeenCalledWith('room-1', 'msg-1');
     expect(
-      getInboundDelivery({ channelType: 'thenvoi', platformId: 'thenvoi:room-1', platformMessageId: 'msg-1' })?.status,
+      getInboundDelivery({ channelType: 'band', platformId: 'band:room-1', platformMessageId: 'msg-1' })?.status,
     ).toBe('processed');
   });
 
+  it('drains pending inbox messages on startup and routes them like live events', async () => {
+    setBandEnv();
+    await import('./band.js');
+    const { initChannelAdapters } = await import('./channel-registry.js');
+    const result: InboundRouteResult = {
+      status: 'persisted',
+      platformMessageId: 'pending-1',
+      sessionIds: ['sess-1'],
+      sessionMessageIds: ['pending-1:ag-1'],
+    };
+    const { beginInboundDelivery, markInboundDeliveryPersisted } = await import('../db/index.js');
+    const onInbound = vi.fn(async (platformId: string, threadId: string | null) => {
+      const key: InboundDeliveryKey = { channelType: 'band', platformId, platformMessageId: 'pending-1' };
+      beginInboundDelivery(key, threadId);
+      markInboundDeliveryPersisted(key, {
+        sessionIds: result.sessionIds,
+        sessionMessageIds: result.sessionMessageIds,
+      });
+      return result;
+    });
+
+    // First poll returns a message that was sitting in the platform inbox
+    // (sent while the host was down); subsequent polls return empty.
+    let polled = false;
+    fakeChats = [{ id: 'room-1', title: 'Room 1', type: 'direct' }];
+
+    await initChannelAdapters(() => ({
+      onInbound,
+      onInboundEvent: async () => result,
+      onMetadata: () => {},
+      onAction: () => {},
+    }));
+
+    const link = fakeLinks[0];
+    link.getNextMessage.mockImplementation(async () => {
+      if (polled) return null;
+      polled = true;
+      return {
+        id: 'pending-1',
+        roomId: 'room-1',
+        content: 'sent while host was down',
+        senderId: 'user-1',
+        senderType: 'User',
+        senderName: 'User One',
+        messageType: 'text',
+        metadata: { mentions: [{ id: 'agent-1' }] },
+        createdAt: new Date(),
+      };
+    });
+
+    // Trigger a drain pass via the room_added path (same code path the
+    // startup drain uses).
+    link.emit({ type: 'room_added', roomId: 'room-1', payload: { id: 'room-1', title: 'Room 1', type: 'direct' } });
+
+    await waitFor(() => link.markProcessed.mock.calls.length === 1);
+    expect(onInbound).toHaveBeenCalledWith(
+      'band:room-1',
+      null,
+      expect.objectContaining({
+        id: 'pending-1',
+        content: expect.objectContaining({ text: 'sent while host was down' }),
+        isMention: true,
+      }),
+    );
+    expect(link.markProcessed).toHaveBeenCalledWith('room-1', 'pending-1');
+  });
+
   it('does not mark unmentioned Band room messages as mentions', async () => {
-    setThenvoiEnv();
-    await import('./thenvoi.js');
+    setBandEnv();
+    await import('./band.js');
     const { initChannelAdapters } = await import('./channel-registry.js');
     const result: InboundRouteResult = {
       status: 'dropped',
@@ -257,8 +362,8 @@ describe('thenvoi channel adapter', () => {
   });
 
   it('delivers generic outbound chat rows through Band REST fallback', async () => {
-    setThenvoiEnv();
-    await import('./thenvoi.js');
+    setBandEnv();
+    await import('./band.js');
     const { initChannelAdapters, getChannelAdapter } = await import('./channel-registry.js');
     const result: InboundRouteResult = {
       status: 'persisted',
@@ -274,27 +379,94 @@ describe('thenvoi channel adapter', () => {
       onAction: () => {},
     }));
 
-    const adapter = getChannelAdapter('thenvoi');
+    const adapter = getChannelAdapter('band');
     await expect(
-      adapter!.deliver('thenvoi:room-1', null, { kind: 'chat', content: { text: 'hello from agent' } }),
+      adapter!.deliver('band:room-1', null, { kind: 'chat', content: { text: 'hello from agent' } }),
     ).resolves.toBe('platform-out-1');
+    // Band only notifies tagged participants, so the fallback prepends an
+    // inline mention of the recipient even in direct rooms.
     expect(fakeRestClients[0].agentApiMessages.createAgentChatMessage).toHaveBeenCalledWith('room-1', {
       message: {
-        content: 'hello from agent',
+        content: '@[[owner-1]] hello from agent',
         mentions: [{ id: 'owner-1', name: 'Owner' }],
       },
     });
   });
 
+  it('renders ask_question cards as tagged text and resolves slash-command replies', async () => {
+    setBandEnv();
+    process.env.BAND_OWNER_ID = 'owner-1';
+    fakeParticipants['room-1'] = [
+      { id: 'owner-1', type: 'User', role: 'member' },
+      { id: 'agent-1', type: 'Agent', role: 'owner' },
+    ];
+    await import('./band.js');
+    const { initChannelAdapters, getActiveAdapters } = await import('./channel-registry.js');
+    const result: InboundRouteResult = {
+      status: 'persisted',
+      platformMessageId: 'unused',
+      sessionIds: [],
+      sessionMessageIds: [],
+    };
+    const onAction = vi.fn();
+    const onInbound = vi.fn(async () => result);
+
+    await initChannelAdapters(() => ({
+      onInbound,
+      onInboundEvent: async () => result,
+      onMetadata: () => {},
+      onAction,
+    }));
+
+    const adapter = getActiveAdapters().find((a) => a.channelType === 'band')!;
+    const msgId = await adapter.deliver('band:room-1', null, {
+      kind: 'chat-sdk',
+      content: JSON.stringify({
+        type: 'ask_question',
+        questionId: 'q-1',
+        title: 'New channel',
+        question: 'Wire it?',
+        options: ['Approve', 'Deny'],
+      }),
+    });
+    expect(msgId).toBe('platform-out-1');
+    const sent = fakeRestClients[0].agentApiMessages.createAgentChatMessage.mock.calls.at(-1)![1] as {
+      message: { content: string };
+    };
+    expect(sent.message.content).toContain('@[[owner-1]]');
+    expect(sent.message.content).toContain('/approve');
+
+    // The owner replies with the slash command (Band embeds mention markup).
+    fakeLinks[0].emit({
+      type: 'message_created',
+      roomId: 'room-1',
+      payload: {
+        id: 'reply-1',
+        content: '@[[agent-1]] /approve',
+        message_type: 'text',
+        sender_id: 'owner-1',
+        sender_type: 'User',
+        sender_name: 'Owner',
+        inserted_at: new Date().toISOString(),
+        metadata: { mentions: [{ id: 'agent-1' }] },
+      },
+    });
+
+    await waitFor(() => onAction.mock.calls.length === 1);
+    expect(onAction).toHaveBeenCalledWith('q-1', 'Approve', 'owner-1');
+    // The reply must not be forwarded to the agent as a normal message.
+    expect(onInbound).not.toHaveBeenCalled();
+  });
+
   it('injects Band env for HTTPS sessions without direct API key', async () => {
-    setThenvoiEnv();
-    process.env.THENVOI_MEMORY_TOOLS = 'true';
-    process.env.THENVOI_MEMORY_LOAD_ON_START = 'true';
-    process.env.THENVOI_MEMORY_CONSOLIDATION = 'true';
-    await import('./thenvoi.js');
+    setBandEnv();
+    process.env.BAND_MEMORY_TOOLS = 'true';
+    process.env.BAND_MEMORY_LOAD_ON_START = 'true';
+    process.env.BAND_MEMORY_CONSOLIDATION = 'true';
+    await import('./band.js');
     const { getChannelContainerConfig } = await import('./channel-container-registry.js');
 
-    const config = await getChannelContainerConfig('thenvoi')!({
+    const config = await getChannelContainerConfig('band')!({
       session: {
         id: 'sess-1',
         agent_group_id: 'ag-1',
@@ -308,8 +480,8 @@ describe('thenvoi channel adapter', () => {
       },
       messagingGroup: {
         id: 'mg-1',
-        channel_type: 'thenvoi',
-        platform_id: 'thenvoi:room-1',
+        channel_type: 'band',
+        platform_id: 'band:room-1',
         name: 'Room 1',
         is_group: 1,
         unknown_sender_policy: 'public',
@@ -322,25 +494,26 @@ describe('thenvoi channel adapter', () => {
 
     expect(config.env).toEqual(
       expect.objectContaining({
-        NANOCLAW_CHANNEL: 'thenvoi',
-        THENVOI_ROOM_ID: 'room-1',
-        THENVOI_AGENT_ID: 'agent-1',
-        THENVOI_REST_URL: 'https://band.example.test',
-        THENVOI_MEMORY_TOOLS: 'true',
-        THENVOI_MEMORY_LOAD_ON_START: 'true',
-        THENVOI_MEMORY_CONSOLIDATION: 'true',
+        NANOCLAW_CHANNEL: 'band',
+        BAND_ROOM_ID: 'room-1',
+        BAND_AGENT_ID: 'agent-1',
+        BAND_REST_URL: 'https://band.example.test',
+        BAND_MEMORY_TOOLS: 'true',
+        BAND_MEMORY_LOAD_ON_START: 'true',
+        BAND_MEMORY_CONSOLIDATION: 'true',
       }),
     );
+    expect(config.env).not.toHaveProperty('BAND_API_KEY');
     expect(config.env).not.toHaveProperty('THENVOI_API_KEY');
   });
 
   it('injects direct Band API key for explicit live validation override', async () => {
-    setThenvoiEnv();
-    process.env.THENVOI_INJECT_API_KEY = 'true';
-    await import('./thenvoi.js');
+    setBandEnv();
+    process.env.BAND_INJECT_API_KEY = 'true';
+    await import('./band.js');
     const { getChannelContainerConfig } = await import('./channel-container-registry.js');
 
-    const config = await getChannelContainerConfig('thenvoi')!({
+    const config = await getChannelContainerConfig('band')!({
       session: {
         id: 'sess-1',
         agent_group_id: 'ag-1',
@@ -354,8 +527,8 @@ describe('thenvoi channel adapter', () => {
       },
       messagingGroup: {
         id: 'mg-1',
-        channel_type: 'thenvoi',
-        platform_id: 'thenvoi:room-1',
+        channel_type: 'band',
+        platform_id: 'band:room-1',
         name: 'Room 1',
         is_group: 1,
         unknown_sender_policy: 'public',
@@ -366,16 +539,17 @@ describe('thenvoi channel adapter', () => {
       hostEnv: process.env,
     });
 
+    expect(config.env).toHaveProperty('BAND_API_KEY', 'secret');
     expect(config.env).toHaveProperty('THENVOI_API_KEY', 'secret');
   });
 
   it('injects direct Band API key only for local HTTP sessions', async () => {
-    setThenvoiEnv();
-    process.env.THENVOI_BASE_URL = 'http://localhost:4000';
-    await import('./thenvoi.js');
+    setBandEnv();
+    process.env.BAND_BASE_URL = 'http://localhost:4000';
+    await import('./band.js');
     const { getChannelContainerConfig } = await import('./channel-container-registry.js');
 
-    const config = await getChannelContainerConfig('thenvoi')!({
+    const config = await getChannelContainerConfig('band')!({
       session: {
         id: 'sess-1',
         agent_group_id: 'ag-1',
@@ -389,8 +563,8 @@ describe('thenvoi channel adapter', () => {
       },
       messagingGroup: {
         id: 'mg-1',
-        channel_type: 'thenvoi',
-        platform_id: 'thenvoi:room-1',
+        channel_type: 'band',
+        platform_id: 'band:room-1',
         name: 'Room 1',
         is_group: 1,
         unknown_sender_policy: 'public',
@@ -403,15 +577,111 @@ describe('thenvoi channel adapter', () => {
 
     expect(config.env).toEqual(
       expect.objectContaining({
-        THENVOI_REST_URL: 'http://host.docker.internal:4000',
-        THENVOI_API_KEY: 'secret',
+        BAND_REST_URL: 'http://host.docker.internal:4000',
+        BAND_API_KEY: 'secret',
       }),
     );
   });
 
+  it('bootstraps the Nano Hub on install when no owner room exists', async () => {
+    setBandEnv();
+    process.env.BAND_OWNER_ID = 'owner-1';
+    fakeChats = []; // fresh install: agent has no rooms at all
+    await import('./band.js');
+    const { initChannelAdapters } = await import('./channel-registry.js');
+    const result: InboundRouteResult = {
+      status: 'persisted',
+      platformMessageId: 'unused',
+      sessionIds: [],
+      sessionMessageIds: [],
+    };
+
+    await initChannelAdapters(() => ({
+      onInbound: async () => result,
+      onInboundEvent: async () => result,
+      onMetadata: () => {},
+      onAction: () => {},
+    }));
+
+    const rest = fakeRestClients[0];
+    expect(rest.agentApiChats.createAgentChat).toHaveBeenCalledTimes(1);
+    expect(rest.agentApiParticipants.addAgentChatParticipant).toHaveBeenCalledWith('hub-room-1', {
+      participant: { participant_id: 'owner-1', role: 'member' },
+    });
+
+    const { getModuleState, getMessagingGroupByPlatform } = await import('../db/index.js');
+    expect(getModuleState('band', 'main-room')).toMatchObject({
+      roomId: 'hub-room-1',
+      platformId: 'band:hub-room-1',
+    });
+    expect(getMessagingGroupByPlatform('band', 'band:hub-room-1')).toMatchObject({
+      name: 'Nano Hub',
+      is_group: 0,
+    });
+  });
+
+  it('openDM resolves the owner to the Nano Hub without creating a room', async () => {
+    setBandEnv();
+    process.env.BAND_OWNER_ID = 'owner-1';
+    fakeParticipants['room-1'] = [
+      { id: 'owner-1', type: 'User', role: 'member' },
+      { id: 'agent-1', type: 'Agent', role: 'owner' },
+    ];
+    await import('./band.js');
+    const { initChannelAdapters, getActiveAdapters } = await import('./channel-registry.js');
+    const result: InboundRouteResult = {
+      status: 'persisted',
+      platformMessageId: 'unused',
+      sessionIds: [],
+      sessionMessageIds: [],
+    };
+
+    await initChannelAdapters(() => ({
+      onInbound: async () => result,
+      onInboundEvent: async () => result,
+      onMetadata: () => {},
+      onAction: () => {},
+    }));
+
+    const adapter = getActiveAdapters().find((a) => a.channelType === 'band')!;
+    await expect(adapter.openDM!('owner-1')).resolves.toBe('band:room-1');
+    expect(fakeRestClients[0].agentApiChats.createAgentChat).not.toHaveBeenCalled();
+  });
+
+  it('detects the main control room by fetching participants when the room payload has none', async () => {
+    setBandEnv();
+    process.env.BAND_OWNER_ID = 'owner-1';
+    // Agent API room objects carry no participants — detection must fetch them.
+    fakeChats = [{ id: 'room-1', title: 'New Session', type: 'group' }];
+    fakeParticipants['room-1'] = [
+      { id: 'owner-1', type: 'User', role: 'member' },
+      { id: 'agent-1', type: 'Agent', role: 'owner' },
+    ];
+    await import('./band.js');
+    const { initChannelAdapters } = await import('./channel-registry.js');
+    const result: InboundRouteResult = {
+      status: 'persisted',
+      platformMessageId: 'unused',
+      sessionIds: [],
+      sessionMessageIds: [],
+    };
+
+    await initChannelAdapters(() => ({
+      onInbound: async () => result,
+      onInboundEvent: async () => result,
+      onMetadata: () => {},
+      onAction: () => {},
+    }));
+
+    const { getModuleState } = await import('../db/index.js');
+    expect(getModuleState('band', 'main-room')).toMatchObject({ roomId: 'room-1', platformId: 'band:room-1' });
+    // Sync detection won — the bootstrap must not have created a hub room.
+    expect(fakeRestClients[0].agentApiChats.createAgentChat).not.toHaveBeenCalled();
+  });
+
   it('marks discovered owner-agent direct Band room as the main control room for container env', async () => {
-    setThenvoiEnv();
-    process.env.THENVOI_OWNER_ID = 'owner-1';
+    setBandEnv();
+    process.env.BAND_OWNER_ID = 'owner-1';
     fakeChats = [
       {
         id: 'room-1',
@@ -420,7 +690,7 @@ describe('thenvoi channel adapter', () => {
         participants: [{ id: 'agent-1' }, { id: 'owner-1' }],
       },
     ];
-    await import('./thenvoi.js');
+    await import('./band.js');
     const { initChannelAdapters } = await import('./channel-registry.js');
     const result: InboundRouteResult = {
       status: 'persisted',
@@ -437,11 +707,11 @@ describe('thenvoi channel adapter', () => {
     }));
 
     const { getModuleState, getMessagingGroupByPlatform } = await import('../db/index.js');
-    expect(getModuleState('thenvoi', 'main-room')).toMatchObject({ roomId: 'room-1', platformId: 'thenvoi:room-1' });
+    expect(getModuleState('band', 'main-room')).toMatchObject({ roomId: 'room-1', platformId: 'band:room-1' });
 
-    const mg = getMessagingGroupByPlatform('thenvoi', 'thenvoi:room-1')!;
+    const mg = getMessagingGroupByPlatform('band', 'band:room-1')!;
     const { getChannelContainerConfig } = await import('./channel-container-registry.js');
-    const config = await getChannelContainerConfig('thenvoi')!({
+    const config = await getChannelContainerConfig('band')!({
       session: {
         id: 'sess-main',
         agent_group_id: 'ag-1',
@@ -458,12 +728,12 @@ describe('thenvoi channel adapter', () => {
       hostEnv: process.env,
     });
 
-    expect(config.env).toHaveProperty('THENVOI_IS_MAIN_CONTROL_ROOM', 'true');
+    expect(config.env).toHaveProperty('BAND_IS_MAIN_CONTROL_ROOM', 'true');
   });
 
   it('does not mark a direct room as main without owner-agent participant proof', async () => {
-    setThenvoiEnv();
-    process.env.THENVOI_OWNER_ID = 'owner-1';
+    setBandEnv();
+    process.env.BAND_OWNER_ID = 'owner-1';
     fakeChats = [
       {
         id: 'room-1',
@@ -472,7 +742,7 @@ describe('thenvoi channel adapter', () => {
         participants: [{ id: 'agent-1' }, { id: 'other-user' }],
       },
     ];
-    await import('./thenvoi.js');
+    await import('./band.js');
     const { initChannelAdapters } = await import('./channel-registry.js');
     const result: InboundRouteResult = {
       status: 'persisted',
@@ -489,16 +759,18 @@ describe('thenvoi channel adapter', () => {
     }));
 
     const { getModuleState, getMessagingGroupByPlatform } = await import('../db/index.js');
-    expect(getModuleState('thenvoi', 'main-room')).toBeUndefined();
-    expect(getMessagingGroupByPlatform('thenvoi', 'thenvoi:room-1')).toMatchObject({
+    // room-1 lacks owner-agent proof, so the bootstrap creates a fresh Nano
+    // Hub and that — not room-1 — becomes the main room.
+    expect(getModuleState('band', 'main-room')).toMatchObject({ roomId: 'hub-room-1' });
+    expect(getMessagingGroupByPlatform('band', 'band:room-1')).toMatchObject({
       name: 'Room 1',
       is_group: 0,
     });
   });
 
   it('does not rewrite room metadata from partial participant_added payloads', async () => {
-    setThenvoiEnv();
-    process.env.THENVOI_OWNER_ID = 'owner-1';
+    setBandEnv();
+    process.env.BAND_OWNER_ID = 'owner-1';
     fakeChats = [
       {
         id: 'room-1',
@@ -507,7 +779,7 @@ describe('thenvoi channel adapter', () => {
         participants: [{ id: 'agent-1' }, { id: 'owner-1' }],
       },
     ];
-    await import('./thenvoi.js');
+    await import('./band.js');
     const { initChannelAdapters } = await import('./channel-registry.js');
     const result: InboundRouteResult = {
       status: 'persisted',
@@ -532,7 +804,7 @@ describe('thenvoi channel adapter', () => {
       agent_provider: null,
       created_at: new Date().toISOString(),
     });
-    const mg = getMessagingGroupByPlatform('thenvoi', 'thenvoi:room-1')!;
+    const mg = getMessagingGroupByPlatform('band', 'band:room-1')!;
     createSession({
       id: 'sess-room-1',
       agent_group_id: 'ag-1',
@@ -552,16 +824,16 @@ describe('thenvoi channel adapter', () => {
     });
 
     await waitFor(() => getSession('sess-room-1')?.status === 'closed');
-    expect(getModuleState('thenvoi', 'main-room')).toBeUndefined();
-    expect(getMessagingGroupByPlatform('thenvoi', 'thenvoi:room-1')).toMatchObject({
-      name: 'Main Control Room',
+    expect(getModuleState('band', 'main-room')).toBeUndefined();
+    expect(getMessagingGroupByPlatform('band', 'band:room-1')).toMatchObject({
+      name: 'Nano Hub',
       is_group: 0,
     });
   });
 
   it('closes active sessions when a Band room lifecycle event invalidates room privilege', async () => {
-    setThenvoiEnv();
-    await import('./thenvoi.js');
+    setBandEnv();
+    await import('./band.js');
     const { initChannelAdapters } = await import('./channel-registry.js');
     const result: InboundRouteResult = {
       status: 'persisted',
@@ -585,7 +857,7 @@ describe('thenvoi channel adapter', () => {
       agent_provider: null,
       created_at: new Date().toISOString(),
     });
-    const mg = getMessagingGroupByPlatform('thenvoi', 'thenvoi:room-1')!;
+    const mg = getMessagingGroupByPlatform('band', 'band:room-1')!;
     createSession({
       id: 'sess-room-1',
       agent_group_id: 'ag-1',
@@ -603,8 +875,8 @@ describe('thenvoi channel adapter', () => {
   });
 
   it('does not mark Band messages processed after retryable drops', async () => {
-    setThenvoiEnv();
-    await import('./thenvoi.js');
+    setBandEnv();
+    await import('./band.js');
     const { initChannelAdapters } = await import('./channel-registry.js');
     const result: InboundRouteResult = {
       status: 'dropped',
@@ -640,13 +912,13 @@ describe('thenvoi channel adapter', () => {
     expect(fakeLinks[0].markProcessed).not.toHaveBeenCalled();
   });
 
-  it('forwards THENVOI_OWNER_ID into the container env when set', async () => {
-    setThenvoiEnv();
-    process.env.THENVOI_OWNER_ID = 'owner-uuid-from-env';
-    await import('./thenvoi.js');
+  it('forwards BAND_OWNER_ID into the container env when set', async () => {
+    setBandEnv();
+    process.env.BAND_OWNER_ID = 'owner-uuid-from-env';
+    await import('./band.js');
     const { getChannelContainerConfig } = await import('./channel-container-registry.js');
 
-    const config = await getChannelContainerConfig('thenvoi')!({
+    const config = await getChannelContainerConfig('band')!({
       session: {
         id: 'sess-1',
         agent_group_id: 'ag-1',
@@ -660,8 +932,8 @@ describe('thenvoi channel adapter', () => {
       },
       messagingGroup: {
         id: 'mg-1',
-        channel_type: 'thenvoi',
-        platform_id: 'thenvoi:room-1',
+        channel_type: 'band',
+        platform_id: 'band:room-1',
         name: 'Room 1',
         is_group: 1,
         unknown_sender_policy: 'public',
@@ -672,14 +944,14 @@ describe('thenvoi channel adapter', () => {
       hostEnv: process.env,
     });
 
-    expect(config.env).toHaveProperty('THENVOI_OWNER_ID', 'owner-uuid-from-env');
-    delete process.env.THENVOI_OWNER_ID;
+    expect(config.env).toHaveProperty('BAND_OWNER_ID', 'owner-uuid-from-env');
+    delete process.env.BAND_OWNER_ID;
   });
 
   it('rejects the removed callback contact strategy instead of auto-approving requests', async () => {
-    setThenvoiEnv();
-    process.env.THENVOI_CONTACT_STRATEGY = 'callback';
-    await import('./thenvoi.js');
+    setBandEnv();
+    process.env.BAND_CONTACT_STRATEGY = 'callback';
+    await import('./band.js');
     const { getChannelAdapter, initChannelAdapters } = await import('./channel-registry.js');
 
     await initChannelAdapters(() => ({
@@ -689,14 +961,21 @@ describe('thenvoi channel adapter', () => {
       onAction: () => {},
     }));
 
-    expect(getChannelAdapter('thenvoi')).toBeUndefined();
+    expect(getChannelAdapter('band')).toBeUndefined();
     expect(fakeRestClients).toHaveLength(0);
   });
 
   it('creates a hub room and routes contact events into it under hub_room strategy', async () => {
-    setThenvoiEnv();
-    process.env.THENVOI_CONTACT_STRATEGY = 'hub_room';
-    process.env.THENVOI_CONTACT_AGENT_GROUP_ID = 'ag-contact';
+    setBandEnv();
+    process.env.BAND_OWNER_ID = 'owner-1';
+    // Pre-existing owner room so the Nano Hub bootstrap no-ops and the
+    // contact-hub assertions only see contact-flow REST calls.
+    fakeParticipants['room-1'] = [
+      { id: 'owner-1', type: 'User', role: 'member' },
+      { id: 'agent-1', type: 'Agent', role: 'owner' },
+    ];
+    process.env.BAND_CONTACT_STRATEGY = 'hub_room';
+    process.env.BAND_CONTACT_AGENT_GROUP_ID = 'ag-contact';
     const { createAgentGroup } = await import('../db/index.js');
     createAgentGroup({
       id: 'ag-contact',
@@ -706,7 +985,7 @@ describe('thenvoi channel adapter', () => {
       created_at: new Date().toISOString(),
     });
 
-    await import('./thenvoi.js');
+    await import('./band.js');
     const { initChannelAdapters } = await import('./channel-registry.js');
     const onInbound = vi.fn(
       async (_platformId: string, _threadId: string | null) =>
@@ -744,7 +1023,7 @@ describe('thenvoi channel adapter', () => {
 
     await waitFor(() => fakeRestClients[0].agentApiChats.createAgentChat.mock.calls.length === 1);
     await waitFor(() => fakeRestClients[0].agentApiParticipants.addAgentChatParticipant.mock.calls.length === 1);
-    await waitFor(() => onInbound.mock.calls.some(([platformId]) => platformId === 'thenvoi:hub-room-1'));
+    await waitFor(() => onInbound.mock.calls.some(([platformId]) => platformId === 'band:hub-room-1'));
     await waitFor(() => fakeRestClients[0].agentApiEvents.createAgentChatEvent.mock.calls.length === 1);
 
     expect(fakeRestClients[0].agentApiParticipants.addAgentChatParticipant).toHaveBeenCalledWith('hub-room-1', {
@@ -753,8 +1032,8 @@ describe('thenvoi channel adapter', () => {
 
     const { getModuleState, getMessagingGroupByPlatform, getMessagingGroupAgentByPair } =
       await import('../db/index.js');
-    expect(getModuleState('thenvoi', 'hub-room')).toMatchObject({ roomId: 'hub-room-1' });
-    const mg = getMessagingGroupByPlatform('thenvoi', 'thenvoi:hub-room-1');
+    expect(getModuleState('band', 'hub-room')).toMatchObject({ roomId: 'hub-room-1' });
+    const mg = getMessagingGroupByPlatform('band', 'band:hub-room-1');
     expect(mg).toMatchObject({ name: 'Contact Hub', unknown_sender_policy: 'public' });
     expect(getMessagingGroupAgentByPair(mg!.id, 'ag-contact')).toMatchObject({
       agent_group_id: 'ag-contact',
@@ -764,9 +1043,16 @@ describe('thenvoi channel adapter', () => {
   });
 
   it('reuses an existing hub room across contact events without recreating it', async () => {
-    setThenvoiEnv();
-    process.env.THENVOI_CONTACT_STRATEGY = 'hub_room';
-    await import('./thenvoi.js');
+    setBandEnv();
+    process.env.BAND_OWNER_ID = 'owner-1';
+    // Pre-existing owner room so the Nano Hub bootstrap no-ops and the
+    // contact-hub assertions only see contact-flow REST calls.
+    fakeParticipants['room-1'] = [
+      { id: 'owner-1', type: 'User', role: 'member' },
+      { id: 'agent-1', type: 'Agent', role: 'owner' },
+    ];
+    process.env.BAND_CONTACT_STRATEGY = 'hub_room';
+    await import('./band.js');
     const { initChannelAdapters } = await import('./channel-registry.js');
 
     await initChannelAdapters(() => ({
@@ -814,8 +1100,15 @@ describe('thenvoi channel adapter', () => {
   });
 
   it('drops contact events under disabled strategy without calling REST', async () => {
-    setThenvoiEnv();
-    await import('./thenvoi.js');
+    setBandEnv();
+    process.env.BAND_OWNER_ID = 'owner-1';
+    // Pre-existing owner room so the Nano Hub bootstrap no-ops and the
+    // contact-hub assertions only see contact-flow REST calls.
+    fakeParticipants['room-1'] = [
+      { id: 'owner-1', type: 'User', role: 'member' },
+      { id: 'agent-1', type: 'Agent', role: 'owner' },
+    ];
+    await import('./band.js');
     const { initChannelAdapters } = await import('./channel-registry.js');
 
     await initChannelAdapters(() => ({
@@ -853,9 +1146,9 @@ describe('thenvoi channel adapter', () => {
   });
 
   it('injects participant memories on participant_added when memory load-on-start is enabled', async () => {
-    setThenvoiEnv();
-    process.env.THENVOI_MEMORY_LOAD_ON_START = 'true';
-    await import('./thenvoi.js');
+    setBandEnv();
+    process.env.BAND_MEMORY_LOAD_ON_START = 'true';
+    await import('./band.js');
     const { initChannelAdapters } = await import('./channel-registry.js');
 
     const onInbound = vi.fn(
@@ -895,13 +1188,13 @@ describe('thenvoi channel adapter', () => {
     });
 
     await waitFor(() => fakeRestClients[0].agentApiMemories.listAgentMemories.mock.calls.length === 1);
-    await waitFor(() => onInbound.mock.calls.some(([platformId]) => platformId === 'thenvoi:room-1'));
+    await waitFor(() => onInbound.mock.calls.some(([platformId]) => platformId === 'band:room-1'));
 
     expect(fakeRestClients[0].agentApiMemories.listAgentMemories).toHaveBeenCalledWith({
       subject_id: 'user-42',
       scope: 'subject',
     });
-    const call = onInbound.mock.calls.find(([platformId]) => platformId === 'thenvoi:room-1')!;
+    const call = onInbound.mock.calls.find(([platformId]) => platformId === 'band:room-1')!;
     const message = call[2] as { content: { text: string; senderId: string } };
     expect(message.content.senderId).toBe('system');
     expect(message.content.text).toContain('Jane joined the room');
@@ -909,8 +1202,8 @@ describe('thenvoi channel adapter', () => {
   });
 
   it('does not fetch participant memories when load-on-start is disabled', async () => {
-    setThenvoiEnv();
-    await import('./thenvoi.js');
+    setBandEnv();
+    await import('./band.js');
     const { initChannelAdapters } = await import('./channel-registry.js');
 
     await initChannelAdapters(() => ({

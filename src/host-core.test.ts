@@ -483,8 +483,8 @@ describe('router', () => {
     const { routeInbound } = await import('./router.js');
     createMessagingGroup({
       id: 'mg-unwired',
-      channel_type: 'thenvoi',
-      platform_id: 'thenvoi:room-unwired',
+      channel_type: 'band',
+      platform_id: 'band:room-unwired',
       name: 'Unwired Band Room',
       is_group: 1,
       unknown_sender_policy: 'public',
@@ -492,8 +492,8 @@ describe('router', () => {
     });
 
     const result = await routeInbound({
-      channelType: 'thenvoi',
-      platformId: 'thenvoi:room-unwired',
+      channelType: 'band',
+      platformId: 'band:room-unwired',
       threadId: null,
       message: {
         id: 'band-msg-unwired-plain',
@@ -506,8 +506,8 @@ describe('router', () => {
     expect(result).toMatchObject({ status: 'dropped', reason: 'no_agent_wired_unmentioned', retryable: true });
     expect(
       getInboundDelivery({
-        channelType: 'thenvoi',
-        platformId: 'thenvoi:room-unwired',
+        channelType: 'band',
+        platformId: 'band:room-unwired',
         platformMessageId: 'band-msg-unwired-plain',
       })?.status,
     ).toBe('retrying');
