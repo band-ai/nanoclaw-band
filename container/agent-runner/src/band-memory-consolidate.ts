@@ -1,7 +1,7 @@
 /**
  * Band.ai end-of-session memory consolidation.
  *
- * When `THENVOI_MEMORY_CONSOLIDATION=true` and the channel is `thenvoi`, this
+ * When `BAND_MEMORY_CONSOLIDATION=true` and the channel is `band`, this
  * runs once after the poll loop has exited (typically on SIGTERM from the host
  * when the container is being shut down). It drives the configured provider
  * directly with a consolidation prompt — events are drained but never written
@@ -22,15 +22,15 @@ function env(name: string): string | undefined {
 
 function shouldRun(): boolean {
   return (
-    process.env.THENVOI_MEMORY_TOOLS === 'true' &&
-    process.env.THENVOI_MEMORY_CONSOLIDATION === 'true' &&
-    process.env.NANOCLAW_CHANNEL === 'thenvoi'
+    (process.env.BAND_MEMORY_TOOLS === 'true' || process.env.THENVOI_MEMORY_TOOLS === 'true') &&
+    (process.env.BAND_MEMORY_CONSOLIDATION === 'true' || process.env.THENVOI_MEMORY_CONSOLIDATION === 'true') &&
+    (process.env.NANOCLAW_CHANNEL === 'band' || process.env.NANOCLAW_CHANNEL === 'thenvoi')
   );
 }
 
 async function loadSubjectMap(): Promise<string> {
-  const agentId = env('THENVOI_AGENT_ID');
-  const roomId = env('THENVOI_ROOM_ID');
+  const agentId = env('BAND_AGENT_ID') ?? env('THENVOI_AGENT_ID');
+  const roomId = env('BAND_ROOM_ID') ?? env('THENVOI_ROOM_ID');
   if (!agentId || !roomId) {
     return 'No participant subject map is available. Do not store user- or agent-specific memories.';
   }
@@ -40,8 +40,8 @@ async function loadSubjectMap(): Promise<string> {
     const { AgentTools } = await import('@thenvoi/sdk/runtime');
     const link = new ThenvoiLink({
       agentId,
-      apiKey: env('THENVOI_API_KEY') ?? env('ONECLI_API_KEY') ?? '',
-      restUrl: env('THENVOI_REST_URL'),
+      apiKey: env('BAND_API_KEY') ?? env('THENVOI_API_KEY') ?? env('ONECLI_API_KEY') ?? '',
+      restUrl: env('BAND_REST_URL') ?? env('THENVOI_REST_URL'),
     });
     const tools = new AgentTools({ roomId, rest: link.rest, capabilities: { memory: true } });
     const participants = await tools.getParticipants();

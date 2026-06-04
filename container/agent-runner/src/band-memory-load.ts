@@ -1,7 +1,7 @@
 /**
  * Band.ai memory pre-load.
  *
- * When `THENVOI_MEMORY_LOAD_ON_START=true` and the channel is `thenvoi` (Band),
+ * When `BAND_MEMORY_LOAD_ON_START=true` and the channel is `band`,
  * fetch each room participant's stored memories via the SDK and format them
  * into a markdown block to append to the system prompt addendum. This gives
  * the agent context about who they're talking to from the very first turn,
@@ -26,19 +26,19 @@ interface MemoryItem {
 
 function shouldLoad(): boolean {
   return (
-    process.env.THENVOI_MEMORY_TOOLS === 'true' &&
-    process.env.THENVOI_MEMORY_LOAD_ON_START === 'true' &&
-    process.env.NANOCLAW_CHANNEL === 'thenvoi'
+    (process.env.BAND_MEMORY_TOOLS === 'true' || process.env.THENVOI_MEMORY_TOOLS === 'true') &&
+    (process.env.BAND_MEMORY_LOAD_ON_START === 'true' || process.env.THENVOI_MEMORY_LOAD_ON_START === 'true') &&
+    (process.env.NANOCLAW_CHANNEL === 'band' || process.env.NANOCLAW_CHANNEL === 'thenvoi')
   );
 }
 
 export async function loadParticipantMemories(): Promise<string> {
   if (!shouldLoad()) return '';
 
-  const agentId = env('THENVOI_AGENT_ID');
-  const roomId = env('THENVOI_ROOM_ID');
+  const agentId = env('BAND_AGENT_ID') ?? env('THENVOI_AGENT_ID');
+  const roomId = env('BAND_ROOM_ID') ?? env('THENVOI_ROOM_ID');
   if (!agentId || !roomId) {
-    log('Skipped: THENVOI_AGENT_ID or THENVOI_ROOM_ID missing');
+    log('Skipped: BAND_AGENT_ID or BAND_ROOM_ID missing');
     return '';
   }
 
@@ -48,8 +48,8 @@ export async function loadParticipantMemories(): Promise<string> {
 
     const link = new ThenvoiLink({
       agentId,
-      apiKey: env('THENVOI_API_KEY') ?? env('ONECLI_API_KEY') ?? '',
-      restUrl: env('THENVOI_REST_URL'),
+      apiKey: env('BAND_API_KEY') ?? env('THENVOI_API_KEY') ?? env('ONECLI_API_KEY') ?? '',
+      restUrl: env('BAND_REST_URL') ?? env('THENVOI_REST_URL'),
     });
     const tools = new AgentTools({
       roomId,

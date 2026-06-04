@@ -47,20 +47,26 @@ function env(name: string): string | undefined {
   return value && value.length > 0 ? value : undefined;
 }
 
-function thenvoiEnvPresent(): boolean {
-  return Boolean(env('THENVOI_ROOM_ID') && env('THENVOI_AGENT_ID') && env('THENVOI_REST_URL'));
+// BAND_* is canonical post-rename; THENVOI_* is honored as a legacy fallback
+// so containers spawned by an older host keep working.
+function bandEnv(suffix: string): string | undefined {
+  return env(`BAND_${suffix}`) ?? env(`THENVOI_${suffix}`);
+}
+
+function bandEnvPresent(): boolean {
+  return Boolean(bandEnv('ROOM_ID') && bandEnv('AGENT_ID') && bandEnv('REST_URL'));
 }
 
 function roomId(): string {
-  return env('THENVOI_ROOM_ID')!;
+  return bandEnv('ROOM_ID')!;
 }
 
 function mainControlRoom(): boolean {
-  return env('THENVOI_IS_MAIN_CONTROL_ROOM') === 'true';
+  return bandEnv('IS_MAIN_CONTROL_ROOM') === 'true';
 }
 
 function memoryToolsEnabled(): boolean {
-  return env('THENVOI_MEMORY_TOOLS') === 'true' && !memoryDisabledForRun;
+  return bandEnv('MEMORY_TOOLS') === 'true' && !memoryDisabledForRun;
 }
 
 function consolidationMode(): boolean {
@@ -75,18 +81,18 @@ let cachedTools: AgentToolsProtocol | null = null;
 let memoryDisabledForRun = false;
 
 function apiKey(): string {
-  return env('THENVOI_API_KEY') ?? env('ONECLI_API_KEY') ?? '';
+  return bandEnv('API_KEY') ?? env('ONECLI_API_KEY') ?? '';
 }
 
 function restUrl(): string | undefined {
-  return env('THENVOI_REST_URL');
+  return bandEnv('REST_URL');
 }
 
 function sdkTools(): AgentToolsProtocol {
   if (cachedTools) return cachedTools;
 
   const link = new ThenvoiLink({
-    agentId: env('THENVOI_AGENT_ID')!,
+    agentId: bandEnv('AGENT_ID')!,
     apiKey: apiKey(),
     restUrl: restUrl(),
   });
@@ -226,6 +232,6 @@ function buildBandToolDefinitions(): McpToolDefinition[] {
   });
 }
 
-if (thenvoiEnvPresent()) {
+if (bandEnvPresent()) {
   registerTools(buildBandToolDefinitions());
 }

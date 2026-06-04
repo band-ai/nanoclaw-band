@@ -25,7 +25,7 @@ describe('Band.ai MCP tools', () => {
     process.env.THENVOI_REST_URL = 'https://band.example.test';
     process.env.THENVOI_MEMORY_TOOLS = 'true';
 
-    await import('./thenvoi.js');
+    await import('./band.js');
     const { listRegisteredToolNames } = await import('./server.js');
 
     expect(listRegisteredToolNames()).toContain('band_send_message');
@@ -43,7 +43,7 @@ describe('Band.ai MCP tools', () => {
     process.env.THENVOI_REST_URL = 'https://band.example.test';
     process.env.THENVOI_IS_MAIN_CONTROL_ROOM = 'true';
 
-    await import('./thenvoi.js');
+    await import('./band.js');
     const { getRegisteredTool } = await import('./server.js');
     const tool = getRegisteredTool('band_add_participant');
 
@@ -61,7 +61,7 @@ describe('Band.ai MCP tools', () => {
     process.env.THENVOI_MEMORY_TOOLS = 'true';
     process.env.NANOCLAW_MEMORY_CONSOLIDATION_ACTIVE = 'true';
 
-    await import('./thenvoi.js');
+    await import('./band.js');
     const { getRegisteredTool } = await import('./server.js');
     const tool = getRegisteredTool('band_send_message');
 
