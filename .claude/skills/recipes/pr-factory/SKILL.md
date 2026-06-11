@@ -87,11 +87,61 @@ All suites green. `src/recipe-pr-factory-stack.test.ts` is the composed-stack le
 
 ## What you get
 
-- **Per-PR worker flow** — webhook → Slack thread (status reactions 🟢⚪🔴🟣) → per-thread agent session seeded with the diff → triage report → review → test plan. The default triage/review/test-plan workflow is seeded into `groups/pr-factory-worker/CLAUDE.local.md` (edit it to tune trusted contributors, merge policy, review depth) or replaced wholesale via `PR_FACTORY_REVIEW_SKILL`.
+- **Per-PR worker flow** — webhook → Slack thread (status reactions 🟢⚪🔴🟣) → per-thread agent session seeded with the diff → triage report → review → test plan. The default triage/review/test-plan workflow is seeded into `groups/pr-factory-worker/CLAUDE.local.md` (edit it to tune trusted contributors, merge policy, review depth) or replaced wholesale via `PR_FACTORY_REVIEW_SKILL` — see "Tailoring the bots" below.
 - **Approval cards for every consequential action** — send-to-testing, retry, skill edits, and every `gh` write (merge, close, comment), executed with the approving human's gh identity.
 - **Supervisor bot** — its own Slack identity; takes feedback in an admin channel or @-mentioned in PR threads, proposes worker skill/instruction edits behind a diff + approval card, clears and retriggers PR sessions.
 - **VM test runs** — approved plans clone an ephemeral VM from a template, check out the PR, build, boot, and hand the VM to the tester agent; PASS wakes the worker to propose a merge, FAIL to analyze.
 - **Canvases** — test plans, results, and review writeups render as Slack Canvases instead of file uploads (paid Slack plan; falls back to `.md` uploads otherwise).
+
+## Tailoring the bots — your own container skills
+
+The shipped triage/review/test-plan workflow is deliberately generic. The PR Factory gets sharply better when the operator replaces it with skills written for **their** repo — its review dimensions, its triage rules, its test environments. The mechanism is all core's:
+
+- **Container skills** live at `container/skills/<name>/SKILL.md` (read-only at `/app/skills` in every agent container). Each group's container config has a `skills` selection (default `'all'`) that controls which ones are symlinked into that group's `~/.claude/skills` at spawn — so a new skill folder reaches the worker on its next container start, no config change needed.
+- **Group-private skills**: a directory at `groups/<folder>/.claude/skills/<name>/` is discovered as a project-level skill (the agent's cwd is `/workspace/agent`, the group folder). Use this for a skill only one group should ever see — but note it sits outside the supervisor's edit loop below.
+- **Precedence**: with `PR_FACTORY_REVIEW_SKILL=<name>` set, every PR trigger opens with `Use the /<name> skill to triage this pull request.` and the generic defaults seeded into `groups/pr-factory-worker/CLAUDE.local.md` are ignored. Without it, the seeded instructions run — editing them in place is the lighter path when the defaults are close.
+- **Iteration loop**: `container/skills/` is what the supervisor bot edits — `propose_skill_edit` writes `container/skills/<skill>/<file>` behind a diff + approval card, then clears + retriggers affected PRs. Routing repo-specific workflow into a container skill (rather than CLAUDE.local.md) is what makes the feedback loop reviewable.
+
+### Interview the operator, then generate
+
+Run this as a conversation — one cluster of questions per skill, then write the files:
+
+1. **Review standards** — what does a good review catch in this repo? Which dimensions matter (correctness, security, migration safety, API stability, performance, docs)? Any house rules — error-handling patterns, layering, naming? What severity scale gates a merge? → the **review skill**: the entry point named in `PR_FACTORY_REVIEW_SKILL`, owning the full triage → review → test-plan pipeline (keep the shipped hard constraints: GitHub writes only via `credentialed_gh`, output to the PR thread, the `[PR_CONTEXT: …]` tag is authoritative).
+2. **Triage categories and routing** — what kinds of PRs arrive (features, fixes, dep bumps, docs, vendor syncs)? Which classes auto-merge, which auto-close, who are the trusted authors? What's the merge strategy? → the triage stage of that skill, or a separate **triage skill** it invokes.
+3. **Test environments and depth** — what exists (unit suites, integration rigs, a staging VM, devices)? What depth is conventional per change type, and what can't be tested automatically? → a **test-planning skill** that fixes plan depth and the plan-file format.
+
+Then: write each as `container/skills/<name>/SKILL.md`, set `PR_FACTORY_REVIEW_SKILL=<review-skill-name>` in `.env`, restart the host, and point future tuning at the supervisor bot ("the worker keeps missing X — fix the skill") so every refinement lands as a diff behind an approval card.
+
+### Worked example — review skill skeleton
+
+`container/skills/acme-review/SKILL.md`:
+
+```markdown
+---
+name: acme-review
+description: Triage and review a pull request against acme/widgets' standards. Used by the PR Factory worker for every incoming PR.
+---
+
+# acme/widgets PR review
+
+Triage first (per the categories below), then review the diff dimension by
+dimension. Verdict first, then findings — most severe first, each with file:line.
+
+## Dimensions
+
+1. **Migration safety** — anything under `migrations/` must be backward-compatible
+   one release back; destructive ops (DROP/ALTER) without a two-step plan are Must-fix.
+2. **API stability** — exported types and HTTP routes are frozen; a breaking change
+   needs a v2 route, not an edit.
+3. **Error handling** — no swallowed errors; failures propagate to the route-level
+   handler. A bare `catch {}` is Must-fix.
+
+## Severity
+
+Must-fix (blocks merge) · Should-fix (request changes) · Nit (comment only).
+```
+
+Then `PR_FACTORY_REVIEW_SKILL=acme-review` in `.env` and restart. Triage and test-planning skills follow the same shape.
 
 ## Upgrading a legacy bot_id install
 
