@@ -18,7 +18,7 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 
 import { initTestDb, closeDb, getDb } from './connection.js';
-import { runMigrations, migrations } from './migrations/index.js';
+import { runMigrations, migrations, type Migration } from './migrations/index.js';
 import {
   createMessagingGroup,
   getMessagingGroupByPlatform,
@@ -133,6 +133,62 @@ describe('migration 016 — wired legacy DB upgrade (the FK recreate arm)', () =
     // Full-DB FK integrity (FK enforcement was restored by the runner).
     expect(db.pragma('foreign_key_check')).toEqual([]);
     expect(db.pragma('foreign_keys', { simple: true })).toBe(1);
+  });
+
+  it('tolerates pre-existing FK orphans: the migration still applies (no boot crash-loop)', () => {
+    const db = initTestDb();
+    runMigrations(
+      db,
+      migrations.filter((m) => m.name !== 'messaging-group-instance'),
+    );
+
+    // Seed the orphan class that demonstrably exists on live installs
+    // (ensureUserDm tolerates it at runtime): a user_dms row whose
+    // messaging_group was deleted through a FK-OFF connection — the
+    // sqlite3 CLI ships with foreign_keys OFF, and operators are told to
+    // poke v2.db when troubleshooting.
+    db.prepare("INSERT INTO users (id, kind, created_at) VALUES ('slack:U1', 'slack', ?)").run(now());
+    db.pragma('foreign_keys = OFF');
+    db.prepare(
+      `INSERT INTO user_dms (user_id, channel_type, messaging_group_id, resolved_at)
+       VALUES ('slack:U1', 'slack', 'mg-deleted-via-cli', ?)`,
+    ).run(now());
+    db.pragma('foreign_keys = ON');
+    expect(db.pragma('foreign_key_check')).toHaveLength(1);
+
+    // 016 did not create this violation — it must still apply (the runner
+    // diffs post-up violations against a pre-up snapshot and only throws
+    // on NEW ones; pre-existing ones are warned about and carried through).
+    expect(() => runMigrations(db)).not.toThrow();
+    const cols = db.prepare("PRAGMA table_info('messaging_groups')").all() as Array<{ name: string }>;
+    expect(cols.some((c) => c.name === 'instance')).toBe(true);
+
+    // The orphan is untouched: still present, still the only violation.
+    expect(db.pragma('foreign_key_check')).toHaveLength(1);
+  });
+
+  it('still rejects a migration that ITSELF introduces FK violations', () => {
+    const db = initTestDb();
+    runMigrations(db);
+
+    const rogue: Migration = {
+      version: 999,
+      name: 'test-rogue-fk-violation',
+      disableForeignKeys: true,
+      up: (d) => {
+        d.prepare("INSERT INTO users (id, kind, created_at) VALUES ('slack:U-rogue', 'slack', datetime('now'))").run();
+        d.prepare(
+          `INSERT INTO user_dms (user_id, channel_type, messaging_group_id, resolved_at)
+           VALUES ('slack:U-rogue', 'slack', 'mg-never-existed', datetime('now'))`,
+        ).run();
+      },
+    };
+
+    expect(() => runMigrations(db, [...migrations, rogue])).toThrow(/left FK violations/);
+
+    // Rolled back atomically: not recorded as applied, nothing committed.
+    expect(db.prepare("SELECT 1 FROM schema_version WHERE name = 'test-rogue-fk-violation'").get()).toBeUndefined();
+    expect(db.pragma('foreign_key_check')).toEqual([]);
   });
 
   it('is idempotent — re-running the full barrel is a no-op', () => {

@@ -115,6 +115,15 @@ export function startTypingRefresh(
     triggerTyping(channelType, platformId, threadId, instance).catch(() => {});
     existing.startedAt = Date.now();
     existing.pausedUntil = 0;
+    // Keep the stored entry self-consistent: a re-trigger can arrive from
+    // a different chat address (agent-shared sessions span messaging
+    // groups, possibly on different platforms/instances), so the address
+    // fields and the owning instance must move together — a torn entry
+    // (old address + new instance) would hand e.g. a telegram platformId
+    // to a Slack instance's setTyping on the next interval tick.
+    existing.channelType = channelType;
+    existing.platformId = platformId;
+    existing.threadId = threadId;
     existing.instance = instance;
     return;
   }

@@ -133,10 +133,9 @@ describe('channel registry — instance keying', () => {
   afterEach(async () => {
     const { teardownChannelAdapters } = await import('./channel-registry.js');
     await teardownChannelAdapters();
-    vi.useRealTimers();
     // Drop this test's registrations so later describe blocks (which import
     // the registry without resetting) start from an empty registry instead
-    // of inheriting same-channelType pairs (and their 10s stagger).
+    // of inheriting same-channelType pairs.
     vi.resetModules();
   });
 
@@ -154,11 +153,7 @@ describe('channel registry — instance keying', () => {
     reg.registerChannelAdapter('slack-worker', { factory: () => worker });
     reg.registerChannelAdapter('slack-tester', { factory: () => tester });
 
-    vi.useFakeTimers();
-    const init = reg.initChannelAdapters(mockSetup);
-    await vi.runAllTimersAsync();
-    await init;
-    vi.useRealTimers();
+    await reg.initChannelAdapters(mockSetup);
 
     expect(reg.getChannelAdapter('slack-worker')).toBe(worker);
     expect(reg.getChannelAdapter('slack-tester')).toBe(tester);
@@ -172,11 +167,7 @@ describe('channel registry — instance keying', () => {
     reg.registerChannelAdapter('slack-tester', { factory: () => named });
     reg.registerChannelAdapter('slack', { factory: () => unnamed });
 
-    vi.useFakeTimers();
-    const init = reg.initChannelAdapters(mockSetup);
-    await vi.runAllTimersAsync();
-    await init;
-    vi.useRealTimers();
+    await reg.initChannelAdapters(mockSetup);
 
     // Exact key (default instance keyed by channelType) beats the fallback
     // scan, even though the named sibling registered first.
@@ -191,44 +182,54 @@ describe('channel registry — instance keying', () => {
     const second = createMockAdapter('slack', 'slack-worker');
     reg2.registerChannelAdapter('slack-tester', { factory: () => first });
     reg2.registerChannelAdapter('slack-worker', { factory: () => second });
-    vi.useFakeTimers();
-    const init2 = reg2.initChannelAdapters(mockSetup);
-    await vi.runAllTimersAsync();
-    await init2;
-    vi.useRealTimers();
+    await reg2.initChannelAdapters(mockSetup);
     expect(reg2.getChannelAdapter('slack')).toBe(first);
   });
 
-  it('staggers the second same-channelType adapter setup by 10s; different platforms unstaggered', async () => {
-    vi.useFakeTimers();
+  it('does NOT reroute default-instance outbound through a named sibling when the default adapter is missing', async () => {
+    // The default Slack app is offline (token rotated, factory returned
+    // null, …) while a named sibling boots fine. Outbound for the default
+    // instance must get the offline-adapter handling (drop into the retry
+    // path) — NEVER a cross-identity send through the sibling bot.
     const reg = await import('./channel-registry.js');
-    const a = createMockAdapter('slack', 'slack-a');
-    const b = createMockAdapter('slack', 'slack-b');
-    const c = createMockAdapter('discord');
-    reg.registerChannelAdapter('slack-a', { factory: () => a });
-    reg.registerChannelAdapter('slack-b', { factory: () => b });
-    reg.registerChannelAdapter('discord', { factory: () => c });
+    const tester = createMockAdapter('slack', 'slack-tester');
+    reg.registerChannelAdapter('slack-tester', { factory: () => tester });
+    reg.registerChannelAdapter('slack', { factory: () => null });
 
-    const init = reg.initChannelAdapters(mockSetup);
+    await reg.initChannelAdapters(mockSetup);
 
-    // Flush microtasks without advancing the clock: a sets up, b is held.
-    await vi.advanceTimersByTimeAsync(0);
-    expect(a.setupTimes).toHaveLength(1);
-    expect(b.setupTimes).toHaveLength(0);
-    expect(c.setupTimes).toHaveLength(0);
+    // Exact lookup (delivery/typing path): the default key resolves nothing.
+    expect(reg.getChannelAdapterExact('slack')).toBeUndefined();
+    // Fallback-capable lookup (channelType-only callers) still resolves.
+    expect(reg.getChannelAdapter('slack')).toBe(tester);
 
-    // Not yet at the stagger window.
-    await vi.advanceTimersByTimeAsync(9_000);
-    expect(b.setupTimes).toHaveLength(0);
+    // The delivery bridge dispatches by exact key: a default-instance
+    // message (instance === channelType after backfill) is dropped, not
+    // delivered through the sibling's identity.
+    const bridge = reg.createChannelDeliveryAdapter();
+    const result = await bridge.deliver(
+      'slack',
+      'slack:C1',
+      null,
+      'chat',
+      JSON.stringify({ text: 'to the default bot' }),
+      undefined,
+      'slack',
+    );
+    expect(result).toBeUndefined();
+    expect(tester.delivered).toHaveLength(0);
 
-    // Crossing 10s releases b; discord (different platform) follows with
-    // no additional stagger of its own.
-    await vi.advanceTimersByTimeAsync(1_000);
-    expect(b.setupTimes).toHaveLength(1);
-    await vi.advanceTimersByTimeAsync(0);
-    expect(c.setupTimes).toHaveLength(1);
-
-    await init;
+    // Sanity: the same bridge DOES deliver when the exact instance is live.
+    await bridge.deliver(
+      'slack',
+      'slack:C1',
+      null,
+      'chat',
+      JSON.stringify({ text: 'to the tester bot' }),
+      undefined,
+      'slack-tester',
+    );
+    expect(tester.delivered).toHaveLength(1);
   });
 });
 

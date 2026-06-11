@@ -53,7 +53,7 @@ export interface ChatSdkBridgeConfig {
    * name. Drives the registry key, the webhook route (/webhook/<instance>),
    * and the Chat SDK state namespace. channelType is NOT affected — user
    * identity, formatting, and container config stay keyed on the platform.
-   * Must be URL-safe: no '/', '?', ':' or whitespace.
+   * Must be URL-safe: non-empty, only letters, digits, '.', '_' or '-'.
    */
   instance?: string;
   concurrency?: ConcurrencyStrategy;
@@ -133,9 +133,14 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
   // The instance name becomes a webhook route segment (the route regex is
   // [^/?]+) and ':' is the state-namespace delimiter — reject anything that
   // would break either, at construction time rather than at first webhook.
-  if (config.instance && /[/?:\s]/.test(config.instance)) {
+  // Positive allow-list (not a deny-list): also rejects '' and
+  // whitespace-only names, which are config bugs — '' is falsy, so it
+  // would skip a truthiness guard, dead-end the webhook route, and
+  // collapse the state namespace into the default instance's keyspace.
+  if (config.instance !== undefined && !/^[A-Za-z0-9._-]+$/.test(config.instance)) {
     throw new Error(
-      `chat-sdk bridge instance ${JSON.stringify(config.instance)} must be URL-safe: no '/', '?', ':' or whitespace`,
+      `chat-sdk bridge instance ${JSON.stringify(config.instance)} must be URL-safe: ` +
+        `non-empty, only letters, digits, '.', '_' or '-'`,
     );
   }
   const transformText = (t: string): string => (config.transformOutboundText ? config.transformOutboundText(t) : t);

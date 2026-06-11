@@ -677,16 +677,12 @@ describe('router — channel instances', () => {
     });
     registerChannelAdapter('slack', { factory: () => makeAdapter(undefined, true) });
     registerChannelAdapter('slack-tester', { factory: () => makeAdapter('slack-tester', false) });
-    vi.useFakeTimers();
-    const init = initChannelAdapters(() => ({
+    await initChannelAdapters(() => ({
       onInbound: () => {},
       onInboundEvent: () => {},
       onMetadata: () => {},
       onAction: () => {},
     }));
-    await vi.runAllTimersAsync();
-    await init;
-    vi.useRealTimers();
 
     try {
       // Inbound on the named instance, with a threadId the non-threaded

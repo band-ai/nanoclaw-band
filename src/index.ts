@@ -62,7 +62,11 @@ import './cli/delivery-action.js';
 import { startCliServer, stopCliServer } from './cli/socket-server.js';
 
 import type { ChannelAdapter, ChannelSetup } from './channels/adapter.js';
-import { initChannelAdapters, teardownChannelAdapters, getChannelAdapter } from './channels/channel-registry.js';
+import {
+  initChannelAdapters,
+  teardownChannelAdapters,
+  createChannelDeliveryAdapter,
+} from './channels/channel-registry.js';
 
 async function main(): Promise<void> {
   log.info('NanoClaw starting');
@@ -149,35 +153,11 @@ async function main(): Promise<void> {
     };
   });
 
-  // 4. Delivery adapter bridge — dispatches to channel adapters
-  const deliveryAdapter = {
-    async deliver(
-      channelType: string,
-      platformId: string,
-      threadId: string | null,
-      kind: string,
-      content: string,
-      files?: import('./channels/adapter.js').OutboundFile[],
-      instance?: string,
-    ): Promise<string | undefined> {
-      const adapter = getChannelAdapter(instance ?? channelType);
-      if (!adapter) {
-        log.warn('No adapter for channel type', { channelType, instance });
-        return;
-      }
-      return adapter.deliver(platformId, threadId, { kind, content: JSON.parse(content), files });
-    },
-    async setTyping(
-      channelType: string,
-      platformId: string,
-      threadId: string | null,
-      instance?: string,
-    ): Promise<void> {
-      const adapter = getChannelAdapter(instance ?? channelType);
-      await adapter?.setTyping?.(platformId, threadId);
-    },
-  };
-  setDeliveryAdapter(deliveryAdapter);
+  // 4. Delivery adapter bridge — dispatches to channel adapters by EXACT
+  // registry key (instance ?? channelType): a named instance with an
+  // offline adapter is never rerouted through a sibling bot. See
+  // createChannelDeliveryAdapter in channels/channel-registry.ts.
+  setDeliveryAdapter(createChannelDeliveryAdapter());
 
   // 5. Start delivery polls
   startActiveDeliveryPoll();

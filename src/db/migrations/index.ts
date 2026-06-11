@@ -48,6 +48,19 @@ export const migrations: Migration[] = [
   migration016,
 ];
 
+/** Row shape of PRAGMA foreign_key_check. Child rowids are stable across a
+ *  parent-table recreate (child tables aren't touched), so this JSON identity
+ *  is a reliable before/after diff key. */
+interface FkViolation {
+  table: string;
+  rowid: number | null;
+  parent: string;
+  fkid: number;
+}
+
+const fkIdentity = (v: FkViolation): string =>
+  JSON.stringify({ table: v.table, rowid: v.rowid, parent: v.parent, fkid: v.fkid });
+
 export function runMigrations(db: Database.Database, list: Migration[] = migrations): void {
   db.exec(`
     CREATE TABLE IF NOT EXISTS schema_version (
@@ -80,11 +93,28 @@ export function runMigrations(db: Database.Database, list: Migration[] = migrati
     if (m.disableForeignKeys) db.pragma('foreign_keys = OFF');
     try {
       db.transaction(() => {
+        // Snapshot violations BEFORE up() runs: live DBs can carry latent
+        // FK orphans (e.g. parents deleted through a FK-OFF sqlite3 CLI
+        // session — ensureUserDm tolerates exactly this at runtime). The
+        // migration must only fail for violations it INTRODUCED; throwing
+        // on pre-existing ones would crash-loop the host at every boot
+        // (runMigrations runs on startup) until manual DB surgery.
+        const preexisting = m.disableForeignKeys
+          ? new Set((db.pragma('foreign_key_check') as FkViolation[]).map(fkIdentity))
+          : null;
         m.up(db);
-        if (m.disableForeignKeys) {
-          const violations = db.pragma('foreign_key_check') as unknown[];
-          if (violations.length > 0) {
-            throw new Error(`migration ${m.name} left FK violations: ${JSON.stringify(violations.slice(0, 5))}`);
+        if (m.disableForeignKeys && preexisting) {
+          const violations = db.pragma('foreign_key_check') as FkViolation[];
+          const introduced = violations.filter((v) => !preexisting.has(fkIdentity(v)));
+          const carried = violations.length - introduced.length;
+          if (carried > 0) {
+            log.warn('Pre-existing FK violations carried through migration (not introduced by it)', {
+              migration: m.name,
+              count: carried,
+            });
+          }
+          if (introduced.length > 0) {
+            throw new Error(`migration ${m.name} left FK violations: ${JSON.stringify(introduced.slice(0, 5))}`);
           }
         }
         const next = (

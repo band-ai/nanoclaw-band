@@ -85,4 +85,39 @@ describe('startTypingRefresh — instance forwarding', () => {
     expect(calls.length).toBeGreaterThanOrEqual(1);
     expect(calls[calls.length - 1].instance).toBe('slack-worker');
   });
+
+  it('re-trigger with a changed address updates the whole entry — interval ticks stay self-consistent', async () => {
+    const calls = captureAdapter();
+    startTypingRefresh('sess-1', 'ag-1', 'slack', 'slack:C1', 'T1', 'slack-tester');
+    await vi.advanceTimersByTimeAsync(0);
+    calls.length = 0;
+
+    // Same session re-triggered from a different platform and chat
+    // (agent-shared sessions span messaging groups). The stored entry must
+    // not tear: keeping the old address with the new instance would hand a
+    // telegram platformId to the slack-tester adapter on the next tick.
+    startTypingRefresh('sess-1', 'ag-1', 'telegram', 'tg:99', null, 'telegram');
+    await vi.advanceTimersByTimeAsync(0);
+    expect(calls).toHaveLength(1);
+    expect(calls[0]).toEqual({
+      channelType: 'telegram',
+      platformId: 'tg:99',
+      threadId: null,
+      instance: 'telegram',
+    });
+
+    // Interval ticks fire from the stored entry — all four fields must
+    // have moved together.
+    calls.length = 0;
+    await vi.advanceTimersByTimeAsync(4_500);
+    expect(calls.length).toBeGreaterThanOrEqual(1);
+    for (const c of calls) {
+      expect(c).toEqual({
+        channelType: 'telegram',
+        platformId: 'tg:99',
+        threadId: null,
+        instance: 'telegram',
+      });
+    }
+  });
 });

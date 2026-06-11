@@ -126,6 +126,18 @@ describe('createChatSdkBridge — instance identity', () => {
       ).toThrow(/URL-safe/);
     }
   });
+
+  it('rejects empty and whitespace-only instance names (config bug — fail loud)', () => {
+    // '' is falsy: a truthiness guard would skip it, dead-ending the
+    // webhook route ('/webhook/' + '') and collapsing the state namespace
+    // into the default instance's unprefixed keyspace — the exact
+    // cross-bot dedupe/lock collisions the namespace exists to prevent.
+    for (const bad of ['', ' ', '   ', '\t']) {
+      expect(() =>
+        createChatSdkBridge({ adapter: stubAdapter({ name: 'slack' }), instance: bad, supportsThreads: true }),
+      ).toThrow(/URL-safe/);
+    }
+  });
 });
 
 describe('createChatSdkBridge.setup — webhook route and state namespace', () => {
@@ -137,8 +149,7 @@ describe('createChatSdkBridge.setup — webhook route and state namespace', () =
     return stubAdapter({
       name: 'slack',
       initialize: async () => {},
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    } as unknown as Partial<Adapter>) as any;
+    } as unknown as Partial<Adapter>);
   }
 
   beforeEach(async () => {
