@@ -7,9 +7,9 @@
  * is resolved per messaging group via `messaging_groups.instance`.
  *
  * Used by:
- *   - pr-factory handler: insert on PR opened
- *   - pr-factory session-ops (clear / retrigger): lookup by (channel_id, thread_ts)
+ *   - pr-factory handler: insert on PR opened; lookup + repoint on synchronize/close
  *   - pr-factory orchestrator: lookup by (repo_full_name, pr_number) when test results land
+ *   - pr-factory testing/gh/skill-edit gates + reactions: lookup by (session_id)
  */
 import { getDb } from './connection.js';
 

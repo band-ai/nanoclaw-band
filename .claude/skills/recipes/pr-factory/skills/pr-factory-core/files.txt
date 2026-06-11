@@ -12,7 +12,6 @@ src/modules/pr-factory/orchestrator.ts
 src/modules/pr-factory/testing-approval.ts
 src/modules/pr-factory/skill-edit-approval.ts
 src/modules/pr-factory/dismiss-approvals.ts
-src/modules/pr-factory/session-ops.ts
 src/modules/pr-factory/reactions.ts
 src/modules/pr-factory/activity-log.ts
 src/modules/pr-factory/defaults.ts

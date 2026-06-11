@@ -89,7 +89,7 @@ All suites green. `src/recipe-pr-factory-stack.test.ts` is the composed-stack le
 
 - **Per-PR worker flow** — webhook → Slack thread (status reactions 🟢⚪🔴🟣) → per-thread agent session seeded with the diff → triage report → review → test plan. The default triage/review/test-plan workflow is seeded into `groups/pr-factory-worker/CLAUDE.local.md` (edit it to tune trusted contributors, merge policy, review depth) or replaced wholesale via `PR_FACTORY_REVIEW_SKILL` — see "Tailoring the bots" below.
 - **Approval cards for every consequential action** — send-to-testing, retry, skill edits, and every `gh` write (merge, close, comment), executed with the approving human's gh identity.
-- **Supervisor bot** — its own Slack identity; takes feedback in an admin channel or @-mentioned in PR threads, proposes worker skill/instruction edits behind a diff + approval card, clears and retriggers PR sessions.
+- **Supervisor bot** — its own Slack identity; takes feedback in an admin channel or @-mentioned in PR threads, proposes worker skill/instruction edits behind a diff + approval card. Approved edits apply to the next PR the worker triages.
 - **VM test runs** — approved plans clone an ephemeral VM from a template, check out the PR, build, boot, and hand the VM to the tester agent; PASS wakes the worker to propose a merge, FAIL to analyze.
 - **Canvases** — test plans, results, and review writeups render as Slack Canvases instead of file uploads (paid Slack plan; falls back to `.md` uploads otherwise).
 
@@ -100,7 +100,7 @@ The shipped triage/review/test-plan workflow is deliberately generic. The PR Fac
 - **Container skills** live at `container/skills/<name>/SKILL.md` (read-only at `/app/skills` in every agent container). Each group's container config has a `skills` selection (default `'all'`) that controls which ones are symlinked into that group's `~/.claude/skills` at spawn — so a new skill folder reaches the worker on its next container start, no config change needed.
 - **Group-private skills**: a directory at `groups/<folder>/.claude/skills/<name>/` is discovered as a project-level skill (the agent's cwd is `/workspace/agent`, the group folder). Use this for a skill only one group should ever see — but note it sits outside the supervisor's edit loop below.
 - **Precedence**: with `PR_FACTORY_REVIEW_SKILL=<name>` set, every PR trigger opens with `Use the /<name> skill to triage this pull request.` and the generic defaults seeded into `groups/pr-factory-worker/CLAUDE.local.md` are ignored. Without it, the seeded instructions run — editing them in place is the lighter path when the defaults are close.
-- **Iteration loop**: `container/skills/` is what the supervisor bot edits — `propose_skill_edit` writes `container/skills/<skill>/<file>` behind a diff + approval card, then clears + retriggers affected PRs. Routing repo-specific workflow into a container skill (rather than CLAUDE.local.md) is what makes the feedback loop reviewable.
+- **Iteration loop**: `container/skills/` is what the supervisor bot edits — `propose_skill_edit` writes `container/skills/<skill>/<file>` behind a diff + approval card; the edit applies to the next PR the worker triages (running sessions keep their old read-only skill view until they next spawn). Routing repo-specific workflow into a container skill (rather than CLAUDE.local.md) is what makes the feedback loop reviewable.
 
 ### Interview the operator, then generate
 

@@ -37,11 +37,9 @@ import { clearAwaitingApproval } from './reactions.js';
 import { registerGitHubWebhook } from './webhook.js';
 import { handlePullRequest } from './handler.js';
 import { bootstrapPrFactory, TESTER_FOLDER } from './bootstrap.js';
-import { DEFAULT_REPO } from './defaults.js';
 import { getTestOrchestrator } from './test-orchestration.js';
 import { dispatchGhAction } from './gh-action.js';
 import { initOrchestrator, shutdownOrchestrator, handleTestResults } from './orchestrator.js';
-import { clearWorkerSession, retriggerWorker } from './session-ops.js';
 import { handleSendToTesting } from './testing-approval.js';
 import { handleProposeSkillEdit } from './skill-edit-approval.js';
 import { getAgentGroupByFolder } from '../../db/agent-groups.js';
@@ -85,12 +83,6 @@ if (!GITHUB_WEBHOOK_SECRET) {
   // same default inside handleTestResults. pr_gh dispatches through the
   // gh-action seam so the agent gets feedback even when the
   // gh-action-approval component isn't installed.
-  registerDeliveryAction('pr_clear_session', async (content) => {
-    clearWorkerSession((content.repo as string) || DEFAULT_REPO, content.pr_number as number);
-  });
-  registerDeliveryAction('pr_retrigger', async (content) => {
-    await retriggerWorker((content.repo as string) || DEFAULT_REPO, content.pr_number as number);
-  });
   registerDeliveryAction('pr_send_to_testing', async (content, session) => {
     await handleSendToTesting(content, session);
   });
@@ -154,5 +146,3 @@ if (!GITHUB_WEBHOOK_SECRET) {
     });
   });
 }
-
-export { clearWorkerSession, retriggerWorker } from './session-ops.js';

@@ -174,11 +174,11 @@ CREATE INDEX idx_pr_threads_session ON pr_threads (session_id);
 
 | Function | Key | Used by |
 |----------|-----|---------|
-| `getPrThread(channelId, threadTs)` | PK | session-ops (clear) |
-| `getPrThreadByRepoPr(repo, prNumber)` | `idx_pr_threads_repo_pr` | handler (dedup, close, synchronize), session-ops, orchestrator |
+| `getPrThread(channelId, threadTs)` | PK | CRUD primitive (covered by `pr-threads.test.ts`) |
+| `getPrThreadByRepoPr(repo, prNumber)` | `idx_pr_threads_repo_pr` | handler (dedup, close, synchronize), orchestrator |
 | `getPrThreadBySession(sessionId)` | `idx_pr_threads_session` | testing-approval, gh-action-approval, reactions |
 | `updatePrThreadSession(channelId, threadTs, sessionId)` | PK | handler (synchronize repoints the row) |
-| `deletePrThread(channelId, threadTs)` | PK | session-ops (clear) |
+| `deletePrThread(channelId, threadTs)` | PK | CRUD primitive (covered by `pr-threads.test.ts`) |
 
 ---
 
@@ -262,7 +262,7 @@ A separate agent group (`pr-factory-supervisor`) speaking as its own Slack bot. 
 - **Admin channel** — shared session, engages on every message.
 - **PR threads** — engages when @-mentioned, sees accumulated thread history.
 
-Its MCP tools: `clear_session`, `retrigger`, `propose_skill_edit` (see below). The instructions tell it to always clear + retrigger affected PRs after an edit lands.
+Its MCP tool: `propose_skill_edit` (see below). A proposed edit is posted as a diff for human approval and, on accept, written under `container/skills/`. Skill edits apply to the **next** PR each affected worker session triages — running sessions keep their old read-only skill view until they next spawn; there is no force-rerun of an in-flight session.
 
 ---
 
@@ -295,12 +295,10 @@ The template VM is operator-prepared: project at `~/nanoclaw` with an `origin` t
 
 **File:** `container/agent-runner/src/mcp-tools/pr-factory.ts`
 
-Six tools, registered in every container via the mcp-tools barrel. Each writes a `kind: 'system'` row to `messages_out`; the host's delivery loop dispatches the `action` string to the matching registered handler. In a non-PR-factory install the actions are unregistered and dropped with "Unknown system action".
+Four tools, registered in every container via the mcp-tools barrel. Each writes a `kind: 'system'` row to `messages_out`; the host's delivery loop dispatches the `action` string to the matching registered handler. In a non-PR-factory install the actions are unregistered and dropped with "Unknown system action".
 
 | Tool | Action emitted | Args |
 |------|----------------|------|
-| `clear_session` | `pr_clear_session` | `{ pr_number, repo? }` |
-| `retrigger` | `pr_retrigger` | `{ pr_number, repo? }` |
 | `propose_skill_edit` | `pr_propose_skill_edit` | `{ skill_name, file_name, content }` |
 | `send_to_testing` | `pr_send_to_testing` | `{}` (plan located via session → pr_threads → file naming) |
 | `credentialed_gh` | `pr_gh` | `{ command?, commands?, description }` — `command` is normalized into `commands` |
@@ -316,8 +314,6 @@ When the agent omits `repo`, the field is omitted from the payload too — the h
 
 | Delivery action | Handler | Effect |
 |--------|-------------|--------|
-| `pr_clear_session` | `session-ops.clearWorkerSession(repo, pr)` | Kill container, delete session, delete pr_threads row |
-| `pr_retrigger` | `session-ops.retriggerWorker(repo, pr)` | Kill container, re-fetch diff, re-trigger in the same thread/session |
 | `pr_send_to_testing` | `testing-approval.handleSendToTesting` | Post plan canvas + approval card |
 | `pr_propose_skill_edit` | `skill-edit-approval.handleProposeSkillEdit` | Post diff + approval card |
 | `pr_gh` | gh-action seam → `gh-action-approval.handleGh` | Post command preview + approval card |
@@ -431,7 +427,6 @@ tail -f data/pr-activity/<owner>/<repo>/*.log     # all PRs
 | `webhook.ts` | core | GitHub webhook: HMAC, event/action filter, `PREvent` parsing |
 | `handler.ts` | core | Per-PR lifecycle: opener, session, pr_threads, trigger, wake; synchronize/close/draft handling; OneCLI proxy GitHub fetches |
 | `supervisor.ts` | core | `SUPERVISOR_FOLDER` + `SUPERVISOR_INSTRUCTIONS` |
-| `session-ops.ts` | core | `clearWorkerSession` / `retriggerWorker`, keyed by `(repo, pr_number)` |
 | `testing-approval.ts` | core | Testing gate + retry card |
 | `skill-edit-approval.ts` | core | Skill-edit gate (traversal-guarded writes into `container/skills/`) |
 | `orchestrator.ts` | core | Tester wake, 30-min timeout, results → worker |
@@ -472,9 +467,9 @@ tail -f data/pr-activity/<owner>/<repo>/*.log     # all PRs
 
 ## Manual Operations
 
-### Clear or retrigger a PR session
+### Re-run a PR from scratch
 
-Ask the supervisor bot (its `clear_session` / `retrigger` MCP tools), or from the host REPL the module exports `clearWorkerSession(repo, prNumber)` and `retriggerWorker(repo, prNumber)` from `src/modules/pr-factory/index.ts`.
+There is no in-place "clear and retrigger" — a skill edit applies to the next PR the worker triages, and a fresh push (a `synchronize` event) re-triages an open PR in the same thread against the updated diff. To force a clean re-run, close and reopen the PR on GitHub, or push a no-op commit; the webhook drives a fresh session either way.
 
 ### Inspect pr_threads
 

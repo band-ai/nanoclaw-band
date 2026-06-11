@@ -1,6 +1,6 @@
 /**
  * pr-factory-core guard — the modules-barrel line (`import
- * './pr-factory/index.js'` in src/modules/index.ts), the six pr_* delivery
+ * './pr-factory/index.js'` in src/modules/index.ts), the four pr_* delivery
  * actions, the three core-owned pr_* approval handlers, the gh-action seam's
  * not-installed fallback, and the GITHUB_WEBHOOK_SECRET env gate.
  *
@@ -43,8 +43,6 @@ const TEST_DIR = '/tmp/nanoclaw-test-prf-registration';
 const ORIGINAL_CWD = process.cwd();
 
 const DELIVERY_ACTIONS = [
-  'pr_clear_session',
-  'pr_retrigger',
   'pr_send_to_testing',
   'pr_propose_skill_edit',
   'pr_gh',
@@ -89,7 +87,7 @@ describe('pr-factory module registration via the real modules barrel', () => {
     }
   });
 
-  it('with the env trio primed before import, all six pr_* delivery actions register', async () => {
+  it('with the env trio primed before import, all four pr_* delivery actions register', async () => {
     vi.resetModules();
     process.env.GITHUB_WEBHOOK_SECRET = 'test-secret';
     process.env.PR_FACTORY_SLACK_CHANNEL_ID = 'C0TEST';
@@ -122,7 +120,8 @@ describe('pr-factory module registration via the real modules barrel', () => {
       const now = new Date().toISOString();
       const { createAgentGroup } = await import('../../db/agent-groups.js');
       const { createSession } = await import('../../db/sessions.js');
-      const { createPrThread, getPrThreadByRepoPr } = await import('../../db/pr-threads.js');
+      const { createPrThread } = await import('../../db/pr-threads.js');
+      const { initSessionFolder, outboundDbPath } = await import('../../session-manager.js');
       createAgentGroup({
         id: 'ag-prf',
         name: 'Worker',
@@ -141,6 +140,7 @@ describe('pr-factory module registration via the real modules barrel', () => {
         last_active: null,
         created_at: now,
       });
+      initSessionFolder('ag-prf', 'sess-prf');
       // The pr_threads row is keyed by the DEFAULT repo — only a handler that
       // fills the omitted `repo` with PR_FACTORY_DEFAULT_REPO can find it.
       createPrThread({
@@ -155,15 +155,19 @@ describe('pr-factory module registration via the real modules barrel', () => {
 
       await import('../index.js');
       const { getDeliveryAction } = await import('../../delivery.js');
-      const { killContainer } = await import('../../container-runner.js');
-      const handler = getDeliveryAction('pr_clear_session');
+      const handler = getDeliveryAction('pr_submit_test_results');
       expect(handler).toBeDefined();
 
       const session = { id: 'sess-prf', agent_group_id: 'ag-prf' };
-      await handler!({ pr_number: 42 }, session as never, undefined as never);
+      // No `repo` in the payload — the handler must default it to acme/defaulted
+      // to find the pr_threads row keyed by that repo and post the verdict.
+      await handler!({ pr_number: 42, verdict: 'PASS', content: '## results' }, session as never, undefined as never);
 
-      expect(killContainer).toHaveBeenCalledWith('sess-prf', 'cleared by supervisor');
-      expect(getPrThreadByRepoPr('acme/defaulted', 42), 'pr_threads row should be cleared').toBeUndefined();
+      const outDb = new Database(outboundDbPath('ag-prf', 'sess-prf'), { readonly: true });
+      const rows = outDb.prepare('SELECT content FROM messages_out').all() as Array<{ content: string }>;
+      outDb.close();
+      expect(rows.length, 'verdict summary should reach the worker session resolved via the default repo').toBe(1);
+      expect((JSON.parse(rows[0].content) as { text: string }).text).toContain('PASS');
     } finally {
       closeDb();
     }

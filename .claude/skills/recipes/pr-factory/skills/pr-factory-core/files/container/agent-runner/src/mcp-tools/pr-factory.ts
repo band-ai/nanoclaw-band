@@ -1,6 +1,6 @@
 /**
- * PR Factory MCP tools — supervisor session ops, skill-edit proposals,
- * testing gate, credentialed GitHub commands, and test-result submission.
+ * PR Factory MCP tools — supervisor skill-edit proposals, testing gate,
+ * credentialed GitHub commands, and test-result submission.
  *
  * The container can't write to inbound.db (host-owned), so each tool emits
  * a system action via messages_out and the host's delivery loop dispatches
@@ -30,82 +30,6 @@ function err(text: string) {
 function genId(prefix: string): string {
   return `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 }
-
-export const clearSession: McpToolDefinition = {
-  tool: {
-    name: 'clear_session',
-    description:
-      "PR Factory supervisor only. Wipe the worker's per-thread session for a PR (kills the container, deletes the session row). Use after editing a skill so the next triage starts from clean state. Always pair with `retrigger` immediately after.",
-    inputSchema: {
-      type: 'object' as const,
-      properties: {
-        pr_number: {
-          type: 'number',
-          description: 'Pull request number, e.g. 2318.',
-        },
-        repo: {
-          type: 'string',
-          description:
-            'Full repository name, e.g. "acme/widgets". Omit to use the host\'s configured default repo (PR_FACTORY_DEFAULT_REPO).',
-        },
-      },
-      required: ['pr_number'],
-    },
-  },
-  async handler(args) {
-    const pr_number = args.pr_number as number;
-    // When the agent omits repo, the field is omitted from the payload too —
-    // the HOST action handler applies PR_FACTORY_DEFAULT_REPO. The container
-    // never sees that env var, so it must not bake in a default of its own.
-    const repo = args.repo as string | undefined;
-    if (!pr_number) return err('pr_number is required');
-
-    writeMessageOut({
-      id: genId('sys'),
-      kind: 'system',
-      content: JSON.stringify({ action: 'pr_clear_session', pr_number, ...(repo ? { repo } : {}) }),
-    });
-    log(`pr_clear_session: ${repo ?? '<default repo>'}#${pr_number}`);
-    return ok(`Clear requested for ${repo ?? 'the default repo'}#${pr_number}`);
-  },
-};
-
-export const retrigger: McpToolDefinition = {
-  tool: {
-    name: 'retrigger',
-    description:
-      'PR Factory supervisor only. Re-fetch the PR diff fresh from GitHub and re-bootstrap the worker session for that PR. Use immediately after `clear_session` on every affected PR.',
-    inputSchema: {
-      type: 'object' as const,
-      properties: {
-        pr_number: {
-          type: 'number',
-          description: 'Pull request number, e.g. 2318.',
-        },
-        repo: {
-          type: 'string',
-          description:
-            'Full repository name, e.g. "acme/widgets". Omit to use the host\'s configured default repo (PR_FACTORY_DEFAULT_REPO).',
-        },
-      },
-      required: ['pr_number'],
-    },
-  },
-  async handler(args) {
-    const pr_number = args.pr_number as number;
-    // Omitted repo stays omitted — the host applies PR_FACTORY_DEFAULT_REPO.
-    const repo = args.repo as string | undefined;
-    if (!pr_number) return err('pr_number is required');
-
-    writeMessageOut({
-      id: genId('sys'),
-      kind: 'system',
-      content: JSON.stringify({ action: 'pr_retrigger', pr_number, ...(repo ? { repo } : {}) }),
-    });
-    log(`pr_retrigger: ${repo ?? '<default repo>'}#${pr_number}`);
-    return ok(`Retrigger requested for ${repo ?? 'the default repo'}#${pr_number}`);
-  },
-};
 
 export const proposeSkillEdit: McpToolDefinition = {
   tool: {
@@ -276,4 +200,4 @@ export const submitTestResults: McpToolDefinition = {
   },
 };
 
-registerTools([clearSession, retrigger, proposeSkillEdit, sendToTesting, ghCommand, submitTestResults]);
+registerTools([proposeSkillEdit, sendToTesting, ghCommand, submitTestResults]);

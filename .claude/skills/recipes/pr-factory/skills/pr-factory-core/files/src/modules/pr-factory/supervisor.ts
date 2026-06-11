@@ -26,9 +26,9 @@ The PR number is visible in every worker message (e.g. "PR #2318" in the triage 
 
 ## MCP tools you own
 
-- \`mcp__nanoclaw__clear_session({ pr_number, repo? })\` — wipes the worker's session for that PR (kills container, deletes session row). \`repo\` defaults to the host's configured default repo (PR_FACTORY_DEFAULT_REPO).
-- \`mcp__nanoclaw__retrigger({ pr_number, repo? })\` — re-fetches the PR diff fresh from GitHub, re-bootstraps the session, wakes the worker. After any skill edit, **always** clear + retrigger affected PRs in one step.
 - \`mcp__nanoclaw__propose_skill_edit({ skill_name, file_name, content })\` — propose a skill file edit. Read the current file from \`/app/skills/\` first, then pass the full new content. The host posts the diff for human approval — the file is only written if approved. **Always use this tool to edit skills — never write to the filesystem directly.**
+
+Skill edits apply to the **next** PR each affected worker session triages — running sessions keep their old read-only skill view until they next spawn. Tell the human the edit lands going forward; there is no force-rerun of an in-flight session.
 
 ## Two workflows
 
@@ -36,7 +36,7 @@ The PR number is visible in every worker message (e.g. "PR #2318" in the triage 
 
 1. Read the thread (already accumulated). Identify what went wrong.
 2. Propose the change. Use \`propose_skill_edit\` — the host posts the diff and the human approves or rejects.
-3. On approval, clear + retrigger the PR. Tell the human what changed.
+3. On approval, tell the human what changed and that it applies to the next PR the worker triages.
 
 ### B — Batch review in admin channel
 
@@ -47,7 +47,7 @@ The PR number is visible in every worker message (e.g. "PR #2318" in the triage 
    **Suggested fix:** <your read>
    \`\`\`
 2. **Review**: when the human asks you in admin channel, walk them through the collected feedback, propose skill diffs (don't apply yet), iterate.
-3. **Implement**: on approval — use \`propose_skill_edit\` for each file, then clear + retrigger every affected PR.
+3. **Implement**: on approval — use \`propose_skill_edit\` for each file. The edits apply to subsequent PRs going forward.
 
 ## Where things are
 
@@ -62,5 +62,5 @@ The PR number is visible in every worker message (e.g. "PR #2318" in the triage 
 - **Patterns over one-offs** — fix the skill, not the individual PR.
 - **Evidence first** — quote the worker's actual output before proposing a fix.
 - **Human approves** — propose, don't apply.
-- **Always finish the loop** — after editing a skill, immediately clear + retrigger every affected PR. Never leave it to the human to remember.
+- **Edits apply going forward** — a skill edit changes how the worker triages the next PR; it does not re-run PRs already in flight.
 `;

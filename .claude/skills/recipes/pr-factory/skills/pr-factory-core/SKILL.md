@@ -1,6 +1,6 @@
 ---
 name: pr-factory-core
-description: PR Factory component — the engine. GitHub pull_request webhook → per-PR Slack thread + worker agent session (triage/review/test-plan via default group instructions), supervisor bootstrap with skill-edit approval flow, send-to-testing approval gate, test-result coordination, session clear/retrigger ops, pr_threads index, and six container MCP tools. Ships seams for the optional gh-action-approval, vm-test-orchestrator, and slack-canvas components.
+description: PR Factory component — the engine. GitHub pull_request webhook → per-PR Slack thread + worker agent session (triage/review/test-plan via default group instructions), supervisor bootstrap with skill-edit approval flow, send-to-testing approval gate, test-result coordination, pr_threads index, and four container MCP tools. Ships seams for the optional gh-action-approval, vm-test-orchestrator, and slack-canvas components.
 ---
 
 # pr-factory-core (PR Factory component)
@@ -12,8 +12,7 @@ The PR Factory engine, as a host module (`src/modules/pr-factory/`) plus a conta
 - **Bootstrap** (`bootstrap.ts`) — idempotent, self-correcting setup: worker agent group (default triage/review/test-plan instructions seeded into `groups/pr-factory-worker/CLAUDE.local.md`), default-instance worker messaging group, optional supervisor agent group with `slack-supervisor`-instance messaging groups (admin channel + PR channel), and a `slack-tester`-instance messaging group when the operator-created `pr-tester` agent group exists.
 - **Approval flows** — send-to-testing (`testing-approval.ts`, plan file → card → human gate), retry-after-failure, and supervisor skill edits (`skill-edit-approval.ts`, diff preview → card → write on approve). One active card per thread (`dismiss-approvals.ts`); a 👀 reaction marks awaiting-approval threads and clears on resolution — the reject path is observed through core's `registerApprovalResolvedHandler` hook.
 - **Coordination** (`orchestrator.ts`) — wakes the tester agent when a VM is ready, enforces a 30-minute run timeout, posts results, wakes the worker to propose merge (PASS) or analyze (FAIL/PARTIAL).
-- **Session ops** (`session-ops.ts`) — supervisor-driven `clear_session` / `retrigger` keyed by (repo, pr_number).
-- **Container MCP tools** (`container/agent-runner/src/mcp-tools/pr-factory.ts`) — `clear_session`, `retrigger`, `propose_skill_edit`, `send_to_testing`, `credentialed_gh`, `submit_test_results`. Each emits a `pr_*` system action via messages_out; the host module registers the six matching delivery actions.
+- **Container MCP tools** (`container/agent-runner/src/mcp-tools/pr-factory.ts`) — `propose_skill_edit`, `send_to_testing`, `credentialed_gh`, `submit_test_results`. Each emits a `pr_*` system action via messages_out; the host module registers the four matching delivery actions.
 
 Inert without `GITHUB_WEBHOOK_SECRET`: the module loads (approval handlers bind) but registers no delivery actions and mounts no webhook.
 
@@ -99,7 +98,7 @@ SKILL=.claude/skills/recipes/pr-factory/skills/pr-factory-core
 ```bash
 mkdir -p src/modules/pr-factory
 for f in index bootstrap handler webhook orchestrator testing-approval skill-edit-approval \
-         dismiss-approvals session-ops reactions activity-log defaults supervisor \
+         dismiss-approvals reactions activity-log defaults supervisor \
          worker-instructions canvas test-orchestration gh-action; do
   cp $SKILL/files/src/modules/pr-factory/$f.ts src/modules/pr-factory/$f.ts
 done
@@ -196,7 +195,7 @@ cp $SKILL/files/container/agent-runner/src/mcp-tools/pr-factory-tools.test.ts co
 
 | Test | Guards |
 |------|--------|
-| `src/modules/pr-factory/registration.test.ts` | The modules-barrel line via the REAL barrel, the six `pr_*` delivery actions + three core approval handlers (read-side registries), the `GITHUB_WEBHOOK_SECRET` env gate, the host-side `PR_FACTORY_DEFAULT_REPO` contract, and the gh-action seam's not-installed fallback |
+| `src/modules/pr-factory/registration.test.ts` | The modules-barrel line via the REAL barrel, the four `pr_*` delivery actions + three core approval handlers (read-side registries), the `GITHUB_WEBHOOK_SECRET` env gate, the host-side `PR_FACTORY_DEFAULT_REPO` contract, and the gh-action seam's not-installed fallback |
 | `src/modules/pr-factory/bootstrap.test.ts` | Bootstrap's consumption of the entity-model writers on the real migrated schema: instance-keyed messaging groups (worker default, supervisor/tester named), wiring modes, instruction seeding, idempotence, foreign-wiring drop, drift self-correction |
 | `src/modules/pr-factory/webhook.test.ts` | `registerGitHubWebhook`'s mount on core's raw webhook registry over real HTTP: HMAC accept/reject, event filtering, 405, throwing-handler → 500 |
 | `src/modules/pr-factory/handler.test.ts` | handler's consumption of resolveSession / writeSessionMessage / pr_threads on real session DBs: the PR_CONTEXT trigger contract, the default triage directive, synchronize kill/re-create, draft deferral, redelivery no-op |
@@ -205,7 +204,7 @@ cp $SKILL/files/container/agent-runner/src/mcp-tools/pr-factory-tools.test.ts co
 | `src/db/pr-threads.test.ts` | Migration barrel presence (real `runMigrations`), v2 schema shape (no bot column), the legacy-upgrade recreate arm, idempotence, CRUD |
 | `src/db/sessions-approval-helpers.test.ts` | The four appended sessions.ts helpers |
 | `container/.../pr-factory-registration.test.ts` | The container mcp-tools barrel line (AST: side-effect import before `startMcpServer()`) |
-| `container/.../pr-factory-tools.test.ts` | The six tools' messages_out contract: exact `pr_*` action strings (paired with the host registrations), odd-seq, repo-omission, command normalization |
+| `container/.../pr-factory-tools.test.ts` | The four tools' messages_out contract: exact `pr_*` action strings (paired with the host registrations), odd-seq, repo-omission, command normalization |
 
 ## Configuration
 

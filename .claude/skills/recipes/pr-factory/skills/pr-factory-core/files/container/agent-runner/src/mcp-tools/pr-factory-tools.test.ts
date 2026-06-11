@@ -16,14 +16,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'bun:test';
 
 import { initTestSessionDb, closeSessionDb } from '../db/connection.js';
 import { getUndeliveredMessages } from '../db/messages-out.js';
-import {
-  clearSession,
-  ghCommand,
-  proposeSkillEdit,
-  retrigger,
-  sendToTesting,
-  submitTestResults,
-} from './pr-factory.js';
+import { ghCommand, proposeSkillEdit, sendToTesting, submitTestResults } from './pr-factory.js';
 
 beforeEach(() => {
   initTestSessionDb();
@@ -41,39 +34,6 @@ function systemRows(): Array<{ seq: number; kind: string; action: string; conten
 }
 
 describe('pr-factory MCP tools → messages_out contract', () => {
-  it('clear_session emits pr_clear_session with pr_number, OMITTING repo so the host applies its default', async () => {
-    const res = await clearSession.handler({ pr_number: 42 });
-    expect(res.isError).toBeUndefined();
-
-    const [row] = systemRows();
-    expect(row.kind).toBe('system');
-    expect(row.seq % 2).toBe(1); // container writes odd seq
-    expect(row.action).toBe('pr_clear_session');
-    expect(row.content.pr_number).toBe(42);
-    // Repo absent in the payload → host-side PR_FACTORY_DEFAULT_REPO applies.
-    expect('repo' in row.content).toBe(false);
-  });
-
-  it('clear_session passes an explicit repo through unchanged', async () => {
-    await clearSession.handler({ pr_number: 42, repo: 'acme/widgets' });
-    const [row] = systemRows();
-    expect(row.content.repo).toBe('acme/widgets');
-  });
-
-  it('retrigger emits pr_retrigger and honors an explicit repo', async () => {
-    await retrigger.handler({ pr_number: 7, repo: 'acme/widgets' });
-    const [row] = systemRows();
-    expect(row.action).toBe('pr_retrigger');
-    expect(row.content).toMatchObject({ pr_number: 7, repo: 'acme/widgets' });
-  });
-
-  it('retrigger omits repo from the payload when the agent does not pass one', async () => {
-    await retrigger.handler({ pr_number: 7 });
-    const [row] = systemRows();
-    expect(row.action).toBe('pr_retrigger');
-    expect('repo' in row.content).toBe(false);
-  });
-
   it('propose_skill_edit emits pr_propose_skill_edit with the full file payload', async () => {
     await proposeSkillEdit.handler({ skill_name: 'my-review-skill', file_name: 'SKILL.md', content: '# v2' });
     const [row] = systemRows();
@@ -85,6 +45,7 @@ describe('pr-factory MCP tools → messages_out contract', () => {
     await sendToTesting.handler({});
     const [row] = systemRows();
     expect(row.kind).toBe('system');
+    expect(row.seq % 2).toBe(1); // container writes odd seq
     expect(row.action).toBe('pr_send_to_testing');
   });
 
