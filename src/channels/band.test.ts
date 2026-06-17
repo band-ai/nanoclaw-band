@@ -50,8 +50,8 @@ class FakeBandLink implements AsyncIterable<QueuedEvent> {
   public readonly rest = {
     createChatMessage: vi.fn(async () => ({ id: 'platform-out-1' })),
   };
-  public readonly markProcessing = vi.fn(async () => {});
-  public readonly markProcessed = vi.fn(async () => {});
+  public readonly markProcessing = vi.fn(async (_roomId: string, _messageId: string) => {});
+  public readonly markProcessed = vi.fn(async (_roomId: string, _messageId: string) => {});
   public readonly connect = vi.fn(async () => {});
   public readonly disconnect = vi.fn(async () => {});
   public readonly subscribeAgentRooms = vi.fn(async () => {});
@@ -319,6 +319,72 @@ describe('band channel adapter', () => {
     expect(link.markProcessed).toHaveBeenCalledWith('room-1', 'pending-1');
   });
 
+  it('drains past a dropped message instead of head-of-line-blocking the room', async () => {
+    setBandEnv();
+    await import('./band.js');
+    const { initChannelAdapters } = await import('./channel-registry.js');
+
+    // The inbox is a FIFO cursor: getNextMessage returns the oldest message
+    // not yet marked processed. msg-stuck routes to a deterministic drop;
+    // msg-next routes successfully. Before the fix, the drop left msg-stuck
+    // unmarked at the head, so the drain re-fetched it forever and msg-next
+    // was never reached.
+    const dropResult: InboundRouteResult = {
+      status: 'dropped',
+      platformMessageId: 'msg-stuck',
+      reason: 'no_agent_engaged',
+      audited: true,
+      retryable: false,
+      intentional: false,
+    };
+    const okResult = (id: string): InboundRouteResult => ({
+      status: 'persisted',
+      platformMessageId: id,
+      sessionIds: ['sess-1'],
+      sessionMessageIds: [`${id}:ag-1`],
+    });
+    const onInbound = vi.fn(async (_platformId: string, _threadId: string | null, message: InboundMessage) =>
+      message.id === 'msg-stuck' ? dropResult : okResult(message.id),
+    );
+
+    fakeChats = [{ id: 'room-1', title: 'Room 1', type: 'direct' }];
+    await initChannelAdapters(() => ({
+      onInbound,
+      onInboundEvent: async () => okResult('evt'),
+      onMetadata: () => {},
+      onAction: () => {},
+    }));
+
+    const link = fakeLinks[0];
+    const base = {
+      roomId: 'room-1',
+      senderId: 'user-1',
+      senderType: 'User',
+      senderName: 'User One',
+      messageType: 'text',
+      metadata: { mentions: [{ id: 'agent-1' }] },
+      createdAt: new Date(),
+    };
+    const inbox: Record<string, unknown>[] = [
+      { ...base, id: 'msg-stuck', content: 'first (drops)' },
+      { ...base, id: 'msg-next', content: 'second (routes)' },
+    ];
+    const drained = new Set<string>();
+    link.markProcessed.mockImplementation(async (_roomId: string, id: string) => {
+      drained.add(id);
+    });
+    link.getNextMessage.mockImplementation(async () => inbox.find((m) => !drained.has(m.id as string)) ?? null);
+
+    link.emit({ type: 'room_added', roomId: 'room-1', payload: { id: 'room-1', title: 'Room 1', type: 'direct' } });
+
+    // Reaching msg-next is only possible if the dropped msg-stuck was consumed
+    // and the cursor advanced past it.
+    await waitFor(() => drained.has('msg-next'));
+    expect(link.markProcessed).toHaveBeenCalledWith('room-1', 'msg-stuck');
+    expect(link.markProcessed).toHaveBeenCalledWith('room-1', 'msg-next');
+    expect(onInbound).toHaveBeenCalledWith('band:room-1', null, expect.objectContaining({ id: 'msg-next' }));
+  });
+
   it('does not mark unmentioned Band room messages as mentions', async () => {
     setBandEnv();
     await import('./band.js');
@@ -357,8 +423,12 @@ describe('band channel adapter', () => {
 
     await waitFor(() => onInbound.mock.calls.length === 1);
     expect(onInbound.mock.calls[0][2]).toEqual(expect.objectContaining({ isMention: false }));
-    expect(fakeLinks[0].markProcessing).not.toHaveBeenCalled();
-    expect(fakeLinks[0].markProcessed).not.toHaveBeenCalled();
+    // A non-retryable drop (no_agent_engaged) is terminal — the message is
+    // consumed on the platform so the inbox cursor advances past it instead
+    // of head-of-line-blocking every later message in the room.
+    await waitFor(() => fakeLinks[0].markProcessed.mock.calls.length === 1);
+    expect(fakeLinks[0].markProcessing).toHaveBeenCalledWith('room-1', 'msg-unmentioned');
+    expect(fakeLinks[0].markProcessed).toHaveBeenCalledWith('room-1', 'msg-unmentioned');
   });
 
   it('delivers generic outbound chat rows through Band REST fallback', async () => {
@@ -875,14 +945,15 @@ describe('band channel adapter', () => {
     await waitFor(() => getSession('sess-room-1')?.status === 'closed');
   });
 
-  it('does not mark Band messages processed after retryable drops', async () => {
+  it('consumes a retryable drop on the platform but leaves the host ledger for replay', async () => {
     setBandEnv();
     await import('./band.js');
     const { initChannelAdapters } = await import('./channel-registry.js');
+    const { getInboundDelivery } = await import('../db/index.js');
     const result: InboundRouteResult = {
       status: 'dropped',
       platformMessageId: 'msg-drop',
-      reason: 'no_agent_wired_unmentioned',
+      reason: 'no_agent_wired',
       audited: true,
       retryable: true,
       intentional: false,
@@ -908,9 +979,16 @@ describe('band channel adapter', () => {
       },
     });
 
-    await new Promise((resolve) => setTimeout(resolve, 0));
-    expect(fakeLinks[0].markProcessing).not.toHaveBeenCalled();
-    expect(fakeLinks[0].markProcessed).not.toHaveBeenCalled();
+    // The platform cursor advances even on a retryable drop, so the drain
+    // does not head-of-line-block on a channel that is awaiting approval.
+    await waitFor(() => fakeLinks[0].markProcessed.mock.calls.length === 1);
+    expect(fakeLinks[0].markProcessing).toHaveBeenCalledWith('room-1', 'msg-drop');
+    expect(fakeLinks[0].markProcessed).toHaveBeenCalledWith('room-1', 'msg-drop');
+    // But the host dedup ledger is NOT flipped to 'processed' — the channel
+    // approval gate's host-side replay must be able to re-route this event.
+    expect(
+      getInboundDelivery({ channelType: 'band', platformId: 'band:room-1', platformMessageId: 'msg-drop' }),
+    ).toBeUndefined();
   });
 
   it('forwards BAND_OWNER_ID into the container env when set', async () => {

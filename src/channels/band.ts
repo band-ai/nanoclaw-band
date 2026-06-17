@@ -1,7 +1,7 @@
 import { BandLink, type PlatformEvent } from '@band-ai/sdk';
 import { ThenvoiClient } from '@thenvoi/rest-client';
 
-import type { ChannelAdapter, ChannelSetup, ConversationInfo, InboundRouteResult, OutboundMessage } from './adapter.js';
+import type { ChannelAdapter, ChannelSetup, ConversationInfo, OutboundMessage } from './adapter.js';
 import { normalizeOptions, type NormalizedOption } from './ask-question.js';
 import { registerChannelContainerConfig } from './channel-container-registry.js';
 import { registerChannelAdapter } from './channel-registry.js';
@@ -107,10 +107,6 @@ function containerReachableRestUrl(baseUrl: string): string {
 function shouldInjectDirectApiKey(baseUrl: string): boolean {
   const url = new URL(baseUrl);
   return url.protocol === 'http:' && (url.hostname === 'localhost' || url.hostname === '127.0.0.1');
-}
-
-function isProcessableRouteResult(result: void | InboundRouteResult): result is InboundRouteResult {
-  return result?.status === 'persisted' || (result?.status === 'dropped' && result.intentional);
 }
 
 function mentionReferencesAgent(mention: unknown, agentId: string): boolean {
@@ -233,6 +229,58 @@ function ensureHubMessagingGroup(roomId: string, agentGroupId: string | null): v
   });
 }
 
+/**
+ * Resolve the agent group that newly-discovered Band rooms should auto-wire
+ * to. Only unambiguous when exactly one agent group exists — with zero or
+ * many, return null and let the router's channel-approval card disambiguate.
+ * Mirrors wireOwnerHub's resolution rule.
+ */
+function resolveAutoWireAgentGroupId(): string | null {
+  const agentGroups = getAllAgentGroups();
+  return agentGroups.length === 1 ? agentGroups[0].id : null;
+}
+
+/**
+ * Auto-approve a discovered Band room: mark it public and wire it to the
+ * default agent group. Band gates both channel and participant access on the
+ * platform — anyone in a room with the agent was already authorized there — so
+ * the host's channel- and sender-approval cards are redundant friction. We
+ * therefore mirror the hub precedents: unknown_sender_policy='public' (any
+ * room member reaches the agent, like ensureHubMessagingGroup) and a
+ * mention-engaged wiring with sender_scope='all' (like wireOwnerHub; Band only
+ * delivers agent-mentioning messages to us, so every delivered message is
+ * effectively a mention).
+ *
+ * No-op for denied rooms (an explicit owner denial still wins) and for
+ * ambiguous multi-agent installs (the router's approval card handles those).
+ */
+function autoWireDiscoveredRoom(roomId: string): void {
+  const agentGroupId = resolveAutoWireAgentGroupId();
+  if (!agentGroupId) return;
+
+  const mg = getMessagingGroupByPlatform(BAND_CHANNEL_TYPE, formatBandPlatformId(roomId));
+  if (!mg || mg.denied_at) return;
+
+  if (mg.unknown_sender_policy !== 'public') {
+    updateMessagingGroup(mg.id, { unknown_sender_policy: 'public' });
+  }
+
+  if (getMessagingGroupAgentByPair(mg.id, agentGroupId)) return;
+  createMessagingGroupAgent({
+    id: `mga-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+    messaging_group_id: mg.id,
+    agent_group_id: agentGroupId,
+    engage_mode: 'mention',
+    engage_pattern: null,
+    sender_scope: 'all',
+    ignored_message_policy: 'drop',
+    session_mode: 'shared',
+    priority: 0,
+    created_at: now(),
+  });
+  log.info('Band.ai auto-wired discovered room', { messagingGroupId: mg.id, agentGroupId, roomId });
+}
+
 function upsertDiscoveredMessagingGroup(
   roomId: string,
   room: Record<string, unknown>,
@@ -261,6 +309,10 @@ function upsertDiscoveredMessagingGroup(
   }
 
   if (isMain) setMainRoom(roomId);
+
+  // Band controls room ACL on the platform, so the host's approval cards are
+  // redundant: auto-wire + open the room instead of escalating to the owner.
+  autoWireDiscoveredRoom(roomId);
 }
 
 function closeSessionsForRoom(roomId: string, reason: string): void {
@@ -803,11 +855,18 @@ class BandChannelAdapter implements ChannelAdapter {
     },
   ): Promise<void> {
     if (!this.setupConfig) return;
-    if (payload.sender_id === this.config.agentId) return;
-    if (payload.message_type !== 'text') return;
 
     const resolvedRoomId = roomId ?? payload.chat_room_id;
     if (!resolvedRoomId) return;
+
+    // Messages we never hand to the agent — the agent's own echoes and
+    // non-text payloads — must still be consumed, or the inbox drain
+    // re-fetches them on every pass and head-of-line-blocks every later
+    // message in the room (see markRoomMessageConsumed).
+    if (payload.sender_id === this.config.agentId || payload.message_type !== 'text') {
+      await this.markRoomMessageConsumed(resolvedRoomId, payload.id);
+      return;
+    }
 
     const platformId = formatBandPlatformId(resolvedRoomId);
 
@@ -863,18 +922,46 @@ class BandChannelAdapter implements ChannelAdapter {
       isMention: metadataMentionsAgent(payload.metadata, this.config.agentId),
     });
 
-    if (!isProcessableRouteResult(result)) return;
+    // Forward progress is mandatory: the inbox drain is a FIFO cursor that
+    // only advances when the head message is marked processed. The one
+    // outcome worth re-feeding is a transient routing failure (onInbound
+    // caught an exception and returned status:'failed') — leave that pending
+    // so the next drain retries it. Every other outcome is terminal: routed,
+    // or a deterministic drop that an identical re-feed would only reproduce.
+    // Consume it. Leaving a deterministically-dropped message at the head of
+    // the queue is exactly what silently kills a whole room.
+    if (result?.status === 'failed' && result.retryable) return;
 
-    try {
-      await this.link.markProcessing(resolvedRoomId, payload.id);
-      await this.link.markProcessed(resolvedRoomId, payload.id);
+    await this.markRoomMessageConsumed(resolvedRoomId, payload.id);
+
+    // Host dedup ledger: only a routed message becomes 'processed'. Drops keep
+    // the status routeInbound assigned (e.g. 'retrying' while a channel awaits
+    // owner approval) so the approval gate's host-side replay re-routes the
+    // original event instead of short-circuiting on a 'processed' row.
+    if (result?.status === 'persisted') {
       markInboundDeliveryProcessed({
         channelType: BAND_CHANNEL_TYPE,
         platformId,
         platformMessageId: payload.id,
       });
+    }
+  }
+
+  /**
+   * Advance the platform inbox cursor past a message we are finished with.
+   * getNextMessage returns the oldest *unprocessed* message and only moves on
+   * once that message is marked processed — so every terminal disposition
+   * (routed, deliberately ignored, or dropped) has to be marked here. A
+   * message left unmarked sits at the head of the queue and the periodic drain
+   * re-fetches it forever, head-of-line-blocking every later message in the
+   * room. Best-effort: a failed mark just means the next drain retries it.
+   */
+  private async markRoomMessageConsumed(roomId: string, messageId: string): Promise<void> {
+    try {
+      await this.link.markProcessing(roomId, messageId);
+      await this.link.markProcessed(roomId, messageId);
     } catch (err) {
-      log.warn('Band.ai failed to mark message processed', { roomId: resolvedRoomId, messageId: payload.id, err });
+      log.warn('Band.ai failed to mark message processed', { roomId, messageId, err });
     }
   }
 
