@@ -1312,3 +1312,71 @@ describe('band channel adapter', () => {
     expect(fakeRestClients[0].agentApiMemories.listAgentMemories).not.toHaveBeenCalled();
   });
 });
+
+describe('bandAgentControlEnv', () => {
+  beforeEach(async () => {
+    vi.resetModules();
+    clearBandEnv();
+    const { initTestDb, runMigrations } = await import('../db/index.js');
+    runMigrations(initTestDb());
+  });
+
+  afterEach(() => {
+    clearBandEnv();
+  });
+
+  async function wireBandGroup(agentGroupId: string): Promise<void> {
+    const { createAgentGroup, createMessagingGroup } = await import('../db/index.js');
+    const { createDestination } = await import('../modules/agent-to-agent/db/agent-destinations.js');
+    createAgentGroup({ id: agentGroupId, name: agentGroupId, folder: agentGroupId, agent_provider: null, created_at: new Date().toISOString() });
+    createMessagingGroup({
+      id: `mg-${agentGroupId}`,
+      channel_type: 'band',
+      platform_id: 'band:room-x',
+      name: 'Room X',
+      is_group: 1,
+      unknown_sender_policy: 'public',
+      created_at: new Date().toISOString(),
+    });
+    createDestination({
+      agent_group_id: agentGroupId,
+      local_name: 'room-x',
+      target_type: 'channel',
+      target_id: `mg-${agentGroupId}`,
+      created_at: new Date().toISOString(),
+    });
+  }
+
+  it('grants agent-scoped Band env to a Band-wired group, without a room id', async () => {
+    setBandEnv();
+    const { bandAgentControlEnv } = await import('./band.js');
+    await wireBandGroup('ag-band');
+
+    const env = bandAgentControlEnv('ag-band');
+
+    expect(env.BAND_AGENT_ID).toBe('agent-1');
+    expect(env.BAND_AGENT_CONTROL).toBe('true');
+    expect(env.BAND_REST_URL).toContain('band.example.test');
+    expect(env.BAND_ROOM_ID).toBeUndefined();
+    expect(env.BAND_IS_MAIN_CONTROL_ROOM).toBeUndefined();
+    // Legacy mirror is present for older container images.
+    expect(env.THENVOI_AGENT_ID).toBe('agent-1');
+  });
+
+  it('returns {} for a group with no Band destination', async () => {
+    setBandEnv();
+    const { bandAgentControlEnv } = await import('./band.js');
+    const { createAgentGroup } = await import('../db/index.js');
+    createAgentGroup({ id: 'ag-none', name: 'None', folder: 'none', agent_provider: null, created_at: new Date().toISOString() });
+
+    expect(bandAgentControlEnv('ag-none')).toEqual({});
+  });
+
+  it('returns {} when Band is not configured', async () => {
+    clearBandEnv();
+    const { bandAgentControlEnv } = await import('./band.js');
+    await wireBandGroup('ag-band-2');
+
+    expect(bandAgentControlEnv('ag-band-2')).toEqual({});
+  });
+});

@@ -24,7 +24,7 @@ import { getContainerConfig } from './db/container-configs.js';
 import { updateContainerConfigScalars } from './db/container-configs.js';
 import { CONTAINER_RUNTIME_BIN, hostGatewayArgs, readonlyMountArgs, stopContainerAsync } from './container-runtime.js';
 import { EGRESS_NETWORK, egressNetworkArgs, ensureEgressNetwork } from './egress-lockdown.js';
-import { getChannelContainerConfig } from './channels/channel-container-registry.js';
+import { getChannelContainerConfig, getAgentContainerConfigs } from './channels/channel-container-registry.js';
 import { composeGroupClaudeMd } from './claude-md-compose.js';
 import { getAgentGroup } from './db/agent-groups.js';
 import { getDb, hasTable } from './db/connection.js';
@@ -344,16 +344,21 @@ async function resolveContainerContribution(
       })
     : {};
 
-  return mergeContainerContributions(providerContribution, channelContribution);
+  // Agent-scoped contributions apply to every session of the group regardless
+  // of the session's channel (e.g. Band grants cross-channel control tools).
+  const agentContributions = await Promise.all(
+    getAgentContainerConfigs().map((fn) => fn({ session, agentGroupId: agentGroup.id, hostEnv: process.env })),
+  );
+
+  return mergeContainerContributions(providerContribution, channelContribution, ...agentContributions);
 }
 
 function mergeContainerContributions(
-  providerContribution: ProviderContainerContribution,
-  channelContribution: ProviderContainerContribution,
+  ...contributions: ProviderContainerContribution[]
 ): ProviderContainerContribution {
   return {
-    mounts: [...(providerContribution.mounts ?? []), ...(channelContribution.mounts ?? [])],
-    env: { ...(providerContribution.env ?? {}), ...(channelContribution.env ?? {}) },
+    mounts: contributions.flatMap((c) => c.mounts ?? []),
+    env: Object.assign({}, ...contributions.map((c) => c.env ?? {})),
   };
 }
 

@@ -3,11 +3,13 @@ import { BandClient } from '@band-ai/rest-client';
 
 import type { ChannelAdapter, ChannelSetup, ConversationInfo, OutboundMessage } from './adapter.js';
 import { normalizeOptions, type NormalizedOption } from './ask-question.js';
-import { registerChannelContainerConfig } from './channel-container-registry.js';
+import { registerChannelContainerConfig, registerAgentContainerConfig } from './channel-container-registry.js';
 import { registerChannelAdapter } from './channel-registry.js';
+import { getDestinations } from '../modules/agent-to-agent/db/agent-destinations.js';
 import { getAllAgentGroups, getAgentGroup } from '../db/agent-groups.js';
 import { markInboundDeliveryProcessed } from '../db/inbound-delivery-ledger.js';
 import {
+  getMessagingGroup,
   getMessagingGroupByPlatform,
   createMessagingGroup,
   updateMessagingGroup,
@@ -1209,28 +1211,30 @@ function formatContactEvent(event: PlatformEvent): string {
   }
 }
 
-registerChannelContainerConfig(BAND_CHANNEL_TYPE, ({ messagingGroup, hostEnv }) => {
-  const config = getBandConfig();
-  if (!config || !messagingGroup) return {};
+// Each BAND_* var is mirrored under the legacy THENVOI_* name so container
+// images built before the product rename keep working until the next rebuild.
+function mirrorBandEnv(bandEnv: Record<string, string>): Record<string, string> {
+  const env: Record<string, string> = {};
+  for (const [key, value] of Object.entries(bandEnv)) {
+    env[key] = value;
+    env[key.replace(/^BAND_/, 'THENVOI_')] = value;
+  }
+  return env;
+}
 
-  // BAND_* is canonical. Each var is mirrored under the legacy THENVOI_* name
-  // so container images built before the product rename keep working until
-  // the next image rebuild.
+// Common (non-room) Band env shared by the per-room channel contribution and
+// the agent-scoped control contribution. The API key is injected directly only
+// for local HTTP validation or explicit opt-in; hosted HTTPS relies on OneCLI.
+function baseBandEnv(config: BandConfig, hostEnv: NodeJS.ProcessEnv): Record<string, string> {
   const bandEnv: Record<string, string> = {
-    BAND_ROOM_ID: parseBandPlatformId(messagingGroup.platform_id),
     BAND_AGENT_ID: config.agentId,
     BAND_REST_URL: containerReachableRestUrl(config.baseUrl),
     BAND_MEMORY_TOOLS: String(config.memoryTools),
     BAND_MEMORY_LOAD_ON_START: String(config.memoryLoadOnStart),
     BAND_MEMORY_CONSOLIDATION: String(config.memoryConsolidation),
     BAND_CONTACT_STRATEGY: config.contactStrategy,
-    BAND_IS_MAIN_CONTROL_ROOM: String(isMainRoomPlatformId(messagingGroup.platform_id)),
   };
-
-  if (config.ownerId) {
-    bandEnv.BAND_OWNER_ID = config.ownerId;
-  }
-
+  if (config.ownerId) bandEnv.BAND_OWNER_ID = config.ownerId;
   if (
     shouldInjectDirectApiKey(config.baseUrl) ||
     hostEnv.BAND_INJECT_API_KEY === 'true' ||
@@ -1238,14 +1242,49 @@ registerChannelContainerConfig(BAND_CHANNEL_TYPE, ({ messagingGroup, hostEnv }) 
   ) {
     bandEnv.BAND_API_KEY = config.apiKey;
   }
+  return bandEnv;
+}
 
-  const env: Record<string, string> = { NANOCLAW_CHANNEL: BAND_CHANNEL_TYPE };
-  for (const [key, value] of Object.entries(bandEnv)) {
-    env[key] = value;
-    env[key.replace(/^BAND_/, 'THENVOI_')] = value;
-  }
+/** True if the agent group is wired to at least one Band room — the
+ *  authorization signal for granting it the agent-scoped Band toolset. */
+function agentGroupHasBandDestination(agentGroupId: string): boolean {
+  return getDestinations(agentGroupId).some(
+    (d) => d.target_type === 'channel' && getMessagingGroup(d.target_id)?.channel_type === BAND_CHANNEL_TYPE,
+  );
+}
 
-  return { env };
+/**
+ * Agent-scoped Band env injected into EVERY session of a Band-enabled agent
+ * group (not only Band-room sessions), so the agent can drive Band from any
+ * channel. Deliberately omits BAND_ROOM_ID / BAND_IS_MAIN_CONTROL_ROOM — there
+ * is no implicit "current room", so room-scoped Band tools require an explicit
+ * chat_room_id. Returns {} when Band isn't configured or the group has no Band
+ * destination.
+ */
+export function bandAgentControlEnv(
+  agentGroupId: string,
+  hostEnv: NodeJS.ProcessEnv = process.env,
+): Record<string, string> {
+  const config = getBandConfig();
+  if (!config || !agentGroupHasBandDestination(agentGroupId)) return {};
+  return mirrorBandEnv({ ...baseBandEnv(config, hostEnv), BAND_AGENT_CONTROL: 'true' });
+}
+
+registerChannelContainerConfig(BAND_CHANNEL_TYPE, ({ messagingGroup, hostEnv }) => {
+  const config = getBandConfig();
+  if (!config || !messagingGroup) return {};
+  const bandEnv = {
+    ...baseBandEnv(config, hostEnv),
+    BAND_ROOM_ID: parseBandPlatformId(messagingGroup.platform_id),
+    BAND_IS_MAIN_CONTROL_ROOM: String(isMainRoomPlatformId(messagingGroup.platform_id)),
+  };
+  return { env: { NANOCLAW_CHANNEL: BAND_CHANNEL_TYPE, ...mirrorBandEnv(bandEnv) } };
+});
+
+// Agent-scoped: grant Band tools to every session of a Band-wired agent group.
+registerAgentContainerConfig(({ agentGroupId, hostEnv }) => {
+  const env = bandAgentControlEnv(agentGroupId, hostEnv);
+  return Object.keys(env).length > 0 ? { env } : {};
 });
 
 registerChannelAdapter('band', {

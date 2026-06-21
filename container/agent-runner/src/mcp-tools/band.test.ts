@@ -71,4 +71,33 @@ describe('Band.ai MCP tools', () => {
     expect(result.content[0].type).toBe('text');
     expect(result.content[0].text).toContain('blocked during Band.ai memory consolidation');
   });
+
+  it('exposes chat_room_id on room-scoped tools so they can target any room', async () => {
+    process.env.THENVOI_AGENT_ID = 'agent-1';
+    process.env.THENVOI_REST_URL = 'https://band.example.test';
+
+    await import('./band.js');
+    const { getRegisteredTool } = await import('./server.js');
+
+    const send = getRegisteredTool('band_send_message');
+    const props = send!.tool.inputSchema.properties as Record<string, unknown> | undefined;
+    expect(props && 'chat_room_id' in props).toBe(true);
+  });
+
+  it('requires chat_room_id for a room-scoped tool when the session has no current room', async () => {
+    // Agent-scoped session (e.g. driven from Telegram): agent identity present,
+    // but no BAND_ROOM_ID. clearEnv() in beforeEach already removed ROOM_ID.
+    process.env.THENVOI_AGENT_ID = 'agent-1';
+    process.env.THENVOI_REST_URL = 'https://band.example.test';
+
+    await import('./band.js');
+    const { getRegisteredTool } = await import('./server.js');
+    const tool = getRegisteredTool('band_send_message');
+
+    const result = await tool!.handler({ content: 'hi there', mentions: [{ id: 'peer-1' }] });
+
+    expect(result.isError).toBe(true);
+    expect(result.content[0].type).toBe('text');
+    expect(result.content[0].text).toContain('needs a chat_room_id');
+  });
 });

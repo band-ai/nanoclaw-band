@@ -42,6 +42,19 @@ const MUTATION_TOOLS_BLOCKED_IN_MAIN_ROOM = new Set<SdkToolName>([
   'thenvoi_create_chatroom',
 ]);
 
+// Tools that operate on a specific room. The SDK binds these to the AgentTools
+// construction roomId, so to target an arbitrary room (e.g. from a Telegram
+// session with no current room) the handler builds a per-room AgentTools and
+// the MCP schema gains an optional `chat_room_id`. Room-independent tools
+// (create_chatroom, lookup_peers, contacts, memory) are unaffected.
+const ROOM_SCOPED_TOOLS = new Set<SdkToolName>([
+  'thenvoi_send_message',
+  'thenvoi_send_event',
+  'thenvoi_get_participants',
+  'thenvoi_add_participant',
+  'thenvoi_remove_participant',
+]);
+
 function env(name: string): string | undefined {
   const value = process.env[name];
   return value && value.length > 0 ? value : undefined;
@@ -53,12 +66,17 @@ function bandEnv(suffix: string): string | undefined {
   return env(`BAND_${suffix}`) ?? env(`THENVOI_${suffix}`);
 }
 
-function bandEnvPresent(): boolean {
-  return Boolean(bandEnv('ROOM_ID') && bandEnv('AGENT_ID') && bandEnv('REST_URL'));
+// The Band toolset is available whenever the agent identity is present —
+// either in a Band room session (BAND_ROOM_ID set) or an agent-scoped session
+// of a Band-wired group (BAND_AGENT_CONTROL=true, no room). Room-scoped tools
+// then require an explicit chat_room_id when there is no current room.
+function bandAgentToolsEnabled(): boolean {
+  return Boolean(bandEnv('AGENT_ID') && bandEnv('REST_URL'));
 }
 
-function roomId(): string {
-  return bandEnv('ROOM_ID')!;
+/** The session's Band room, if this session is bound to one. */
+function sessionRoomId(): string | undefined {
+  return bandEnv('ROOM_ID');
 }
 
 function mainControlRoom(): boolean {
@@ -77,8 +95,15 @@ function isMemoryTool(sdkToolName: SdkToolName): boolean {
   return sdkToolName.includes('memory') || sdkToolName.includes('memories');
 }
 
-let cachedTools: AgentToolsProtocol | null = null;
+// AgentTools binds room-scoped operations to its construction roomId, so we
+// cache one instance per target room. Room-independent tools use the base
+// instance (its roomId is irrelevant to them).
+const toolsByRoom = new Map<string, AgentToolsProtocol>();
 let memoryDisabledForRun = false;
+
+// Placeholder room for the base instance when the session has no current room
+// (agent-scoped sessions). Room-independent tools never read it.
+const AGENT_SCOPED_PLACEHOLDER_ROOM = 'agent-control';
 
 function apiKey(): string {
   return bandEnv('API_KEY') ?? env('ONECLI_API_KEY') ?? '';
@@ -88,16 +113,17 @@ function restUrl(): string | undefined {
   return bandEnv('REST_URL');
 }
 
-function sdkTools(): AgentToolsProtocol {
-  if (cachedTools) return cachedTools;
+function sdkToolsForRoom(targetRoomId: string): AgentToolsProtocol {
+  const cached = toolsByRoom.get(targetRoomId);
+  if (cached) return cached;
 
   const link = new ThenvoiLink({
     agentId: bandEnv('AGENT_ID')!,
     apiKey: apiKey(),
     restUrl: restUrl(),
   });
-  cachedTools = new AgentTools({
-    roomId: roomId(),
+  const tools = new AgentTools({
+    roomId: targetRoomId,
     rest: link.rest,
     capabilities: {
       peers: true,
@@ -105,7 +131,13 @@ function sdkTools(): AgentToolsProtocol {
       memory: memoryToolsEnabled(),
     },
   }).getAdapterTools();
-  return cachedTools;
+  toolsByRoom.set(targetRoomId, tools);
+  return tools;
+}
+
+/** Base toolset for schema generation and room-independent tool calls. */
+function baseTools(): AgentToolsProtocol {
+  return sdkToolsForRoom(sessionRoomId() ?? AGENT_SCOPED_PLACEHOLDER_ROOM);
 }
 
 function toBandToolName(sdkToolName: SdkToolName): string {
@@ -170,7 +202,10 @@ function blockedDuringConsolidation(sdkToolName: SdkToolName): CallToolResult | 
   };
 }
 
-function blockedInMainRoom(sdkToolName: SdkToolName): CallToolResult | null {
+function blockedInMainRoom(sdkToolName: SdkToolName, hasExplicitRoom: boolean): CallToolResult | null {
+  // Only guard the implicit current room: when the agent explicitly targets a
+  // different room (chat_room_id), the main-control-room restriction doesn't apply.
+  if (hasExplicitRoom) return null;
   if (!mainControlRoom() || !MUTATION_TOOLS_BLOCKED_IN_MAIN_ROOM.has(sdkToolName)) return null;
   return {
     content: [
@@ -181,6 +216,10 @@ function blockedInMainRoom(sdkToolName: SdkToolName): CallToolResult | null {
     ],
     isError: true,
   };
+}
+
+function errorResult(text: string): CallToolResult {
+  return { content: [{ type: 'text', text }], isError: true };
 }
 
 function normalizeDescription(description: unknown, registryEntry: BandToolRegistryEntry): string {
@@ -194,16 +233,26 @@ function sdkSchemaToMcpTool(schema: Record<string, unknown>): Tool | null {
   const inputSchema = schema.input_schema && typeof schema.input_schema === 'object' ? schema.input_schema : undefined;
   if (!registryEntry || !inputSchema) return null;
 
+  let finalSchema = inputSchema as Record<string, unknown>;
+  if (ROOM_SCOPED_TOOLS.has(registryEntry.sdkName)) {
+    const properties = { ...((finalSchema.properties as Record<string, unknown> | undefined) ?? {}) };
+    properties.chat_room_id = {
+      type: 'string',
+      description:
+        'Target Band room id. Optional in a Band room session (defaults to the current room); required when this tool is used from another channel (e.g. Telegram).',
+    };
+    finalSchema = { ...finalSchema, properties };
+  }
+
   return {
     name: registryEntry.bandName,
     description: normalizeDescription(schema.description, registryEntry),
-    inputSchema: inputSchema as Tool['inputSchema'],
+    inputSchema: finalSchema as Tool['inputSchema'],
   };
 }
 
 function buildBandToolDefinitions(): McpToolDefinition[] {
-  const tools = sdkTools();
-  const schemas = tools.getAnthropicToolSchemas({ includeMemory: memoryToolsEnabled() });
+  const schemas = baseTools().getAnthropicToolSchemas({ includeMemory: memoryToolsEnabled() });
 
   return schemas.flatMap((schema) => {
     const tool = sdkSchemaToMcpTool(schema);
@@ -211,16 +260,43 @@ function buildBandToolDefinitions(): McpToolDefinition[] {
 
     const sdkToolName = toSdkToolName(tool.name);
     if (!sdkToolName) return [];
+    const roomScoped = ROOM_SCOPED_TOOLS.has(sdkToolName);
     return [
       {
         tool,
         async handler(args) {
           const consolidationBlocked = blockedDuringConsolidation(sdkToolName);
           if (consolidationBlocked) return consolidationBlocked;
-          const blocked = blockedInMainRoom(sdkToolName);
-          if (blocked) return blocked;
           if (isMemoryTool(sdkToolName) && memoryDisabledForRun) return memoryDisabledResult(sdkToolName);
-          const result = await sdkTools().executeToolCall(sdkToolName, args);
+
+          let execArgs = args;
+          let tools = baseTools();
+
+          if (roomScoped) {
+            const record = (args ?? {}) as Record<string, unknown>;
+            const explicit = typeof record.chat_room_id === 'string' ? record.chat_room_id : undefined;
+            const blocked = blockedInMainRoom(sdkToolName, Boolean(explicit));
+            if (blocked) return blocked;
+            const targetRoom = explicit ?? sessionRoomId();
+            if (!targetRoom) {
+              return errorResult(
+                `${toBandToolName(sdkToolName)} needs a chat_room_id — this session has no current Band room.`,
+              );
+            }
+            tools = sdkToolsForRoom(targetRoom);
+            if (explicit) {
+              const rest = { ...record };
+              delete rest.chat_room_id;
+              execArgs = rest;
+            }
+          } else {
+            // Room-independent tools (e.g. create_chatroom) are still guarded
+            // against mutation from within the main control room.
+            const blocked = blockedInMainRoom(sdkToolName, false);
+            if (blocked) return blocked;
+          }
+
+          const result = await tools.executeToolCall(sdkToolName, execArgs);
           if (isMemoryTool(sdkToolName) && isUnavailableMemoryResult(result)) {
             memoryDisabledForRun = true;
             return memoryDisabledResult(sdkToolName);
@@ -232,6 +308,6 @@ function buildBandToolDefinitions(): McpToolDefinition[] {
   });
 }
 
-if (bandEnvPresent()) {
+if (bandAgentToolsEnabled()) {
   registerTools(buildBandToolDefinitions());
 }

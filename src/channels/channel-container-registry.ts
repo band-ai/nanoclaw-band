@@ -28,3 +28,30 @@ export function getChannelContainerConfig(channelType: string): ChannelContainer
 export function listChannelContainerConfigNames(): string[] {
   return [...registry.keys()];
 }
+
+/**
+ * Agent-scoped container contributions — applied to EVERY session of an agent
+ * group regardless of the session's channel, so a channel can grant the agent
+ * cross-channel control tools (e.g. Band peer/room management from a Telegram
+ * session). The producer decides whether it applies to a given agent group and
+ * returns {} otherwise.
+ */
+export interface AgentContainerContext {
+  session: Session;
+  agentGroupId: string;
+  hostEnv: NodeJS.ProcessEnv;
+}
+
+export type AgentContainerConfigFn = (
+  ctx: AgentContainerContext,
+) => ProviderContainerContribution | Promise<ProviderContainerContribution>;
+
+const agentRegistry: AgentContainerConfigFn[] = [];
+
+export function registerAgentContainerConfig(fn: AgentContainerConfigFn): void {
+  agentRegistry.push(fn);
+}
+
+export function getAgentContainerConfigs(): AgentContainerConfigFn[] {
+  return [...agentRegistry];
+}
