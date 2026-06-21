@@ -146,6 +146,7 @@ async function walkThroughAppCreation(): Promise<'continue' | 'back'> {
       '     • chat:write',
       '     • users:read',
       '     • reactions:write',
+      '     • files:read, files:write',
       '  3. App Home → enable "Messages Tab" and "Allow users to send',
       '     slash commands and messages from the messages tab"',
       '  4. Basic Information → copy the "Signing Secret"',
@@ -317,9 +318,9 @@ async function collectSlackUserId(): Promise<string> {
     [
       "To get your Slack member ID:",
       '',
-      '  1. In Slack, click your profile picture (top right)',
+      '  1. In Slack, click your profile picture (bottom left)',
       '  2. Click "Profile"',
-      '  3. Click the three dots (⋯) → "Copy member ID"',
+      '  3. Click the three dots (⋮) → "Copy member ID"',
     ].join('\n'),
     'Find your Slack user ID',
   );

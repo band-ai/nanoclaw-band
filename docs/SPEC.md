@@ -289,10 +289,7 @@ nanoclaw/
 │       ├── debug/SKILL.md              # /debug - Container debugging
 │       ├── add-telegram/SKILL.md       # /add-telegram - Telegram channel
 │       ├── add-gmail/SKILL.md          # /add-gmail - Gmail integration
-│       ├── add-voice-transcription/    # /add-voice-transcription - Whisper
-│       ├── x-integration/SKILL.md      # /x-integration - X/Twitter
-│       ├── convert-to-apple-container/  # /convert-to-apple-container - Apple Container runtime
-│       └── add-parallel/SKILL.md       # /add-parallel - Parallel agents
+│       └── add-voice-transcription/    # /add-voice-transcription - Whisper
 │
 ├── groups/
 │   ├── CLAUDE.md                  # Global memory (all groups read this)

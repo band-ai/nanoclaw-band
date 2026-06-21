@@ -6,6 +6,7 @@
  */
 import path from 'path';
 
+import { backfillContainerConfigs } from './backfill-container-configs.js';
 import { DATA_DIR } from './config.js';
 import { enforceStartupBackoff, resetCircuitBreaker } from './circuit-breaker.js';
 import { migrateGroupsToClaudeLocal } from './claude-md-compose.js';
@@ -16,6 +17,7 @@ import { startActiveDeliveryPoll, startSweepDeliveryPoll, setDeliveryAdapter, st
 import { startHostSweep, stopHostSweep } from './host-sweep.js';
 import { routeInbound } from './router.js';
 import { log } from './log.js';
+import { enforceUpgradeTripwire } from './upgrade-state.js';
 
 // Response + shutdown registries live in response-registry.ts to break the
 // circular import cycle: src/index.ts imports src/modules/index.js for side
@@ -53,8 +55,18 @@ import './channels/index.js';
 // append registry-based modules. Imported for side effects (registrations).
 import './modules/index.js';
 
+// CLI command barrel — populates the `ncl` registry before the CLI server
+// accepts connections.
+import './cli/commands/index.js';
+import './cli/delivery-action.js';
+import { startCliServer, stopCliServer } from './cli/socket-server.js';
+
 import type { ChannelAdapter, ChannelSetup } from './channels/adapter.js';
-import { initChannelAdapters, teardownChannelAdapters, getChannelAdapter } from './channels/channel-registry.js';
+import {
+  initChannelAdapters,
+  teardownChannelAdapters,
+  createChannelDeliveryAdapter,
+} from './channels/channel-registry.js';
 
 async function main(): Promise<void> {
   log.info('NanoClaw starting');
@@ -62,13 +74,21 @@ async function main(): Promise<void> {
   // 0. Circuit breaker — backoff on rapid restarts
   await enforceStartupBackoff();
 
+  // 0.5 Upgrade tripwire — refuse to start if this install was updated
+  // outside the sanctioned path (raw `git pull` instead of /update-nanoclaw).
+  enforceUpgradeTripwire();
+
   // 1. Init central DB
   const dbPath = path.join(DATA_DIR, 'v2.db');
   const db = initDb(dbPath);
   runMigrations(db);
   log.info('Central DB ready', { path: dbPath });
 
-  // 1b. One-time filesystem cutover — idempotent, no-op after first run.
+  // 1b. Backfill container_configs from legacy container.json files.
+  // Idempotent — skips groups that already have a config row.
+  backfillContainerConfigs();
+
+  // 1c. One-time filesystem cutover — idempotent, no-op after first run.
   migrateGroupsToClaudeLocal();
 
   // 2. Container runtime
@@ -82,6 +102,9 @@ async function main(): Promise<void> {
         try {
           return await routeInbound({
             channelType: adapter.channelType,
+            // The one host-side stamping seam: adapters stay instance-blind,
+            // the host stamps the receiving instance on every inbound event.
+            instance: adapter.instance ?? adapter.channelType,
             platformId,
             threadId,
             message: {
@@ -146,29 +169,11 @@ async function main(): Promise<void> {
     };
   });
 
-  // 4. Delivery adapter bridge — dispatches to channel adapters
-  const deliveryAdapter = {
-    async deliver(
-      channelType: string,
-      platformId: string,
-      threadId: string | null,
-      kind: string,
-      content: string,
-      files?: import('./channels/adapter.js').OutboundFile[],
-    ): Promise<string | undefined> {
-      const adapter = getChannelAdapter(channelType);
-      if (!adapter) {
-        log.warn('No adapter for channel type', { channelType });
-        return;
-      }
-      return adapter.deliver(platformId, threadId, { kind, content: JSON.parse(content), files });
-    },
-    async setTyping(channelType: string, platformId: string, threadId: string | null): Promise<void> {
-      const adapter = getChannelAdapter(channelType);
-      await adapter?.setTyping?.(platformId, threadId);
-    },
-  };
-  setDeliveryAdapter(deliveryAdapter);
+  // 4. Delivery adapter bridge — dispatches to channel adapters by EXACT
+  // registry key (instance ?? channelType): a named instance with an
+  // offline adapter is never rerouted through a sibling bot. See
+  // createChannelDeliveryAdapter in channels/channel-registry.ts.
+  setDeliveryAdapter(createChannelDeliveryAdapter());
 
   // 5. Start delivery polls
   startActiveDeliveryPoll();
@@ -178,6 +183,9 @@ async function main(): Promise<void> {
   // 6. Start host sweep
   startHostSweep();
   log.info('Host sweep started');
+
+  // 7. Start the `ncl` CLI socket server (data/ncl.sock).
+  await startCliServer();
 
   log.info('NanoClaw running');
 }
@@ -194,6 +202,7 @@ async function shutdown(signal: string): Promise<void> {
   }
   stopDeliveryPolls();
   stopHostSweep();
+  await stopCliServer();
   try {
     await teardownChannelAdapters();
   } finally {

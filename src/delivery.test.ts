@@ -26,8 +26,16 @@ vi.mock('./config.js', async () => {
 
 const TEST_DIR = '/tmp/nanoclaw-test-delivery';
 
-import { initTestDb, closeDb, runMigrations, createAgentGroup, createMessagingGroup } from './db/index.js';
-import { resolveSession, outboundDbPath } from './session-manager.js';
+import {
+  initTestDb,
+  closeDb,
+  runMigrations,
+  createAgentGroup,
+  createMessagingGroup,
+  createMessagingGroupAgent,
+} from './db/index.js';
+import { getDeliveredIds } from './db/session-db.js';
+import { resolveSession, outboundDbPath, openInboundDb } from './session-manager.js';
 import { deliverSessionMessages, setDeliveryAdapter } from './delivery.js';
 
 function now(): string {
@@ -144,5 +152,192 @@ describe('deliverSessionMessages — concurrent invocations', () => {
     await deliverSessionMessages(session);
 
     expect(callCount).toBe(1);
+  });
+});
+
+describe('deliverSessionMessages — retry and permanent failure', () => {
+  it('retries on adapter failure and marks failed after MAX_DELIVERY_ATTEMPTS (3)', async () => {
+    seedAgentAndChannel();
+    const { session } = resolveSession('ag-1', 'mg-1', null, 'shared');
+    insertOutbound('ag-1', session.id, 'out-flaky');
+
+    let callCount = 0;
+    setDeliveryAdapter({
+      async deliver() {
+        callCount++;
+        throw new Error('network timeout');
+      },
+    });
+
+    // Attempt 1
+    await deliverSessionMessages(session);
+    expect(callCount).toBe(1);
+
+    // Attempt 2
+    await deliverSessionMessages(session);
+    expect(callCount).toBe(2);
+
+    // Attempt 3 — should mark as permanently failed
+    await deliverSessionMessages(session);
+    expect(callCount).toBe(3);
+
+    // Attempt 4 — message is now in delivered (as failed), adapter not called
+    await deliverSessionMessages(session);
+    expect(callCount).toBe(3);
+
+    // Verify the message is in the delivered table with 'failed' status
+    const inDb = openInboundDb('ag-1', session.id);
+    const delivered = getDeliveredIds(inDb);
+    inDb.close();
+    expect(delivered.has('out-flaky')).toBe(true);
+  });
+
+  it('clears attempt counter on successful delivery', async () => {
+    seedAgentAndChannel();
+    const { session } = resolveSession('ag-1', 'mg-1', null, 'shared');
+    insertOutbound('ag-1', session.id, 'out-retry-ok');
+
+    let callCount = 0;
+    setDeliveryAdapter({
+      async deliver() {
+        callCount++;
+        if (callCount === 1) throw new Error('transient');
+        return 'plat-ok';
+      },
+    });
+
+    // Attempt 1 — fails
+    await deliverSessionMessages(session);
+    expect(callCount).toBe(1);
+
+    // Attempt 2 — succeeds
+    await deliverSessionMessages(session);
+    expect(callCount).toBe(2);
+
+    // Attempt 3 — not called, message already delivered
+    await deliverSessionMessages(session);
+    expect(callCount).toBe(2);
+  });
+});
+
+describe('deliverSessionMessages — instance resolution', () => {
+  it('delivers via the origin session instance when sibling rows share (channel_type, platform_id)', async () => {
+    createAgentGroup({
+      id: 'ag-1',
+      name: 'Test Agent',
+      folder: 'test-agent',
+      agent_provider: null,
+      created_at: now(),
+    });
+    // Two instances own the same chat address. The named row sorts before
+    // 'slack', so a plain by-platform lookup (default-instance-first) would
+    // pick mg-default — only origin-session preference selects mg-tester.
+    createMessagingGroup({
+      id: 'mg-default',
+      channel_type: 'slack',
+      platform_id: 'slack:C1',
+      name: 'Default',
+      is_group: 1,
+      unknown_sender_policy: 'public',
+      created_at: now(),
+    });
+    createMessagingGroup({
+      id: 'mg-tester',
+      channel_type: 'slack',
+      platform_id: 'slack:C1',
+      instance: 'alpha-tester',
+      name: 'Tester',
+      is_group: 1,
+      unknown_sender_policy: 'public',
+      created_at: now(),
+    });
+
+    const { session } = resolveSession('ag-1', 'mg-tester', null, 'shared');
+    const db = new Database(outboundDbPath('ag-1', session.id));
+    db.prepare(
+      `INSERT INTO messages_out (id, timestamp, kind, platform_id, channel_type, content)
+       VALUES ('out-inst', datetime('now'), 'chat', 'slack:C1', 'slack', ?)`,
+    ).run(JSON.stringify({ text: 'hi' }));
+    db.close();
+
+    const instances: Array<string | undefined> = [];
+    setDeliveryAdapter({
+      async deliver(_ct, _pid, _tid, _kind, _content, _files, instance) {
+        instances.push(instance);
+        return 'plat-1';
+      },
+    });
+
+    await deliverSessionMessages(session);
+    expect(instances).toEqual(['alpha-tester']);
+  });
+
+  it('default session passes the backfilled default instance (= channel_type)', async () => {
+    seedAgentAndChannel();
+    const { session } = resolveSession('ag-1', 'mg-1', null, 'shared');
+    insertOutbound('ag-1', session.id, 'out-default-inst');
+
+    const instances: Array<string | undefined> = [];
+    setDeliveryAdapter({
+      async deliver(_ct, _pid, _tid, _kind, _content, _files, instance) {
+        instances.push(instance);
+        return 'plat-2';
+      },
+    });
+
+    await deliverSessionMessages(session);
+    expect(instances).toEqual(['telegram']);
+  });
+});
+
+describe('deliverSessionMessages — permission check', () => {
+  it('rejects delivery to an unauthorized channel destination', async () => {
+    seedAgentAndChannel();
+
+    // Create a second messaging group that the agent is NOT wired to
+    createMessagingGroup({
+      id: 'mg-2',
+      channel_type: 'discord',
+      platform_id: 'discord:456',
+      name: 'Unauthorized Chat',
+      is_group: 0,
+      unknown_sender_policy: 'public',
+      created_at: now(),
+    });
+
+    // Session is on mg-1 (telegram)
+    const { session } = resolveSession('ag-1', 'mg-1', null, 'shared');
+
+    // Insert an outbound message targeting mg-2 (discord) — not the origin chat
+    const outDb = new Database(outboundDbPath('ag-1', session.id));
+    outDb
+      .prepare(
+        `INSERT INTO messages_out (id, timestamp, kind, platform_id, channel_type, content)
+       VALUES (?, datetime('now'), 'chat', 'discord:456', 'discord', ?)`,
+      )
+      .run('out-unauth', JSON.stringify({ text: 'sneaky' }));
+    outDb.close();
+
+    const calls: string[] = [];
+    setDeliveryAdapter({
+      async deliver(_ct, _pid, _tid, _kind, content) {
+        calls.push(content);
+        return 'plat-msg';
+      },
+    });
+
+    // Deliver 3 times to exhaust retries
+    await deliverSessionMessages(session);
+    await deliverSessionMessages(session);
+    await deliverSessionMessages(session);
+
+    // Adapter never called — permission check throws before reaching it
+    expect(calls).toHaveLength(0);
+
+    // Message is marked as permanently failed
+    const inDb = openInboundDb('ag-1', session.id);
+    const delivered = getDeliveredIds(inDb);
+    inDb.close();
+    expect(delivered.has('out-unauth')).toBe(true);
   });
 });

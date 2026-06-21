@@ -115,17 +115,16 @@ function buildDestinationsSection(): string {
     }
   }
   lines.push('');
-  lines.push('**Every response must be wrapped** in a `<message to="name">...</message>` block.');
-  lines.push('You can include multiple `<message>` blocks in one response to send to multiple destinations.');
-  lines.push('Text outside of `<message>` blocks is scratchpad — logged but not sent anywhere.');
-  lines.push('Use `<internal>...</internal>` to make scratchpad intent explicit.');
-  lines.push('');
   lines.push(
-    '**Default routing**: when replying to an incoming message, address the same destination the message came `from` — every inbound `<message>` tag carries a `from="name"` attribute that names the origin destination. Only address a different destination when the request itself asks you to (e.g., "tell Laura that…").',
+    'Wrap each delivered message in a `<message to="name">…</message>` block; include several blocks in one response to address several destinations. `<internal>…</internal>` marks thinking you don\'t want sent.',
   );
   lines.push('');
   lines.push(
-    'To send a message mid-response (e.g., an acknowledgment before a long task), call the `send_message` MCP tool with the `to` parameter set to a destination name.',
+    'When replying to an incoming message, default to addressing the destination it came `from` (every inbound `<message>` tag carries a `from="name"` attribute). Pick a different destination when the request asks for it (e.g., "tell Laura that…").',
+  );
+  lines.push('');
+  lines.push(
+    'The `send_message` MCP tool is the same delivery, available mid-turn — handy for a quick acknowledgment ("on it") before a slow tool call. Each `send_message` call and each final-response `<message>` block lands as its own message in the conversation, so they read as a sequence rather than as one combined reply.',
   );
   return lines.join('\n');
 }

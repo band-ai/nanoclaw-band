@@ -41,3 +41,10 @@ groups/global/*
 
 agents-sdk-docs
 container/agent-runner/vendor/
+.agents
+AGENTS.md
+
+# Internal working docs, never committed
+docs/maintainer-guide.md
+docs/drafts/
+forks.md

@@ -13,10 +13,35 @@ import {
   stripInternalTags,
   type RoutingContext,
 } from './formatter.js';
-import type { AgentProvider, AgentQuery, ProviderEvent } from './providers/types.js';
+import { isUploadTraceCommand, uploadTrace } from './upload-trace.js';
+import type { AgentProvider, AgentQuery, ProviderEvent, ProviderExchange } from './providers/types.js';
 
 const POLL_INTERVAL_MS = 1000;
 const ACTIVE_POLL_INTERVAL_MS = 500;
+
+/**
+ * Number of consecutive `database disk image is malformed` errors after which
+ * the follow-up poll gives up and exits the process. At ACTIVE_POLL_INTERVAL_MS
+ * = 500ms this is roughly 5 seconds — long enough to dodge a transient torn
+ * read during a host write, short enough to recover quickly from a poisoned
+ * page cache (host-sweep then respawns with a fresh mount).
+ */
+const CORRUPTION_STREAK_EXIT = 10;
+
+/**
+ * True for SQLite errors that indicate a corrupt READ view — almost always a
+ * cross-mount page-cache coherency issue on Docker Desktop macOS rather than
+ * actual file damage (host-side integrity_check passes). Reopening the DB
+ * handle inside this process does NOT recover; only a fresh container mount
+ * does. Caller's job is to exit so host-sweep respawns the container.
+ */
+export function isCorruptionError(msg: string): boolean {
+  return (
+    msg.includes('database disk image is malformed') ||
+    msg.includes('SQLITE_CORRUPT') ||
+    msg.includes('file is not a database')
+  );
+}
 
 function log(msg: string): void {
   console.error(`[poll-loop] ${msg}`);
@@ -35,10 +60,15 @@ export interface PollLoopConfig {
    */
   providerName: string;
   cwd: string;
-  signal?: AbortSignal;
   systemContext?: {
     instructions?: string;
   };
+  /**
+   * Optional stop signal. In production the loop runs until the container
+   * dies; tests pass a signal so an abandoned loop actually exits instead of
+   * polling forever and stealing messages from the next test's DB.
+   */
+  signal?: AbortSignal;
 }
 
 /**
@@ -52,14 +82,25 @@ export interface PollLoopConfig {
  * 6. Loop
  */
 export async function runPollLoop(config: PollLoopConfig): Promise<void> {
-  const signal = config.signal;
-
   // Resume the agent's prior session from a previous container run if one
   // was persisted. The continuation is opaque to the poll-loop — the
   // provider decides how to use it (Claude resumes a .jsonl transcript,
   // other providers may reload a thread ID, etc.). Keyed per-provider so
   // a Codex thread id never gets handed to Claude or vice versa.
   let continuation: string | undefined = migrateLegacyContinuation(config.providerName);
+
+  // Before resuming, drop a session whose on-disk transcript has grown too
+  // large/old to cold-resume within the host's idle ceiling. Without this a
+  // long-lived hub keeps trying to reload an ever-growing .jsonl, hangs the
+  // first turn, and gets killed before it can reply (then repeats forever).
+  if (continuation) {
+    const rotateReason = config.provider.maybeRotateContinuation?.(continuation, config.cwd);
+    if (rotateReason) {
+      log(`Rotating session — ${rotateReason}; starting fresh`);
+      clearContinuation(config.providerName);
+      continuation = undefined;
+    }
+  }
 
   if (continuation) {
     log(`Resuming agent session ${continuation}`);
@@ -70,9 +111,12 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
   clearStaleProcessingAcks();
 
   let pollCount = 0;
-  while (!signal?.aborted) {
+  let isFirstPoll = true;
+  while (true) {
+    if (config.signal?.aborted) return;
     // Skip system messages — they're responses for MCP tools (e.g., ask_user_question)
-    const messages = getPendingMessages().filter((m) => m.kind !== 'system');
+    const messages = getPendingMessages(isFirstPoll).filter((m) => m.kind !== 'system');
+    isFirstPoll = false;
     pollCount++;
 
     // Periodic heartbeat so we know the loop is alive
@@ -81,7 +125,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
     }
 
     if (messages.length === 0) {
-      await sleep(POLL_INTERVAL_MS, signal);
+      await sleep(POLL_INTERVAL_MS);
       continue;
     }
 
@@ -94,7 +138,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
     // the "store as context, don't engage" contract. Host-side countDueMessages
     // gates the same way for wake-from-cold (see src/db/session-db.ts).
     if (!messages.some((m) => m.trigger === 1)) {
-      await sleep(POLL_INTERVAL_MS, signal);
+      await sleep(POLL_INTERVAL_MS);
       continue;
     }
 
@@ -121,6 +165,19 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
           channel_type: routing.channelType,
           thread_id: routing.threadId,
           content: JSON.stringify({ text: 'Session cleared.' }),
+        });
+        commandIds.push(msg.id);
+        continue;
+      }
+      if ((msg.kind === 'chat' || msg.kind === 'chat-sdk') && isUploadTraceCommand(msg)) {
+        log('Uploading session trace to Hugging Face');
+        writeMessageOut({
+          id: generateId(),
+          kind: 'chat',
+          platform_id: routing.platformId,
+          channel_type: routing.channelType,
+          thread_id: routing.threadId,
+          content: JSON.stringify({ text: uploadTrace() }),
         });
         commandIds.push(msg.id);
         continue;
@@ -182,7 +239,15 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
     // can stamp it on outbound rows — needed for a2a return-path routing.
     setCurrentInReplyTo(routing.inReplyTo);
     try {
-      const result = await processQuery(query, routing, processingIds, config.providerName, signal);
+      const result = await processQuery(
+        query,
+        routing,
+        processingIds,
+        config.providerName,
+        config.provider.onExchangeComplete?.bind(config.provider),
+        prompt,
+        continuation,
+      );
       if (result.continuation && result.continuation !== continuation) {
         continuation = result.continuation;
         setContinuation(config.providerName, continuation);
@@ -258,18 +323,28 @@ interface QueryResult {
   continuation?: string;
 }
 
-async function processQuery(
+export async function processQuery(
   query: AgentQuery,
   routing: RoutingContext,
   initialBatchIds: string[],
   providerName: string,
-  signal?: AbortSignal,
+  onExchangeComplete: ((exchange: ProviderExchange) => void) | undefined,
+  initialPrompt: string,
+  initialContinuation: string | undefined,
 ): Promise<QueryResult> {
   let queryContinuation: string | undefined;
-  let userVisibleToolUsed = false;
   let done = false;
-  const abortQuery = () => query.abort();
-  signal?.addEventListener('abort', abortQuery, { once: true });
+  let unwrappedNudged = false;
+  // Set when the agent invokes a user-visible MCP tool (e.g. band_send_message)
+  // that already delivered content to the channel this turn. The SDK's final
+  // `result` text is then a terse tool summary ("Sent.") that must not be
+  // re-delivered by the fallback dispatch path.
+  let userVisibleToolUsed = false;
+  // Prompt queue for the exchange hook — each result event consumes the
+  // oldest unanswered prompt, except a wrapping-retry result, which answers
+  // the same prompt again. Unused (and unmaintained) when the provider
+  // doesn't implement `onExchangeComplete`.
+  const archivePrompts: string[] = [initialPrompt];
 
   // Concurrent polling: push follow-ups into the active query as they arrive.
   // We do NOT force-end the stream on silence — keeping the query open avoids
@@ -282,6 +357,7 @@ async function processQuery(
   // will kill the container and messages get reset to pending.
   let pollInFlight = false;
   let endedForCommand = false;
+  let corruptionStreak = 0;
   const pollHandle = setInterval(() => {
     if (done || pollInFlight || endedForCommand) return;
     pollInFlight = true;
@@ -294,13 +370,16 @@ async function processQuery(
         // resume id (fixed at sdkQuery() time); admin/passthrough commands
         // (/compact, /cost, …) only dispatch when they're the first input
         // of a query — pushed mid-stream they arrive as plain text and
-        // the SDK never runs them. End the stream and leave the rows
-        // pending; the outer loop handles them on next iteration via the
-        // canonical command path + formatMessagesWithCommands.
+        // the SDK never runs them. Abort the active stream and leave the
+        // rows pending; the outer loop handles them on next iteration via
+        // the canonical command path + formatMessagesWithCommands. Abort,
+        // not end: end() lets an in-flight turn run to completion, which
+        // can block the command (e.g. /clear during a long task) for as
+        // long as the turn takes.
         if (pending.some((m) => isRunnerCommand(m))) {
-          log('Pending slash command — ending stream so outer loop can process');
+          log('Pending slash command — aborting active stream so outer loop can process');
           endedForCommand = true;
-          query.end();
+          query.abort();
           return;
         }
 
@@ -343,7 +422,9 @@ async function processQuery(
         const keptIds = keep.map((m) => m.id);
         const prompt = formatMessages(keep);
         log(`Pushing ${keep.length} follow-up message(s) into active query`);
+        unwrappedNudged = false;
         query.push(prompt);
+        archivePrompts.push(prompt);
         markCompleted(keptIds);
       } catch (err) {
         // Without this catch the rejection escapes the void IIFE and Node
@@ -352,6 +433,31 @@ async function processQuery(
         // path is not, so it needs its own.
         const errMsg = err instanceof Error ? err.message : String(err);
         log(`Follow-up poll error: ${errMsg}`);
+
+        // Detect SQLite cross-mount corruption (Docker Desktop macOS virtiofs /
+        // gRPC-FUSE coherency bug — the kernel page cache for the inbound.db
+        // bind mount can latch a torn snapshot mid-host-write, after which
+        // every fresh openInboundDb() in this process sees the same broken
+        // view. Reopening inside the container does NOT recover; only a fresh
+        // container mount does. Exit so the host sweep respawns us.
+        if (isCorruptionError(errMsg)) {
+          corruptionStreak += 1;
+          if (corruptionStreak >= CORRUPTION_STREAK_EXIT) {
+            log(
+              `Follow-up poll: ${corruptionStreak} consecutive '${errMsg}' errors — ` +
+                `inbound.db page cache is poisoned. Exiting so host respawns with a fresh mount.`,
+            );
+            // Stop touching the heartbeat so host-sweep stale detection fires
+            // promptly even if exit() races with in-flight async work.
+            done = true;
+            clearInterval(pollHandle);
+            // Defer exit one tick so this log line flushes through Docker's
+            // log driver before the process dies.
+            setTimeout(() => process.exit(75), 100);
+          }
+        } else {
+          corruptionStreak = 0;
+        }
       } finally {
         pollInFlight = false;
       }
@@ -378,45 +484,94 @@ async function processQuery(
         // A result — with or without text — means the turn is done. Mark
         // the initial batch completed now so the host sweep doesn't see
         // stale 'processing' claims while the query stays open for
-        // follow-up pushes. If the agent already sent a user-visible MCP
-        // message, the SDK's final text is usually a terse tool result
-        // summary (for example "Sent.") and must not be delivered again by
-        // the fallback path.
+        // follow-up pushes. The agent may have responded via MCP
+        // (send_message) mid-turn, or the message may not need a response
+        // at all — either way the turn is finished.
         markCompleted(initialBatchIds);
-        if (event.text) {
-          if (userVisibleToolUsed) {
-            log(`[tool-result] ${event.text.slice(0, 200)}`);
+        if (event.text && userVisibleToolUsed) {
+          // The agent already sent a user-visible MCP message this turn; the
+          // SDK's final text is a terse tool-result summary. Log it, don't
+          // re-deliver, and record the exchange as completed.
+          log(`[tool-result] ${event.text.slice(0, 200)}`);
+          notifyExchangeComplete(onExchangeComplete, {
+            prompt: archivePrompts[0] ?? initialPrompt,
+            result: event.text,
+            continuation: queryContinuation ?? initialContinuation,
+            status: 'completed',
+          });
+          archivePrompts.shift();
+        } else if (event.text) {
+          const { sent, hasUnwrapped } = dispatchResultText(event.text, routing);
+          if (sent === 0 && event.isError === true) {
+            // Non-retryable error turn (e.g. a 403 billing_error) with no
+            // <message> envelope: deliver the notice instead of dropping it as
+            // scratchpad, and skip the re-wrap nudge — it would just re-hammer
+            // the failing gateway turn after turn.
+            deliverErrorResult(event.text, routing);
+            notifyExchangeComplete(onExchangeComplete, {
+              prompt: archivePrompts[0] ?? initialPrompt,
+              result: event.text,
+              continuation: queryContinuation ?? initialContinuation,
+              status: 'error',
+            });
+            archivePrompts.shift();
           } else {
-            dispatchResultText(event.text, routing);
+            const willRetryWrapping = hasUnwrapped && !unwrappedNudged;
+            notifyExchangeComplete(onExchangeComplete, {
+              prompt: archivePrompts[0] ?? initialPrompt,
+              result: event.text,
+              continuation: queryContinuation ?? initialContinuation,
+              status: hasUnwrapped ? 'undelivered' : 'completed',
+            });
+            if (willRetryWrapping) {
+              unwrappedNudged = true;
+              const destinations = getAllDestinations();
+              const names = destinations.map((d) => d.name).join(', ');
+              query.push(
+                `<system>Your response was not delivered — it was not wrapped in <message to="name">...</message> blocks. ` +
+                  `All output must be wrapped: use <message to="name"> for content to send, or <internal> for scratchpad. ` +
+                  `Your destinations: ${names}. ` +
+                  `Please re-send your response with the correct wrapping.</system>`,
+              );
+            }
+            // The wrapping-retry result answers the SAME user prompt — keep it
+            // queued so the retry archives against it, not the nudge text.
+            if (!willRetryWrapping) archivePrompts.shift();
           }
+        } else {
+          archivePrompts.shift();
         }
+        // Reset for the next turn within this open query.
         userVisibleToolUsed = false;
-      } else if (event.type === 'compacted') {
-        // The SDK auto-compacted the conversation. After compaction the
-        // model often drops the learned `<message to="…">` wrapping
-        // discipline (the destinations are still in the system prompt,
-        // but the behavioral pattern is summarized away). Inject a
-        // reminder back into the live query so the next turn re-anchors
-        // on the destination model. Only do this when there's >1
-        // destination — single-destination groups have a fallback that
-        // works without wrapping. See qwibitai/nanoclaw#2325.
-        const destinations = getAllDestinations();
-        if (destinations.length > 1) {
-          const names = destinations.map((d) => d.name).join(', ');
-          query.push(
-            `[system] Context was just compacted. Reminder: you have ${destinations.length} destinations (${names}). ` +
-              `Use <message to="name"> blocks to address them. Bare text goes to the scratchpad fallback only.`,
-          );
-        }
       }
     }
+  } catch (err) {
+    const errMsg = err instanceof Error ? err.message : String(err);
+    notifyExchangeComplete(onExchangeComplete, {
+      prompt: archivePrompts[0] ?? initialPrompt,
+      result: `Error: ${errMsg}`,
+      continuation: queryContinuation ?? initialContinuation,
+      status: 'error',
+    });
+    throw err;
   } finally {
     done = true;
-    signal?.removeEventListener('abort', abortQuery);
     clearInterval(pollHandle);
   }
 
   return { continuation: queryContinuation };
+}
+
+function notifyExchangeComplete(
+  hook: ((exchange: ProviderExchange) => void) | undefined,
+  exchange: ProviderExchange,
+): void {
+  if (!hook) return;
+  try {
+    hook(exchange);
+  } catch (err) {
+    log(`onExchangeComplete failed: ${err instanceof Error ? err.message : String(err)}`);
+  }
 }
 
 function handleEvent(event: ProviderEvent, _routing: RoutingContext): void {
@@ -435,13 +590,30 @@ function handleEvent(event: ProviderEvent, _routing: RoutingContext): void {
     case 'progress':
       log(`Progress: ${event.message}`);
       break;
-    case 'compacted':
-      log(`Compacted: ${event.text}`);
-      break;
     case 'user_visible_tool':
       log(`User-visible tool: ${event.name}`);
       break;
   }
+}
+
+/**
+ * Deliver a turn's text straight to the channel the batch arrived on. Used when
+ * a turn ends in a provider error (e.g. a non-retryable 403 billing_error) with
+ * no <message> envelope: the notice would otherwise be dropped as scratchpad.
+ * This is the same user-facing write the outer catch block does, minus the
+ * `Error:` prefix — the provider's text is already a user-facing message.
+ */
+function deliverErrorResult(text: string, routing: RoutingContext): void {
+  log('Error result with no <message> envelope — delivering to channel');
+  writeMessageOut({
+    id: generateId(),
+    in_reply_to: routing.inReplyTo,
+    kind: 'chat',
+    platform_id: routing.platformId,
+    channel_type: routing.channelType,
+    thread_id: routing.threadId,
+    content: JSON.stringify({ text }),
+  });
 }
 
 /**
@@ -452,7 +624,7 @@ function handleEvent(event: ProviderEvent, _routing: RoutingContext): void {
  * The agent must always wrap output in <message to="name">...</message>
  * blocks, even with a single destination. Bare text is scratchpad only.
  */
-function dispatchResultText(text: string, routing: RoutingContext): void {
+function dispatchResultText(text: string, routing: RoutingContext): { sent: number; hasUnwrapped: boolean } {
   const MESSAGE_RE = /<message\s+to="([^"]+)"\s*>([\s\S]*?)<\/message>/g;
 
   let match: RegExpExecArray | null;
@@ -487,9 +659,11 @@ function dispatchResultText(text: string, routing: RoutingContext): void {
     log(`[scratchpad] ${scratchpad.slice(0, 500)}${scratchpad.length > 500 ? '…' : ''}`);
   }
 
-  if (sent === 0 && text.trim()) {
+  const hasUnwrapped = sent === 0 && !!scratchpad;
+  if (hasUnwrapped) {
     log(`WARNING: agent output had no <message to="..."> blocks — nothing was sent`);
   }
+  return { sent, hasUnwrapped };
 }
 
 function sendToDestination(dest: DestinationEntry, body: string, routing: RoutingContext): void {
@@ -535,18 +709,6 @@ function resolveDestinationThread(
   return null;
 }
 
-function sleep(ms: number, signal?: AbortSignal): Promise<void> {
-  if (signal?.aborted) return Promise.resolve();
-
-  return new Promise((resolve) => {
-    const timeout = setTimeout(resolve, ms);
-    signal?.addEventListener(
-      'abort',
-      () => {
-        clearTimeout(timeout);
-        resolve();
-      },
-      { once: true },
-    );
-  });
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }

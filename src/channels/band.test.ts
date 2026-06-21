@@ -10,12 +10,12 @@ interface QueuedEvent {
 }
 
 const fakeLinks: FakeBandLink[] = [];
-const fakeRestClients: FakeThenvoiClient[] = [];
+const fakeRestClients: FakeBandClient[] = [];
 let fakeChats: Record<string, unknown>[] = [{ id: 'room-1', title: 'Room 1', type: 'direct' }];
 let fakeParticipants: Record<string, unknown[]> = {};
 let closeTestDb: (() => void) | null = null;
 
-class FakeThenvoiClient {
+class FakeBandClient {
   public readonly agentApiIdentity = {
     getAgentMe: vi.fn(async () => ({ data: { owner_uuid: 'owner-1' } })),
   };
@@ -90,11 +90,11 @@ class FakeBandLink implements AsyncIterable<QueuedEvent> {
 }
 
 vi.mock('@band-ai/sdk', () => ({
-  BandLink: FakeBandLink,
+  ThenvoiLink: FakeBandLink,
 }));
 
-vi.mock('@thenvoi/rest-client', () => ({
-  ThenvoiClient: FakeThenvoiClient,
+vi.mock('@band-ai/rest-client', () => ({
+  BandClient: FakeBandClient,
 }));
 
 // Isolate config resolution from the real on-disk .env. band-config.ts

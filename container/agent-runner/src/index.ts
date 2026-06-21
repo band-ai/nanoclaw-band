@@ -27,6 +27,7 @@ import { fileURLToPath } from 'url';
 
 import { loadConfig } from './config.js';
 import { buildSystemPromptAddendum } from './destinations.js';
+import { ensureMemoryScaffold } from './memory-scaffold.js';
 // Providers barrel — each enabled provider self-registers on import.
 // Provider skills append imports to providers/index.ts.
 import './providers/index.js';
@@ -109,7 +110,15 @@ async function main(): Promise<void> {
     mcpServers,
     env: { ...process.env },
     additionalDirectories: additionalDirectories.length > 0 ? additionalDirectories : undefined,
+    model: config.model,
+    effort: config.effort,
   });
+
+  // Providers that lack native memory opt in via `usesMemoryScaffold`; for them
+  // the runner creates a persistent memory/ tree in its host-backed workspace at
+  // boot (idempotent). Default off — the trunk default (Claude) omits the flag
+  // and keeps its native memory untouched.
+  if (provider.usesMemoryScaffold) ensureMemoryScaffold();
 
   // Graceful shutdown: when the host stops the container (SIGTERM from
   // `docker stop`), abort the poll loop so the in-flight query can wind

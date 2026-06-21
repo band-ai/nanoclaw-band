@@ -1,5 +1,5 @@
-import { BandLink, type PlatformEvent } from '@band-ai/sdk';
-import { ThenvoiClient } from '@thenvoi/rest-client';
+import { ThenvoiLink as BandLink, type PlatformEvent } from '@band-ai/sdk';
+import { BandClient } from '@band-ai/rest-client';
 
 import type { ChannelAdapter, ChannelSetup, ConversationInfo, OutboundMessage } from './adapter.js';
 import { normalizeOptions, type NormalizedOption } from './ask-question.js';
@@ -336,7 +336,7 @@ class BandChannelAdapter implements ChannelAdapter {
   private stopController: AbortController | null = null;
   private eventLoop: Promise<void> | null = null;
   private readonly link: BandLink;
-  private readonly restClient: ThenvoiClient;
+  private readonly restClient: BandClient;
   private ownerMention: { id: string; name?: string } | null = null;
   private hubRoomInitPromise: Promise<string | null> | null = null;
   private readonly contactDedup = new Set<string>();
@@ -356,7 +356,7 @@ class BandChannelAdapter implements ChannelAdapter {
       restUrl,
       capabilities: { contacts: config.contactStrategy !== 'disabled' },
     });
-    this.restClient = new ThenvoiClient({ apiKey: config.apiKey, baseUrl: restUrl });
+    this.restClient = new BandClient({ apiKey: config.apiKey, baseUrl: restUrl });
   }
 
   public async setup(config: ChannelSetup): Promise<void> {

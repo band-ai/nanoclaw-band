@@ -11,7 +11,7 @@ Run `/update-nanoclaw` in Claude Code.
 
 ## How it works
 
-**Preflight**: checks for clean working tree (`git status --porcelain`). If `upstream` remote is missing, asks you for the URL (defaults to `https://github.com/qwibitai/nanoclaw.git`) and adds it. Detects the upstream branch name (`main` or `master`).
+**Preflight**: checks for clean working tree (`git status --porcelain`). If `upstream` remote is missing, asks you for the URL (defaults to `https://github.com/nanocoai/nanoclaw.git`) and adds it. Detects the upstream branch name (`main` or `master`).
 
 **Backup**: creates a timestamped backup branch and tag (`backup/pre-update-<hash>-<timestamp>`, `pre-update-<hash>-<timestamp>`) before touching anything. Safe to run multiple times.
 
@@ -60,16 +60,25 @@ Help a user with a customized NanoClaw install safely incorporate upstream chang
 - Default to MERGE (one-pass conflict resolution). Offer REBASE as an explicit option.
 - Keep token usage low: rely on `git status`, `git log`, `git diff`, and open only conflicted files.
 
+# Step 0a: Refresh this skill first
+The update process itself evolves, so run its newest version before doing anything else:
+- Ensure the `upstream` remote exists (default `https://github.com/nanocoai/nanoclaw.git`) and fetch: `git fetch upstream --prune`. Detect the upstream branch (`main` or `master`).
+- Refresh this skill from upstream: `git checkout upstream/<branch> -- .claude/skills/update-nanoclaw/`
+- Re-read `.claude/skills/update-nanoclaw/SKILL.md`. If it changed, **follow the updated version from the top** instead of this one.
+
+This is the only working-tree change expected before the preflight check; the full update commits it along with everything else.
+
 # Step 0: Preflight (stop early if unsafe)
 Run:
 - `git status --porcelain`
 If output is non-empty:
 - Tell the user to commit or stash first, then stop.
+- Exception: changes limited to `.claude/skills/update-nanoclaw/` are the Step 0a self-refresh — ignore those and proceed.
 
 Confirm remotes:
 - `git remote -v`
 If `upstream` is missing:
-- Ask the user for the upstream repo URL (default: `https://github.com/qwibitai/nanoclaw.git`).
+- Ask the user for the upstream repo URL (default: `https://github.com/nanocoai/nanoclaw.git`).
 - Add it: `git remote add upstream <user-provided-url>`
 - Then: `git fetch upstream --prune`
 
@@ -112,6 +121,7 @@ Bucket the upstream changed files:
 - **Host source** (`src/`): may conflict if user modified the same files
 - **Container** (`container/`): triggers container rebuild (+ typecheck if `agent-runner/src/` changed)
 - **Build/config** (`package.json`, `pnpm-lock.yaml`, `tsconfig*.json`): lockfile changes trigger dep install
+- **Version pins** (`versions.json`): a changed `onecli-gateway` / `onecli-cli` value requires upgrading the OneCLI gateway/CLI to match — see Step 5.5
 - **Other**: docs, tests, setup scripts, misc
 
 **Large drift check:** If the upstream commit count and age suggest the user has a lot of catching up to do, mention that `/migrate-nanoclaw` might be a better fit — it extracts customizations and reapplies them on clean upstream instead of merging. Offer it as an option but don't push.
@@ -206,6 +216,11 @@ If build fails:
 - Do not refactor unrelated code.
 - If unclear, ask the user before making changes.
 
+# Step 5.5: OneCLI upgrade (if pins moved)
+The OneCLI gateway and CLI are external components pinned in `versions.json`; when a pin moves, the running version must be upgraded to match or the new code may fail against it.
+
+If `git diff <backup-tag-from-step-1>..HEAD -- versions.json` shows the `onecli-gateway` or `onecli-cli` value changed, follow `docs/onecli-upgrades.md` before the service restart (Step 8). Otherwise skip.
+
 # Step 6: Breaking changes check
 After validation succeeds, check if the update introduced any breaking changes.
 
@@ -256,6 +271,16 @@ If any channels/providers are installed AND `upstream/channels` or `upstream/pro
 
 If no channels/providers are installed, skip silently.
 
+Proceed to Step 7.9.
+
+# Step 7.9: Stamp the upgrade marker (required)
+After validation has **succeeded**, record that this install reached the new version through the supported path. Without this, the startup tripwire stops the host on its next start.
+
+- `pnpm exec tsx scripts/upgrade-state.ts set "" update-nanoclaw`
+  - The empty version argument stamps the current `package.json` version.
+
+If validation did NOT succeed, do not stamp — leave the tripwire to catch the broken state.
+
 Proceed to Step 8.
 
 # Step 8: Summary + rollback instructions
@@ -270,9 +295,9 @@ Show:
 Tell the user:
 - To rollback: `git reset --hard <backup-tag-from-step-1>`
 - Backup branch also exists: `backup/pre-update-<HASH>-<TIMESTAMP>`
-- Restart the service to apply changes. Detect platform with `uname -s`:
-  - **macOS (Darwin)**: `launchctl kickstart -k gui/$(id -u)/com.nanoclaw`
-  - **Linux**: detect the service name with `systemctl --user list-units --type=service | grep nanoclaw | awk '{print $1}'`, then `systemctl --user restart <detected-name>`
+- Restart the service to apply changes. The unit/label names are per-install — derive them with `setup/lib/install-slug.sh`. Run from your NanoClaw project root:
+  - **macOS (Darwin)**: `source setup/lib/install-slug.sh && launchctl kickstart -k gui/$(id -u)/$(launchd_label)`
+  - **Linux**: `source setup/lib/install-slug.sh && systemctl --user restart $(systemd_unit)` (or, if you want to confirm the unit name first: `systemctl --user list-units --type=service | grep "$(. setup/lib/install-slug.sh && systemd_unit)"`)
   - **Manual** (no service found): restart `pnpm run dev`
 
 

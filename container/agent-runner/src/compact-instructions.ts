@@ -26,9 +26,9 @@ const instructions = [
   '2. Preserve the chronological message/reply sequence of recent exchanges.',
   '   The agent needs to see: who said what, in what order, and from which destination.',
   '',
-  '3. The `from` attribute identifies which destination sent the message.',
-  '   The agent MUST wrap all responses in <message to="name">...</message> blocks.',
-  `   Available destinations: ${names.length > 0 ? names.map((n) => `\`${n}\``).join(', ') : '(none)'}`,
+  '3. At the END of the compaction summary, include this verbatim reminder:',
+  '   "You MUST wrap all responses in <message to="name">...</message> blocks.',
+  `   Available destinations: ${names.length > 0 ? names.map((n) => `\`${n}\``).join(', ') : '(none)'}."`,
 ];
 
 console.log(instructions.join('\n'));

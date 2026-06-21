@@ -43,8 +43,8 @@ export async function loadParticipantMemories(): Promise<string> {
   }
 
   try {
-    const { ThenvoiLink } = await import('@thenvoi/sdk');
-    const { AgentTools } = await import('@thenvoi/sdk/runtime');
+    const { ThenvoiLink } = await import('@band-ai/sdk');
+    const { AgentTools } = await import('@band-ai/sdk/runtime');
 
     const link = new ThenvoiLink({
       agentId,

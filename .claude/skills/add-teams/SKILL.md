@@ -16,6 +16,7 @@ NanoClaw doesn't ship channels in trunk. This skill copies the Teams adapter in 
 Skip to **Credentials** if all of these are already in place:
 
 - `src/channels/teams.ts` exists
+- `src/channels/teams-registration.test.ts` exists
 - `src/channels/index.ts` contains `import './teams.js';`
 - `@chat-adapter/teams` is listed in `package.json` dependencies
 
@@ -27,10 +28,11 @@ Otherwise continue. Every step below is safe to re-run.
 git fetch origin channels
 ```
 
-### 2. Copy the adapter
+### 2. Copy the adapter and its registration test
 
 ```bash
-git show origin/channels:src/channels/teams.ts > src/channels/teams.ts
+git show origin/channels:src/channels/teams.ts                 > src/channels/teams.ts
+git show origin/channels:src/channels/teams-registration.test.ts > src/channels/teams-registration.test.ts
 ```
 
 ### 3. Append the self-registration import
@@ -47,13 +49,59 @@ import './teams.js';
 pnpm install @chat-adapter/teams@4.27.0
 ```
 
-### 5. Build
+### 5. Build and validate
 
 ```bash
 pnpm run build
+pnpm exec vitest run src/channels/teams-registration.test.ts
 ```
 
+Both must be clean before proceeding. `teams-registration.test.ts` is the one integration test: it imports the real channel barrel and asserts the registry contains `teams`. It goes red if the `import './teams.js';` line is deleted or drifts, if the barrel fails to evaluate, or if `@chat-adapter/teams` isn't installed (the import throws) — so it also implicitly verifies the dependency from step 4. The adapter also calls core's `createChatSdkBridge(...)`; that typed core-API consumption is guarded by `pnpm run build`.
+
+End-to-end message delivery against a real Teams workspace is verified manually once the service is running — see Next Steps and the webhook setup above.
+
 ## Credentials
+
+Two paths — manual (Azure Portal) or auto (Teams CLI).
+
+### Auto: Teams CLI
+
+Requires Node.js 18+, a Microsoft 365 account with sideloading permissions, and a public HTTPS endpoint (ngrok, Cloudflare Tunnel, or similar).
+
+1. Install the CLI:
+
+   ```bash
+   npm install -g @microsoft/teams.cli@preview
+   ```
+
+2. Sign in and verify:
+
+   ```bash
+   teams login
+   teams status
+   ```
+
+3. Create the Entra app, client secret, and bot registration:
+
+   ```bash
+   teams app create \
+     --name "NanoClaw" \
+     --endpoint "https://your-domain/api/webhooks/teams"
+   ```
+
+   The CLI prints the credentials as `CLIENT_ID`, `CLIENT_SECRET`, and `TENANT_ID`. Map them to NanoClaw's env keys:
+
+   - `CLIENT_ID` → `TEAMS_APP_ID`
+   - `CLIENT_SECRET` → `TEAMS_APP_PASSWORD`
+   - `TENANT_ID` → `TEAMS_APP_TENANT_ID`
+
+4. Pick **Install in Teams** from the post-create menu and confirm in the Teams dialog.
+
+Continue to [Configure environment](#configure-environment).
+
+---
+
+The steps below describe the **manual Azure Portal path**.
 
 ### Step 1: Create an Azure AD App Registration
 

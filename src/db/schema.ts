@@ -7,8 +7,7 @@
 export const SCHEMA = `
 -- Agent workspaces: folder, skills, CLAUDE.md.
 -- All workspaces are equal; privilege lives on users, not groups.
--- Container config (mcpServers, packages, imageTag, additionalMounts) lives
--- in groups/<folder>/container.json on disk, not in the DB.
+-- Container config lives in the container_configs table (see migration 014).
 CREATE TABLE agent_groups (
   id               TEXT PRIMARY KEY,
   name             TEXT NOT NULL,
@@ -23,16 +22,21 @@ CREATE TABLE agent_groups (
 -- only matters if something inserts without specifying the field, which no
 -- current callsite does. Router auto-create hardcodes "request_approval"
 -- (see src/router.ts:151); setup scripts pick per context.
+-- instance = adapter-instance name; the default instance IS the channel
+-- type (migration 016 backfill), so single-instance installs never see it.
+-- Inbound lookups are exact-on-instance; outbound lookups default-first.
 CREATE TABLE messaging_groups (
   id                    TEXT PRIMARY KEY,
   channel_type          TEXT NOT NULL,
   platform_id           TEXT NOT NULL,
+  instance              TEXT NOT NULL,
   name                  TEXT,
   is_group              INTEGER DEFAULT 0,
   unknown_sender_policy TEXT NOT NULL DEFAULT 'strict',
                         -- 'strict' | 'request_approval' | 'public'
   created_at            TEXT NOT NULL,
-  UNIQUE(channel_type, platform_id)
+  denied_at             TEXT,
+  UNIQUE(channel_type, platform_id, instance)
 );
 
 -- Which agent groups handle which messaging groups.
@@ -221,7 +225,10 @@ CREATE TABLE IF NOT EXISTS messages_in (
   -- the reply routes back to this exact session, not to the source agent
   -- group's "newest" session. NULL on channel-side inbound and on a2a rows
   -- written before this column existed.
-  source_session_id TEXT
+  source_session_id TEXT,
+  on_wake        INTEGER NOT NULL DEFAULT 0
+               -- 1 = only deliver on the container's first poll (fresh start).
+               -- Dying containers (past first poll) skip these rows.
 );
 CREATE INDEX IF NOT EXISTS idx_messages_in_series ON messages_in(series_id);
 

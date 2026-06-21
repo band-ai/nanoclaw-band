@@ -1,7 +1,7 @@
-import { ThenvoiLink } from '@thenvoi/sdk';
-import { AgentTools } from '@thenvoi/sdk/runtime';
+import { ThenvoiLink } from '@band-ai/sdk';
+import { AgentTools } from '@band-ai/sdk/runtime';
 import type { CallToolResult, Tool } from '@modelcontextprotocol/sdk/types.js';
-import type { AgentToolsProtocol } from '@thenvoi/sdk';
+import type { AgentToolsProtocol } from '@band-ai/sdk';
 
 import { registerTools } from './server.js';
 import type { McpToolDefinition } from './types.js';

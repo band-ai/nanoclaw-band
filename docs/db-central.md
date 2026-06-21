@@ -10,7 +10,7 @@ Access layer: `src/db/`. Authoritative schema reference: `src/db/schema.ts` (com
 
 ### 1.1 `agent_groups`
 
-Agent workspaces. Each maps 1:1 to a `groups/<folder>/` directory containing `CLAUDE.md`, skills, and `container.json`. Container config lives on disk, not in the DB.
+Agent workspaces. Each maps 1:1 to a `groups/<folder>/` directory containing `CLAUDE.md` and skills. Container config lives in `container_configs` (see §1.x below); a `container.json` file is materialized at spawn time for the container runner to read.
 
 ```sql
 CREATE TABLE agent_groups (
@@ -27,21 +27,24 @@ CREATE TABLE agent_groups (
 
 ### 1.2 `messaging_groups`
 
-One row per platform chat (one WhatsApp group, one Slack channel, one 1:1 DM, etc.).
+One row per platform chat (one WhatsApp group, one Slack channel, one 1:1 DM, etc.) per adapter instance.
 
 ```sql
 CREATE TABLE messaging_groups (
   id                    TEXT PRIMARY KEY,
   channel_type          TEXT NOT NULL,
   platform_id           TEXT NOT NULL,
+  instance              TEXT NOT NULL,
   name                  TEXT,
   is_group              INTEGER DEFAULT 0,
   unknown_sender_policy TEXT NOT NULL DEFAULT 'strict',
   created_at            TEXT NOT NULL,
-  UNIQUE(channel_type, platform_id)
+  denied_at             TEXT,
+  UNIQUE(channel_type, platform_id, instance)
 );
 ```
 
+- `instance`: adapter-instance name — N adapters of one platform (e.g. three Slack apps in one workspace) each own their rows. The default instance IS the channel type: migration 016 backfills `instance = channel_type` and `createMessagingGroup` stamps the same default, so single-instance installs never see the dimension. Inbound lookups are exact-on-instance (an unknown named instance auto-creates its own row); outbound lookups resolve default-instance-first.
 - `unknown_sender_policy`: `strict` (drop), `request_approval` (ask admin), `public` (allow).
 - **Readers:** `src/router.ts`, `src/delivery.ts`, `src/session-manager.ts`
 - **Writers:** `src/db/messaging-groups.ts`, channel setup flows
@@ -134,7 +137,7 @@ CREATE TABLE user_dms (
 );
 ```
 
-Populated lazily by `ensureUserDm()` in `src/user-dm.ts`.
+Populated lazily by `ensureUserDm()` in `src/user-dm.ts`. Cold DMs resolve via the channel's default adapter instance — `PRIMARY KEY (user_id, channel_type)` is per-platform, not per-instance.
 
 ### 1.8 `sessions`
 
@@ -294,6 +297,32 @@ CREATE TABLE schema_version (
 );
 ```
 
+### 1.15 `container_configs`
+
+Per-agent-group container runtime config. Source of truth for provider, model, packages, MCP servers, mounts, CLI scope, etc. Materialized to `groups/<folder>/container.json` at spawn time.
+
+```sql
+CREATE TABLE container_configs (
+  agent_group_id         TEXT PRIMARY KEY REFERENCES agent_groups(id) ON DELETE CASCADE,
+  provider               TEXT,
+  model                  TEXT,
+  effort                 TEXT,
+  image_tag              TEXT,
+  assistant_name         TEXT,
+  max_messages_per_prompt INTEGER,
+  skills                 TEXT NOT NULL DEFAULT '"all"',
+  mcp_servers            TEXT NOT NULL DEFAULT '{}',
+  packages_apt           TEXT NOT NULL DEFAULT '[]',
+  packages_npm           TEXT NOT NULL DEFAULT '[]',
+  additional_mounts      TEXT NOT NULL DEFAULT '[]',
+  cli_scope              TEXT NOT NULL DEFAULT 'group',   -- disabled | group | global
+  updated_at             TEXT NOT NULL
+);
+```
+
+- **Readers:** `src/container-config.ts`, `src/container-runner.ts`, `src/cli/dispatch.ts` (scope enforcement), `src/claude-md-compose.ts`
+- **Writers:** `src/db/container-configs.ts`, `src/modules/self-mod/apply.ts`, `src/backfill-container-configs.ts`
+
 ---
 
 ## 2. Migration system
@@ -313,6 +342,8 @@ Migrations live in `src/db/migrations/`, one file per migration. Runner: `runMig
 | 007 | `007-pending-approvals-title-options.ts` | `ALTER TABLE pending_approvals` add `title`, `options_json` (retrofits DBs created between 003 and 007) |
 | 008 | `008-dropped-messages.ts` | `unregistered_senders` |
 | 009 | `009-drop-pending-credentials.ts` | Drop the defunct `pending_credentials` table |
+| 014 | `014-container-configs.ts` | `container_configs` — per-agent-group container runtime config |
+| 015 | `015-cli-scope.ts` | `ALTER TABLE container_configs ADD COLUMN cli_scope` |
 
 Numbers 005 and 006 are intentionally absent — migrations were renumbered during early development.
 

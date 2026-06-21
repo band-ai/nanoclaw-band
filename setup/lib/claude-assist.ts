@@ -27,6 +27,7 @@ import path from 'path';
 import * as p from '@clack/prompts';
 import k from 'kleur';
 
+import { extractClaudeOAuthToken } from './captured-token.js';
 import { ensureAnswer } from './runner.js';
 import { brandBody, fitToWidth, fmtDuration, note } from './theme.js';
 
@@ -43,7 +44,7 @@ export interface AssistContext {
  * rather than us stuffing contents into the prompt. Keys are step names as
  * they appear in fail() calls; values are repo-relative paths.
  */
-const STEP_FILES: Record<string, string[]> = {
+export const STEP_FILES: Record<string, string[]> = {
   bootstrap: ['setup.sh', 'setup/install-node.sh', 'nanoclaw.sh'],
   environment: ['setup/environment.ts'],
   container: [
@@ -81,7 +82,7 @@ const STEP_FILES: Record<string, string[]> = {
   ],
 };
 
-const BIG_PICTURE_FILES = ['README.md', 'setup/auto.ts'];
+export const BIG_PICTURE_FILES = ['README.md', 'setup/auto.ts'];
 
 /**
  * Returns `true` if the user ran a Claude-suggested fix command; callers
@@ -150,7 +151,7 @@ function isClaudeAuthenticated(): boolean {
   }
 }
 
-async function ensureClaudeReady(projectRoot: string): Promise<boolean> {
+export async function ensureClaudeReady(projectRoot: string): Promise<boolean> {
   if (!isClaudeInstalled()) {
     const install = ensureAnswer(
       await p.confirm({
@@ -207,16 +208,11 @@ async function ensureClaudeReady(projectRoot: string): Promise<boolean> {
       });
 
       if (!isClaudeAuthenticated() && fs.existsSync(tmpfile)) {
-        const raw = fs.readFileSync(tmpfile, 'utf-8');
-        const stripped = raw
-          .replace(/\x1b\[[0-9;]*[a-zA-Z]/g, '')
-          .replace(/[\n\r]/g, '');
-        const matches = stripped.match(/(sk-ant-oat[A-Za-z0-9_-]{80,500}AA)/g);
-        if (matches) {
-          process.env.CLAUDE_CODE_OAUTH_TOKEN = matches[matches.length - 1];
-        }
+        const token = extractClaudeOAuthToken(fs.readFileSync(tmpfile, 'utf-8'));
+        if (token) process.env.CLAUDE_CODE_OAUTH_TOKEN = token;
       }
     } finally {
+      // eslint-disable-next-line no-empty -- best-effort temp cleanup
       try { fs.unlinkSync(tmpfile); } catch {}
     }
 

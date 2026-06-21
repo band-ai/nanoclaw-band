@@ -2,12 +2,57 @@
 
 All notable changes to NanoClaw will be documented in this file.
 
-For detailed release notes, see the [full changelog on the documentation site](https://docs.nanoclaw.dev/changelog).
-
 ## [Unreleased]
 
+- **Budget/billing-exhausted LLM turns now reach the user instead of being silently dropped.** When a turn ends in a non-retryable provider error (e.g. an Anthropic `403 billing_error`) with no `<message>` wrapping, the agent-runner delivers the provider's notice to the originating channel and stops re-nudging the failing gateway. `providers/claude.ts` now surfaces the SDK's `is_error` flag (and the error subtype's `errors[]` text); `poll-loop.ts` delivers that text and skips the re-wrap retry. Fixes the case where a spend-limit notice produced silence plus a turn-after-turn retry loop.
+- [BREAKING] **`@onecli-sh/sdk` 0.5.0 -> 2.2.1 — requires a OneCLI server with the `/v1` API** (older servers 404 every SDK call). The sanctioned gateway and CLI versions are pinned in `versions.json`. **The gateway is a separate component — updating NanoClaw does not upgrade it for you:** `/update-nanoclaw` upgrades it when the pin moves, otherwise upgrade manually. **Migration:** [docs/onecli-upgrades.md](docs/onecli-upgrades.md).
+- **New agent provider: Codex (OpenAI) — run `/add-codex`.** Full runtime via `codex app-server` (planning, MCP tools, server-side history, resume). Trunk ships the seams and the skill; the payload installs from the `providers` branch (the skill, the setup picker, or `--step provider-auth codex`). Auth is vault-only — no credential ever enters a container.
+- **Setup can now select, install, and authenticate a non-default agent provider.** A provider registry feeds the setup picker, an installer pulls the provider's payload from its branch, a vault auth walkthrough runs (`--step provider-auth`), and the picked provider is set on the first agent (a DB property) before its first spawn. Default (Claude) installs are unaffected — picking Claude changes nothing.
+- **Provider choice is explicit per group — no install-wide default.** Provider is a DB property set via `ncl groups config update --provider` + restart; creation is provider-agnostic.
+- **Memory migrates via `/migrate-memory`, never at runtime.** Each provider keeps its own store; fresh groups on a surfaces-owning provider see no stale `CLAUDE.*` files. See [docs/provider-migration.md](docs/provider-migration.md).
+- **Per-exchange archiving is provider-owned** — the `onExchangeComplete` hook; the markdown writer ships with the codex payload.
+- **Container boot failures now say why** — the last stderr lines are logged at `warn` on a non-zero exit instead of a silent crash loop.
+- **Slash commands now interrupt an in-flight turn.** A runner-handled command (`/clear`, `/compact`, `/cost`, …) arriving mid-turn aborts the active stream and runs immediately instead of waiting out the turn.
+
+## [2.1.0] - 2026-06-07
+
+- [BREAKING] **Startup now requires an upgrade marker.** The host refuses to boot unless `data/upgrade-state.json` records that this install reached the current version through a sanctioned path (`/setup`, `/update-nanoclaw`, `/migrate-nanoclaw`). After this update completes — and before restarting the service — stamp the marker by running `pnpm exec tsx scripts/upgrade-state.ts set`. If the host has already tripped on restart with "update did not go through the supported path", that same command clears it. See [docs/upgrade-recovery.md](docs/upgrade-recovery.md).
+
+## [2.0.64] - 2026-05-18
+
+- **`ncl destinations add` and `remove` through the approval flow now reach the receiver immediately.** Approved destinations weren't being projected into the receiving agent's local session state, so a freshly-added destination silently failed at `send_message` with `unknown destination`, and a removed destination stayed resolvable until the next container restart. Both now take effect the moment the approval executes. Direct (non-approval) calls were unaffected.
+
+## [2.0.63] - 2026-05-15
+
+Rollup release covering v2.0.55 through v2.0.63 — everything merged since the v2.0.54 tag. Starting with this release, the goal is to publish a GitHub Release for every `package.json` version bump that lands on `main`; see [RELEASING.md](RELEASING.md).
+
+- [BREAKING] **Service names are now per-install.** On v2 installs the launchd label and systemd unit are slugged to your project root: `com.nanoclaw.<sha1(projectRoot)[:8]>` and `nanoclaw-<slug>.service`. The old `com.nanoclaw` / `nanoclaw.service` names no longer match a real service — update any copy-pasted restart or status commands. Find your install's names with `source setup/lib/install-slug.sh && launchd_label` (macOS) or `systemd_unit` (Linux). The `ncl` transport-error help text and 26 skill files now use the canonical helper-driven pattern; see [setup/lib/install-slug.sh](setup/lib/install-slug.sh).
+- **Compaction destination reminder placement fixed.** The reminder injected after SDK auto-compaction now appears at the end of the compaction summary so it isn't stripped during truncation. Replaces the placement shipped in v2.0.54.
+- **Stronger message-wrapping enforcement.** The poll loop nudges the agent when its output lacks `<message>` wrapping, and `CLAUDE.md` core instructions now require wrapping even for single-destination agents. The welcome flow no longer double-greets.
+- **OneCLI credentials after MCP install.** MCP servers added through `add_mcp_server` now inherit OneCLI gateway routing — fixes the case where the agent kept asking for API keys after installing a new server.
+- **CLI scope hardening.** `scopeField` now fails closed when scope is missing, and `sessions get` is guarded against cross-group oracle access from group-scoped agents.
+- **gmail/gcal skills aligned with v2.** `/add-gmail-tool` and `/add-gcal-tool` now reflect the v2 container-config model — DB-backed mounts, no dead `TOOL_ALLOWLIST` edits, no `container.json` writes that get clobbered on next spawn. Manual sqlite3/JSON1 invocations corrected.
+- **Repo-rename cleanup.** Remaining `qwibitai/nanoclaw` references swept to `nanocoai/nanoclaw` across code and docs; CI workflow guards updated so they no longer no-op after the rename.
+- Slack scope checklist now includes `files:read` and `files:write` for skills that read or post attachments.
+- The internal-tag description in destination instructions no longer mentions scratchpads (which confused agents into routing them incorrectly).
+- Container startup is now graceful when the `on_wake` column is missing on older sessions DBs.
+
+## [2.0.54] - 2026-05-10
+
+- **Per-group model and effort overrides.** Agent groups can now run a specific Claude model and effort level, set via `ncl groups config update --model <model> --effort <level>`. Defaults to the host-configured model when unset.
+- **Claude Code 2.1.128.** Container claude-code bumped from 2.1.116 to 2.1.128.
+- CLI help text improvements for `ncl groups config` and `ncl groups restart`.
+
+## [2.0.48] - 2026-05-09
+
+- **Container config moved to DB.** Per-agent-group container runtime config (provider, model, packages, MCP servers, mounts, skills) now lives in the `container_configs` table instead of `groups/<folder>/container.json`. Existing filesystem configs are backfilled automatically on startup. Managed via `ncl groups config get/update` and `config add-mcp-server/remove-mcp-server/add-package/remove-package`.
+- **Explicit restart with on-wake messages.** Config CLI operations no longer auto-kill containers. New `ncl groups restart` command with `--rebuild` and `--message` flags. On-wake messages (`on_wake` column on `messages_in`) are only picked up by a fresh container's first poll, preventing dying containers from stealing them during the SIGTERM grace period. Self-mod approval handlers (`install_packages`, `add_mcp_server`) use the same race-free mechanism.
+- **Per-group CLI scope.** New `cli_scope` setting on container config (`disabled` / `group` / `global`, default `group`). Controls what the agent can access via `ncl` from inside the container. `disabled` excludes CLI instructions from CLAUDE.md and blocks all requests. `group` (default) restricts to own-group resources with auto-filled args. `global` gives unrestricted access (set automatically for owner agent groups). Includes post-handler result filtering to prevent cross-group data leaks and blocks `cli_scope` escalation from group-scoped agents.
+
+## [2.0.45] - 2026-05-08
+
+- **Admin CLI (`ncl`).** New `ncl` command for querying and modifying the central DB — agent groups, messaging groups, wirings, users, roles, members, destinations, sessions, approvals, and dropped messages. Host-side transport via Unix socket; container-side transport via session DB. Write operations from inside containers go through the approval flow. `list` supports column filtering and `--limit`. Run `ncl help` for usage.
 - **v1 → v2 migration.** Run `bash migrate-v2.sh` from the v2 checkout. Finds your v1 install (sibling directory or `NANOCLAW_V1_PATH`), merges `.env`, seeds the v2 DB from `registered_groups`, copies group folders (`CLAUDE.md` → `CLAUDE.local.md`), copies session data with conversation continuity, ports scheduled tasks, interactively selects and installs channels (clack multiselect), copies container skills, builds the agent container, and offers a service switchover to test. Hands off to Claude (`/migrate-from-v1`) for owner seeding, access policy, CLAUDE.md cleanup, and fork customization porting. See [docs/migration-dev.md](docs/migration-dev.md) and [docs/v1-to-v2-changes.md](docs/v1-to-v2-changes.md).
-- **Migration fixes.** `1b-db` now resolves Discord DMs as `discord:@me:<id>` (previously skipped any v1 chat that wasn't a guild channel — a blocker for personal-bot installs). `1c-groups` skips symlinks instead of following them (a single broken `.claude-shared.md → /app/CLAUDE.md` no longer aborts the whole copy). When `1b-db` reuses an auto-created `messaging_group` with no wired agents, its `unknown_sender_policy` is now reconciled to the migration's `public` default.
 
 ## [2.0.0] - 2026-04-22
 
