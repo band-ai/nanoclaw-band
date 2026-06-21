@@ -1,7 +1,7 @@
 import { ThenvoiLink as BandLink, type PlatformEvent } from '@band-ai/sdk';
 import { BandClient } from '@band-ai/rest-client';
 
-import type { ChannelAdapter, ChannelSetup, ConversationInfo, OutboundMessage } from './adapter.js';
+import type { ChannelAdapter, ChannelSetup, ConversationInfo, InboundRouteResult, OutboundMessage } from './adapter.js';
 import { normalizeOptions, type NormalizedOption } from './ask-question.js';
 import { registerChannelContainerConfig, registerAgentContainerConfig } from './channel-container-registry.js';
 import { registerChannelAdapter } from './channel-registry.js';
@@ -16,7 +16,10 @@ import {
   createMessagingGroupAgent,
   getMessagingGroupAgentByPair,
 } from '../db/messaging-groups.js';
-import { closeActiveSessionsForMessagingGroup } from '../db/sessions.js';
+import { closeActiveSessionsForMessagingGroup, getSession } from '../db/sessions.js';
+import { writeSessionMessage } from '../session-manager.js';
+import { wakeContainer } from '../container-runner.js';
+import { registerDeliveryAction } from '../delivery.js';
 import { getModuleState, setModuleState, deleteModuleState } from '../db/module-state.js';
 import { log } from '../log.js';
 import { getBandConfig, type BandConfig } from '../modules/band-config.js';
@@ -59,6 +62,15 @@ interface BandMainRoomState {
 interface BandHubRoomState {
   roomId: string;
   platformId: string;
+  createdAt: string;
+}
+
+/** Records the session that opened a Band room via band_create_chatroom, so a
+ *  peer's later reply in that room can be relayed back to the originating
+ *  conversation (e.g. the Telegram chat) instead of a separate per-room session. */
+interface BandRoomOriginState {
+  sessionId: string;
+  agentGroupId: string;
   createdAt: string;
 }
 
@@ -187,6 +199,27 @@ function setHubRoom(roomId: string): void {
     createdAt: now(),
   } satisfies BandHubRoomState);
 }
+
+function roomOriginStateKey(roomId: string): string {
+  return `origin:${roomId}`;
+}
+
+function getBandRoomOrigin(roomId: string): BandRoomOriginState | undefined {
+  return getModuleState<BandRoomOriginState>(BAND_MODULE_NAME, roomOriginStateKey(roomId));
+}
+
+// Delivery action emitted by the container when the agent opens a room via
+// band_create_chatroom: record which session created it for the relay path.
+registerDeliveryAction('band_room_origin', async (content, session) => {
+  const roomId = typeof content.roomId === 'string' ? content.roomId : null;
+  if (!roomId) return;
+  setModuleState(BAND_MODULE_NAME, roomOriginStateKey(roomId), {
+    sessionId: session.id,
+    agentGroupId: session.agent_group_id,
+    createdAt: now(),
+  } satisfies BandRoomOriginState);
+  log.info('Band.ai room origin recorded', { roomId, sessionId: session.id });
+});
 
 function ensureHubMessagingGroup(roomId: string, agentGroupId: string | null): void {
   const platformId = formatBandPlatformId(roomId);
@@ -916,13 +949,19 @@ class BandChannelAdapter implements ChannelAdapter {
       metadata: payload.metadata ?? undefined,
     };
 
-    const result = await this.setupConfig.onInbound(platformId, null, {
-      id: payload.id,
-      kind: 'chat',
-      content,
-      timestamp: payload.inserted_at,
-      isMention: metadataMentionsAgent(payload.metadata, this.config.agentId),
-    });
+    // If this room was opened by the agent on behalf of another conversation
+    // (e.g. from Telegram), relay the reply back to that originating session
+    // instead of spawning an isolated per-room session.
+    const origin = getBandRoomOrigin(resolvedRoomId);
+    const result = origin
+      ? await this.relayToOrigin(origin, resolvedRoomId, content, payload)
+      : await this.setupConfig.onInbound(platformId, null, {
+          id: payload.id,
+          kind: 'chat',
+          content,
+          timestamp: payload.inserted_at,
+          isMention: metadataMentionsAgent(payload.metadata, this.config.agentId),
+        });
 
     // Forward progress is mandatory: the inbox drain is a FIFO cursor that
     // only advances when the head message is marked processed. The one
@@ -947,6 +986,59 @@ class BandChannelAdapter implements ChannelAdapter {
         platformMessageId: payload.id,
       });
     }
+  }
+
+  /**
+   * Relay a peer's message in an agent-opened room back to the session that
+   * opened it, so the originating conversation (e.g. Telegram) hears the reply
+   * instead of it landing in an isolated per-room session. Falls back to normal
+   * per-room routing if the origin session is gone.
+   */
+  private async relayToOrigin(
+    origin: BandRoomOriginState,
+    roomId: string,
+    content: BandMessageContent,
+    payload: { id: string; inserted_at: string; metadata?: Record<string, unknown> | null },
+  ): Promise<InboundRouteResult> {
+    const platformId = formatBandPlatformId(roomId);
+    const session = getSession(origin.sessionId);
+    if (!session || session.status === 'closed') {
+      const fallback = await this.setupConfig!.onInbound(platformId, null, {
+        id: payload.id,
+        kind: 'chat',
+        content,
+        timestamp: payload.inserted_at,
+        isMention: metadataMentionsAgent(payload.metadata, this.config.agentId),
+      });
+      return fallback ?? { status: 'persisted', platformMessageId: payload.id, sessionIds: [], sessionMessageIds: [] };
+    }
+
+    const who = content.senderName ?? content.sender;
+    const relayId = `band-relay-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    writeSessionMessage(session.agent_group_id, session.id, {
+      id: relayId,
+      kind: 'chat',
+      timestamp: payload.inserted_at,
+      platformId,
+      channelType: BAND_CHANNEL_TYPE,
+      threadId: null,
+      content: JSON.stringify({
+        text: `[Reply in the Band room you opened] ${who}: ${content.text}`,
+        sender: who,
+        senderId: content.senderId,
+        senderName: content.senderName ?? null,
+        roomId,
+      }),
+    });
+    void wakeContainer(session).catch((err) =>
+      log.error('Band.ai relay wake failed', { sessionId: session.id, err }),
+    );
+    log.info('Band.ai relayed room reply to origin session', {
+      roomId,
+      sessionId: session.id,
+      senderId: content.senderId,
+    });
+    return { status: 'persisted', platformMessageId: payload.id, sessionIds: [session.id], sessionMessageIds: [relayId] };
   }
 
   /**

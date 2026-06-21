@@ -5,6 +5,7 @@ import type { AgentToolsProtocol } from '@band-ai/sdk';
 
 import { registerTools } from './server.js';
 import type { McpToolDefinition } from './types.js';
+import { writeMessageOut } from '../db/messages-out.js';
 
 const BAND_TOOL_REGISTRY = [
   { sdkName: 'thenvoi_send_message', bandName: 'band_send_message' },
@@ -308,6 +309,17 @@ function buildBandToolDefinitions(): McpToolDefinition[] {
             memoryDisabledForRun = true;
             return memoryDisabledResult(sdkToolName);
           }
+          // Record provenance: a room created from this session should relay its
+          // future messages back here, so the host can route a peer's reply to
+          // the originating conversation (e.g. the Telegram chat). createChatroom
+          // returns the new room id as a string.
+          if (sdkToolName === 'thenvoi_create_chatroom' && typeof result === 'string' && result) {
+            writeMessageOut({
+              id: `band-origin-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+              kind: 'system',
+              content: JSON.stringify({ action: 'band_room_origin', roomId: result }),
+            });
+          }
           return formatToolResult(result);
         },
       },
@@ -315,70 +327,6 @@ function buildBandToolDefinitions(): McpToolDefinition[] {
   });
 }
 
-interface PlatformMessageRecord {
-  content?: string;
-  sender_name?: string;
-  senderName?: string;
-  sender_type?: string;
-  senderType?: string;
-  inserted_at?: string;
-  insertedAt?: string;
-}
-
-/**
- * Read recent messages from a Band room. The SDK's AgentTools has no
- * read-history method, so this is a first-class tool backed by the REST
- * adapter's listMessages — it lets the agent observe replies in a room it
- * created or was added to (e.g. check whether a peer answered) rather than
- * relying solely on inbound push.
- */
-function buildReadMessagesTool(): McpToolDefinition {
-  return {
-    tool: {
-      name: 'band_get_messages',
-      description:
-        "Read recent messages from a Band room (newest last). Use to check replies in a room you created or were added to — e.g. to see whether a peer has answered. Provide chat_room_id; in a Band room session it defaults to the current room.",
-      inputSchema: {
-        type: 'object',
-        properties: {
-          chat_room_id: {
-            type: 'string',
-            description: 'Band room id to read. Defaults to the current room when in a Band room session.',
-          },
-          limit: { type: 'number', description: 'Maximum messages to return (default 20, max 100).' },
-        },
-      },
-    },
-    async handler(args) {
-      if (consolidationMode()) {
-        return errorResult('band_get_messages is blocked during Band.ai memory consolidation.');
-      }
-      const record = (args ?? {}) as Record<string, unknown>;
-      const explicit = typeof record.chat_room_id === 'string' && record.chat_room_id ? record.chat_room_id : undefined;
-      const room = explicit ?? sessionRoomId();
-      if (!room) {
-        return errorResult('band_get_messages needs a chat_room_id — this session has no current Band room.');
-      }
-      const limit = typeof record.limit === 'number' && record.limit > 0 ? Math.min(record.limit, 100) : 20;
-      const rest = bandLink().rest;
-      if (!rest.listMessages) {
-        return errorResult('band_get_messages is unavailable: the Band REST adapter has no message-list endpoint.');
-      }
-      const res = (await rest.listMessages({ chatId: room, page: 1, pageSize: limit })) as {
-        data?: PlatformMessageRecord[];
-      };
-      const items = res?.data ?? [];
-      if (items.length === 0) return { content: [{ type: 'text', text: '(no messages in this room yet)' }] };
-      const lines = items.map((m) => {
-        const who = m.sender_name ?? m.senderName ?? 'unknown';
-        const kind = m.sender_type ?? m.senderType ?? '';
-        return `${who}${kind ? ` (${kind})` : ''}: ${m.content ?? ''}`;
-      });
-      return { content: [{ type: 'text', text: lines.join('\n') }] };
-    },
-  };
-}
-
 if (bandAgentToolsEnabled()) {
-  registerTools([...buildBandToolDefinitions(), buildReadMessagesTool()]);
+  registerTools(buildBandToolDefinitions());
 }
