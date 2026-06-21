@@ -102,8 +102,12 @@ const toolsByRoom = new Map<string, AgentToolsProtocol>();
 let memoryDisabledForRun = false;
 
 // Placeholder room for the base instance when the session has no current room
-// (agent-scoped sessions). Room-independent tools never read it.
-const AGENT_SCOPED_PLACEHOLDER_ROOM = 'agent-control';
+// (agent-scoped sessions). Empty string, NOT a fake UUID: room-independent
+// tools like lookupPeers pass the construction roomId to the API as the
+// optional `not_in_chat` filter, and the SDK's rest adapter drops the param
+// when it's falsy — so an empty roomId yields an unfiltered peer/contact list
+// instead of a "not a uuid" validation error.
+const AGENT_SCOPED_PLACEHOLDER_ROOM = '';
 
 function apiKey(): string {
   return bandEnv('API_KEY') ?? env('ONECLI_API_KEY') ?? '';
@@ -113,18 +117,21 @@ function restUrl(): string | undefined {
   return bandEnv('REST_URL');
 }
 
+let cachedLink: ThenvoiLink | null = null;
+function bandLink(): ThenvoiLink {
+  if (!cachedLink) {
+    cachedLink = new ThenvoiLink({ agentId: bandEnv('AGENT_ID')!, apiKey: apiKey(), restUrl: restUrl() });
+  }
+  return cachedLink;
+}
+
 function sdkToolsForRoom(targetRoomId: string): AgentToolsProtocol {
   const cached = toolsByRoom.get(targetRoomId);
   if (cached) return cached;
 
-  const link = new ThenvoiLink({
-    agentId: bandEnv('AGENT_ID')!,
-    apiKey: apiKey(),
-    restUrl: restUrl(),
-  });
   const tools = new AgentTools({
     roomId: targetRoomId,
-    rest: link.rest,
+    rest: bandLink().rest,
     capabilities: {
       peers: true,
       contacts: true,
@@ -308,6 +315,70 @@ function buildBandToolDefinitions(): McpToolDefinition[] {
   });
 }
 
+interface PlatformMessageRecord {
+  content?: string;
+  sender_name?: string;
+  senderName?: string;
+  sender_type?: string;
+  senderType?: string;
+  inserted_at?: string;
+  insertedAt?: string;
+}
+
+/**
+ * Read recent messages from a Band room. The SDK's AgentTools has no
+ * read-history method, so this is a first-class tool backed by the REST
+ * adapter's listMessages — it lets the agent observe replies in a room it
+ * created or was added to (e.g. check whether a peer answered) rather than
+ * relying solely on inbound push.
+ */
+function buildReadMessagesTool(): McpToolDefinition {
+  return {
+    tool: {
+      name: 'band_get_messages',
+      description:
+        "Read recent messages from a Band room (newest last). Use to check replies in a room you created or were added to — e.g. to see whether a peer has answered. Provide chat_room_id; in a Band room session it defaults to the current room.",
+      inputSchema: {
+        type: 'object',
+        properties: {
+          chat_room_id: {
+            type: 'string',
+            description: 'Band room id to read. Defaults to the current room when in a Band room session.',
+          },
+          limit: { type: 'number', description: 'Maximum messages to return (default 20, max 100).' },
+        },
+      },
+    },
+    async handler(args) {
+      if (consolidationMode()) {
+        return errorResult('band_get_messages is blocked during Band.ai memory consolidation.');
+      }
+      const record = (args ?? {}) as Record<string, unknown>;
+      const explicit = typeof record.chat_room_id === 'string' && record.chat_room_id ? record.chat_room_id : undefined;
+      const room = explicit ?? sessionRoomId();
+      if (!room) {
+        return errorResult('band_get_messages needs a chat_room_id — this session has no current Band room.');
+      }
+      const limit = typeof record.limit === 'number' && record.limit > 0 ? Math.min(record.limit, 100) : 20;
+      const rest = bandLink().rest;
+      if (!rest.listMessages) {
+        return errorResult('band_get_messages is unavailable: the Band REST adapter has no message-list endpoint.');
+      }
+      const res = (await rest.listMessages({ chatId: room, page: 1, pageSize: limit })) as {
+        data?: PlatformMessageRecord[];
+      };
+      const items = res?.data ?? [];
+      if (items.length === 0) return { content: [{ type: 'text', text: '(no messages in this room yet)' }] };
+      const lines = items.map((m) => {
+        const who = m.sender_name ?? m.senderName ?? 'unknown';
+        const kind = m.sender_type ?? m.senderType ?? '';
+        return `${who}${kind ? ` (${kind})` : ''}: ${m.content ?? ''}`;
+      });
+      return { content: [{ type: 'text', text: lines.join('\n') }] };
+    },
+  };
+}
+
 if (bandAgentToolsEnabled()) {
-  registerTools(buildBandToolDefinitions());
+  registerTools([...buildBandToolDefinitions(), buildReadMessagesTool()]);
 }

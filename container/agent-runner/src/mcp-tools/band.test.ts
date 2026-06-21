@@ -84,6 +84,20 @@ describe('Band.ai MCP tools', () => {
     expect(props && 'chat_room_id' in props).toBe(true);
   });
 
+  it('registers band_get_messages and requires a room when none is in session', async () => {
+    process.env.THENVOI_AGENT_ID = 'agent-1';
+    process.env.THENVOI_REST_URL = 'https://band.example.test';
+
+    await import('./band.js');
+    const { listRegisteredToolNames, getRegisteredTool } = await import('./server.js');
+    expect(listRegisteredToolNames()).toContain('band_get_messages');
+
+    // No session room and no chat_room_id → clear error before any network call.
+    const result = await getRegisteredTool('band_get_messages')!.handler({});
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain('needs a chat_room_id');
+  });
+
   it('requires chat_room_id for a room-scoped tool when the session has no current room', async () => {
     // Agent-scoped session (e.g. driven from Telegram): agent identity present,
     // but no BAND_ROOM_ID. clearEnv() in beforeEach already removed ROOM_ID.
