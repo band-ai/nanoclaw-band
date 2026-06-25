@@ -353,9 +353,7 @@ async function resolveContainerContribution(
   return mergeContainerContributions(providerContribution, channelContribution, ...agentContributions);
 }
 
-function mergeContainerContributions(
-  ...contributions: ProviderContainerContribution[]
-): ProviderContainerContribution {
+function mergeContainerContributions(...contributions: ProviderContainerContribution[]): ProviderContainerContribution {
   return {
     mounts: contributions.flatMap((c) => c.mounts ?? []),
     env: Object.assign({}, ...contributions.map((c) => c.env ?? {})),

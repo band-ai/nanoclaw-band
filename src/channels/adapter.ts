@@ -16,7 +16,7 @@ export type InboundRouteResult =
       status: 'dropped';
       platformMessageId: string;
       reason: string;
-      audited: true;
+      audited: boolean;
       retryable: boolean;
       intentional: boolean;
     }
@@ -161,6 +161,27 @@ export interface ChannelAdapter {
    *         router; agent replies go to the channel.
    */
   supportsThreads: boolean;
+
+  /**
+   * Whether this adapter implements delivery ACK semantics.
+   *
+   * When true, the router writes the inbound_delivery_ledger rows
+   * (beginInboundDelivery / markInboundDeliveryDropped /
+   * markInboundDeliveryPersisted) so the adapter can use the ledger to
+   * confirm durable persistence before emitting platform-level processed
+   * markers. Adapters that don't support ACKing skip ledger writes entirely.
+   * Default: false.
+   */
+  supportsDeliveryAck?: boolean;
+
+  /**
+   * Whether this adapter needs a graceful stop window for its container
+   * teardown work (e.g. Band memory consolidation). When true, the host
+   * sweep tags ceiling kills with 'graceful' so stopGraceForReason grants
+   * GRACEFUL_STOP_GRACE_SEC (30 min) instead of FAST_STOP_GRACE_SEC (10 s).
+   * Default: false.
+   */
+  needsGracefulStop?: boolean;
 
   // Lifecycle
   setup(config: ChannelSetup): Promise<void>;

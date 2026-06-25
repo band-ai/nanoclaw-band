@@ -1030,15 +1030,18 @@ class BandChannelAdapter implements ChannelAdapter {
         roomId,
       }),
     });
-    void wakeContainer(session).catch((err) =>
-      log.error('Band.ai relay wake failed', { sessionId: session.id, err }),
-    );
+    void wakeContainer(session).catch((err) => log.error('Band.ai relay wake failed', { sessionId: session.id, err }));
     log.info('Band.ai relayed room reply to origin session', {
       roomId,
       sessionId: session.id,
       senderId: content.senderId,
     });
-    return { status: 'persisted', platformMessageId: payload.id, sessionIds: [session.id], sessionMessageIds: [relayId] };
+    return {
+      status: 'persisted',
+      platformMessageId: payload.id,
+      sessionIds: [session.id],
+      sessionMessageIds: [relayId],
+    };
   }
 
   /**

@@ -1328,7 +1328,13 @@ describe('bandAgentControlEnv', () => {
   async function wireBandGroup(agentGroupId: string): Promise<void> {
     const { createAgentGroup, createMessagingGroup } = await import('../db/index.js');
     const { createDestination } = await import('../modules/agent-to-agent/db/agent-destinations.js');
-    createAgentGroup({ id: agentGroupId, name: agentGroupId, folder: agentGroupId, agent_provider: null, created_at: new Date().toISOString() });
+    createAgentGroup({
+      id: agentGroupId,
+      name: agentGroupId,
+      folder: agentGroupId,
+      agent_provider: null,
+      created_at: new Date().toISOString(),
+    });
     createMessagingGroup({
       id: `mg-${agentGroupId}`,
       channel_type: 'band',
@@ -1367,7 +1373,13 @@ describe('bandAgentControlEnv', () => {
     setBandEnv();
     const { bandAgentControlEnv } = await import('./band.js');
     const { createAgentGroup } = await import('../db/index.js');
-    createAgentGroup({ id: 'ag-none', name: 'None', folder: 'none', agent_provider: null, created_at: new Date().toISOString() });
+    createAgentGroup({
+      id: 'ag-none',
+      name: 'None',
+      folder: 'none',
+      agent_provider: null,
+      created_at: new Date().toISOString(),
+    });
 
     expect(bandAgentControlEnv('ag-none')).toEqual({});
   });
