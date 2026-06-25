@@ -33,9 +33,8 @@ import { ensureMemoryScaffold } from './memory-scaffold.js';
 import './providers/index.js';
 import { createProvider, type ProviderName } from './providers/factory.js';
 import { buildMcpServers } from './mcp-servers.js';
+import { runStartHooks, runStopHooks } from './lifecycle.js';
 import { runPollLoop } from './poll-loop.js';
-import { loadParticipantMemories } from './band-memory-load.js';
-import { runMemoryConsolidation } from './band-memory-consolidate.js';
 import { getContinuation } from './db/session-state.js';
 
 function log(msg: string): void {
@@ -58,12 +57,12 @@ async function main(): Promise<void> {
   // memory lives in /workspace/agent/CLAUDE.local.md (auto-loaded).
   let instructions = buildSystemPromptAddendum(config.assistantName || undefined);
 
-  // Band.ai memory pre-load (no-op when not Band or when feature is off).
-  // Appended once at startup so the agent has participant context from the
-  // first turn instead of needing to call list_memories itself.
-  const memoryBlock = await loadParticipantMemories();
-  if (memoryBlock) {
-    instructions = `${instructions}\n\n${memoryBlock}`;
+  // Start hooks: channel/provider callbacks that may return a system-prompt
+  // addendum (e.g. Band memory pre-load). Core ships no hooks; channels
+  // register them via band-lifecycle.ts (imported as a side effect).
+  const startAddenda = await runStartHooks({ assistantName: config.assistantName || undefined, cwd: CWD });
+  for (const addendum of startAddenda) {
+    instructions = `${instructions}\n\n${addendum}`;
   }
 
   // Discover additional directories mounted at /workspace/extra/*
@@ -141,15 +140,10 @@ async function main(): Promise<void> {
     signal: shutdown.signal,
   });
 
-  // Post-loop hooks. Continuation is read fresh from outbound.db — the loop
-  // persists it on every `init` event, so this picks up the latest session id.
+  // Stop hooks: run after poll loop exits (on SIGTERM/SIGINT). Errors are
+  // swallowed per hook so one failure can't block the others.
   const continuation = getContinuation(providerName);
-  await runMemoryConsolidation({
-    provider,
-    providerName,
-    cwd: CWD,
-    continuation,
-  });
+  await runStopHooks({ provider, providerName, cwd: CWD, continuation });
 }
 
 main().catch((err) => {
