@@ -602,6 +602,40 @@ describe('band channel adapter', () => {
     expect(config.env).not.toHaveProperty('THENVOI_API_KEY');
   });
 
+  it('declares band_send_message via the userVisibleTools seam (B2)', async () => {
+    setBandEnv();
+    await import('./band.js');
+    const { getChannelContainerConfig } = await import('./channel-container-registry.js');
+
+    const config = await getChannelContainerConfig('band')!({
+      session: {
+        id: 'sess-1',
+        agent_group_id: 'ag-1',
+        messaging_group_id: 'mg-1',
+        thread_id: null,
+        agent_provider: null,
+        status: 'active',
+        container_status: 'idle',
+        last_active: null,
+        created_at: new Date().toISOString(),
+      },
+      messagingGroup: {
+        id: 'mg-1',
+        channel_type: 'band',
+        platform_id: 'band:room-1',
+        name: 'Room 1',
+        is_group: 1,
+        unknown_sender_policy: 'public',
+        denied_at: null,
+        created_at: new Date().toISOString(),
+      },
+      agentGroupId: 'ag-1',
+      hostEnv: process.env,
+    });
+
+    expect(config.userVisibleTools).toContain('mcp__nanoclaw__band_send_message');
+  });
+
   it('injects direct Band API key for explicit live validation override', async () => {
     setBandEnv();
     process.env.BAND_INJECT_API_KEY = 'true';

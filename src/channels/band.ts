@@ -1380,7 +1380,10 @@ registerChannelContainerConfig(BAND_CHANNEL_TYPE, ({ messagingGroup, hostEnv }) 
     BAND_ROOM_ID: parseBandPlatformId(messagingGroup.platform_id),
     BAND_IS_MAIN_CONTROL_ROOM: String(isMainRoomPlatformId(messagingGroup.platform_id)),
   };
-  return { env: { NANOCLAW_CHANNEL: BAND_CHANNEL_TYPE, ...mirrorBandEnv(bandEnv) } };
+  return {
+    env: { NANOCLAW_CHANNEL: BAND_CHANNEL_TYPE, ...mirrorBandEnv(bandEnv) },
+    userVisibleTools: ['mcp__nanoclaw__band_send_message'],
+  };
 });
 
 // Agent-scoped: grant Band tools to every session of a Band-wired agent group.
