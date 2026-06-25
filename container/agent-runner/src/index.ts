@@ -32,6 +32,7 @@ import { ensureMemoryScaffold } from './memory-scaffold.js';
 // Provider skills append imports to providers/index.ts.
 import './providers/index.js';
 import { createProvider, type ProviderName } from './providers/factory.js';
+import { buildMcpServers } from './mcp-servers.js';
 import { runPollLoop } from './poll-loop.js';
 import { loadParticipantMemories } from './band-memory-load.js';
 import { runMemoryConsolidation } from './band-memory-consolidate.js';
@@ -88,22 +89,19 @@ async function main(): Promise<void> {
     Object.entries(process.env).filter((entry): entry is [string, string] => typeof entry[1] === 'string'),
   );
 
-  // Build MCP servers config: nanoclaw built-in + any from container.json.
-  // The built-in server is a subprocess of the provider, so it needs the same
-  // container env as the runner for channel-provided tools (Band/Thenvoi, etc.)
-  // to register and for OneCLI proxy variables to reach SDK REST calls.
-  const mcpServers: Record<string, { command: string; args: string[]; env: Record<string, string> }> = {
-    nanoclaw: {
-      command: 'bun',
-      args: ['run', mcpServerPath],
-      env: mcpEnv,
+  const mcpServers = buildMcpServers({
+    builtin: {
+      nanoclaw: {
+        command: 'bun',
+        args: ['run', mcpServerPath],
+        env: mcpEnv,
+      },
     },
-  };
-
-  for (const [name, serverConfig] of Object.entries(config.mcpServers)) {
-    mcpServers[name] = serverConfig;
-    log(`Additional MCP server: ${name} (${serverConfig.command})`);
-  }
+    configServers: config.mcpServers,
+    mcpEnv,
+    extraMcpJson: process.env.NANOCLAW_EXTRA_MCP_SERVERS,
+    log,
+  });
 
   const provider = createProvider(providerName, {
     assistantName: config.assistantName || undefined,
