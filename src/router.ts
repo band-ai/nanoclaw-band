@@ -169,17 +169,20 @@ function droppedResult(
   event: InboundEvent,
   reason: string,
   opts: { intentional?: boolean; retryable?: boolean } = {},
+  ackMode = false,
 ): InboundRouteResult {
-  markInboundDeliveryDropped(deliveryKey(event), {
-    reason,
-    intentional: opts.intentional ?? false,
-    retryable: opts.retryable ?? false,
-  });
+  if (ackMode) {
+    markInboundDeliveryDropped(deliveryKey(event), {
+      reason,
+      intentional: opts.intentional ?? false,
+      retryable: opts.retryable ?? false,
+    });
+  }
   return {
     status: 'dropped',
     platformMessageId: event.message.id,
     reason,
-    audited: true,
+    audited: ackMode,
     retryable: opts.retryable ?? false,
     intentional: opts.intentional ?? false,
   };
@@ -195,38 +198,43 @@ export async function routeInbound(event: InboundEvent): Promise<InboundRouteRes
   //    by the RECEIVING instance — sibling instances of one platform can
   //    differ in thread support.
   const adapter = getChannelAdapter(event.instance ?? event.channelType);
+  const ackMode = adapter?.supportsDeliveryAck === true;
   if (adapter && !adapter.supportsThreads) {
     event = { ...event, threadId: null };
   }
 
   const isMention = event.message.isMention === true;
   const key = deliveryKey(event);
-  const existingDelivery = beginInboundDelivery(key, event.threadId);
-  if (existingDelivery.status === 'persisted' || existingDelivery.status === 'processed') {
-    return {
-      status: 'persisted',
-      platformMessageId: event.message.id,
-      sessionIds: existingDelivery.session_ids_json ? (JSON.parse(existingDelivery.session_ids_json) as string[]) : [],
-      sessionMessageIds: existingDelivery.session_message_ids_json
-        ? (JSON.parse(existingDelivery.session_message_ids_json) as string[])
-        : [],
-    };
-  }
-  if (existingDelivery.status === 'intentionally_dropped') {
-    return {
-      status: 'dropped',
-      platformMessageId: event.message.id,
-      reason: existingDelivery.reason ?? 'intentionally_dropped',
-      audited: true,
-      retryable: false,
-      intentional: true,
-    };
+  if (ackMode) {
+    const existingDelivery = beginInboundDelivery(key, event.threadId);
+    if (existingDelivery.status === 'persisted' || existingDelivery.status === 'processed') {
+      return {
+        status: 'persisted',
+        platformMessageId: event.message.id,
+        sessionIds: existingDelivery.session_ids_json
+          ? (JSON.parse(existingDelivery.session_ids_json) as string[])
+          : [],
+        sessionMessageIds: existingDelivery.session_message_ids_json
+          ? (JSON.parse(existingDelivery.session_message_ids_json) as string[])
+          : [],
+      };
+    }
+    if (existingDelivery.status === 'intentionally_dropped') {
+      return {
+        status: 'dropped',
+        platformMessageId: event.message.id,
+        reason: existingDelivery.reason ?? 'intentionally_dropped',
+        audited: true,
+        retryable: false,
+        intentional: true,
+      };
+    }
   }
 
   // Pre-route interceptor — lets modules consume messages before any routing
   // (e.g. free-text replies during multi-step approval flows).
   if (messageInterceptor && (await messageInterceptor(event))) {
-    return droppedResult(event, 'intercepted', { intentional: true });
+    return droppedResult(event, 'intercepted', { intentional: true }, ackMode);
   }
 
   // 1. Combined lookup: messaging_group row + count of wired agents in a
@@ -248,7 +256,7 @@ export async function routeInbound(event: InboundEvent): Promise<InboundRouteRes
     // attention (the bot was addressed — @mention or DM). Plain chatter in
     // channels we merely sit in is now audited for ACK-aware adapters without
     // creating a messaging_group row.
-    if (!isMention) return droppedResult(event, 'no_messaging_group', { retryable: true });
+    if (!isMention) return droppedResult(event, 'no_messaging_group', { retryable: true }, ackMode);
     const mgId = `mg-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
     mg = {
       id: mgId,
@@ -278,13 +286,13 @@ export async function routeInbound(event: InboundEvent): Promise<InboundRouteRes
   // 1b. No wirings — either audited drop (plain chatter / denied channel) or
   //     escalate to owner for channel-registration approval.
   if (agentCount === 0) {
-    if (!isMention) return droppedResult(event, 'no_agent_wired_unmentioned', { retryable: true });
+    if (!isMention) return droppedResult(event, 'no_agent_wired_unmentioned', { retryable: true }, ackMode);
     if (mg.denied_at) {
       log.debug('Message dropped — channel was denied by owner', {
         messagingGroupId: mg.id,
         deniedAt: mg.denied_at,
       });
-      return droppedResult(event, 'channel_denied', { intentional: true });
+      return droppedResult(event, 'channel_denied', { intentional: true }, ackMode);
     }
 
     const parsed = safeParseContent(event.message.content);
@@ -313,7 +321,7 @@ export async function routeInbound(event: InboundEvent): Promise<InboundRouteRes
         platformId: event.platformId,
       });
     }
-    return droppedResult(event, 'no_agent_wired', { retryable: true });
+    return droppedResult(event, 'no_agent_wired', { retryable: true }, ackMode);
   }
 
   // 2. Sender resolution (permissions module upserts the users row as a
@@ -434,10 +442,10 @@ export async function routeInbound(event: InboundEvent): Promise<InboundRouteRes
       messaging_group_id: mg.id,
       agent_group_id: null,
     });
-    return droppedResult(event, 'no_agent_engaged', { retryable: false });
+    return droppedResult(event, 'no_agent_engaged', { retryable: false }, ackMode);
   }
 
-  markInboundDeliveryPersisted(key, { sessionIds, sessionMessageIds });
+  if (ackMode) markInboundDeliveryPersisted(key, { sessionIds, sessionMessageIds });
   return {
     status: 'persisted',
     platformMessageId: event.message.id,

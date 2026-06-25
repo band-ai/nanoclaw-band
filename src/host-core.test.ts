@@ -30,7 +30,12 @@ import {
   clearOutbox,
 } from './session-manager.js';
 import { getSession, findSession } from './db/sessions.js';
-import type { InboundEvent } from './channels/adapter.js';
+import {
+  registerChannelAdapter,
+  initChannelAdapters,
+  teardownChannelAdapters,
+} from './channels/channel-registry.js';
+import type { ChannelAdapter, InboundEvent } from './channels/adapter.js';
 
 // Mock container runner to prevent actual Docker spawning
 vi.mock('./container-runner.js', () => ({
@@ -48,6 +53,46 @@ vi.mock('./config.js', async () => {
 
 function now() {
   return new Date().toISOString();
+}
+
+/**
+ * Minimal ACK-mode channel adapter for router tests. The delivery ledger is
+ * only written for adapters with supportsDeliveryAck === true (C3 seam), so
+ * router tests that assert ledger rows must register one of these for the
+ * channel type they route.
+ */
+function ackAdapter(channelType: string, supportsDeliveryAck = true): ChannelAdapter {
+  let connected = false;
+  return {
+    name: channelType,
+    channelType,
+    supportsThreads: false,
+    supportsDeliveryAck,
+    async setup() {
+      connected = true;
+    },
+    async teardown() {
+      connected = false;
+    },
+    isConnected() {
+      return connected;
+    },
+    async deliver() {
+      return undefined;
+    },
+  };
+}
+
+async function registerAckAdapters(channelTypes: string[], supportsDeliveryAck = true): Promise<void> {
+  for (const ct of channelTypes) {
+    registerChannelAdapter(ct, { factory: () => ackAdapter(ct, supportsDeliveryAck) });
+  }
+  await initChannelAdapters(() => ({
+    onInbound: () => {},
+    onInboundEvent: () => {},
+    onMetadata: () => {},
+    onAction: () => {},
+  }));
 }
 
 const TEST_DIR = '/tmp/nanoclaw-test-host';
@@ -359,7 +404,7 @@ describe('session manager', () => {
 });
 
 describe('router', () => {
-  beforeEach(() => {
+  beforeEach(async () => {
     createAgentGroup({
       id: 'ag-1',
       name: 'Test Agent',
@@ -390,6 +435,13 @@ describe('router', () => {
       priority: 0,
       created_at: now(),
     });
+    // The delivery ledger is ACK-mode-only (C3 seam). These router cases assert
+    // ledger rows, so register ACK-mode adapters for the channels they route.
+    await registerAckAdapters(['discord', 'slack', 'band']);
+  });
+
+  afterEach(async () => {
+    await teardownChannelAdapters();
   });
 
   it('should route a message end-to-end', async () => {
@@ -670,6 +722,80 @@ describe('router', () => {
     expect(wakeContainer).not.toHaveBeenCalled();
     // No session should have been created for this agent.
     expect(findSession('mg-1', null)).toBeUndefined();
+  });
+
+  it('writes ledger rows only for ACK-mode adapters', async () => {
+    const { routeInbound } = await import('./router.js');
+    // 'discord' is registered as ACK-mode in beforeEach via registerAckAdapters
+    const result = await routeInbound({
+      channelType: 'discord',
+      platformId: 'chan-123',
+      threadId: null,
+      message: { id: 'msg-ack-1', kind: 'chat', content: JSON.stringify({ text: 'hi' }), timestamp: now() },
+    });
+    expect(result.status).toBe('persisted');
+    const ledger = getInboundDelivery({
+      channelType: 'discord',
+      platformId: 'chan-123',
+      platformMessageId: 'msg-ack-1',
+    });
+    expect(ledger?.status).toBe('persisted');
+  });
+
+  it('does NOT write ledger rows for non-ACK adapters', async () => {
+    // Register a non-ACK adapter for a fresh channel and bring it up.
+    await registerAckAdapters(['no-ack-ch'], false);
+    // Need a messaging group wired for this channel.
+    createMessagingGroup({
+      id: 'mg-noack',
+      channel_type: 'no-ack-ch',
+      platform_id: 'noack-room',
+      instance: 'no-ack-ch',
+      name: null,
+      is_group: 0,
+      unknown_sender_policy: 'public',
+      created_at: now(),
+    });
+    createMessagingGroupAgent({
+      id: 'mga-noack',
+      messaging_group_id: 'mg-noack',
+      agent_group_id: 'ag-1',
+      engage_mode: 'pattern',
+      engage_pattern: '.',
+      sender_scope: 'all',
+      ignored_message_policy: 'drop',
+      session_mode: 'shared',
+      priority: 0,
+      created_at: now(),
+    });
+
+    const { routeInbound } = await import('./router.js');
+    const result = await routeInbound({
+      channelType: 'no-ack-ch',
+      platformId: 'noack-room',
+      threadId: null,
+      message: { id: 'msg-noack-1', kind: 'chat', content: JSON.stringify({ text: 'hi' }), timestamp: now() },
+    });
+    expect(result.status).toBe('persisted');
+    const ledger = getInboundDelivery({
+      channelType: 'no-ack-ch',
+      platformId: 'noack-room',
+      platformMessageId: 'msg-noack-1',
+    });
+    expect(ledger).toBeUndefined();
+  });
+
+  it('returns audited:false on drops from non-ACK adapters', async () => {
+    const { routeInbound } = await import('./router.js');
+    // Route to unknown channel with no adapter — ackMode is false.
+    const result = await routeInbound({
+      channelType: 'no-adapter-ch',
+      platformId: 'some-room',
+      threadId: null,
+      message: { id: 'msg-drop-noack', kind: 'chat', content: JSON.stringify({ text: 'hi' }), timestamp: now() },
+    });
+    expect(result.status).toBe('dropped');
+    if (result.status === 'dropped') expect(result.audited).toBe(false);
   });
 });
 
