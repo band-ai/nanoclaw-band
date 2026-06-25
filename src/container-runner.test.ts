@@ -2,7 +2,25 @@ import fs from 'fs';
 import path from 'path';
 import { describe, expect, it } from 'vitest';
 
-import { resolveProviderName, rewriteOneCliProxyArgs } from './container-runner.js';
+import {
+  resolveProviderName,
+  rewriteOneCliProxyArgs,
+  stopGraceForReason,
+  FAST_STOP_GRACE_SEC,
+  GRACEFUL_STOP_GRACE_SEC,
+} from './container-runner.js';
+
+describe('stopGraceForReason', () => {
+  it('grants the long graceful window when the reason contains "graceful"', () => {
+    expect(stopGraceForReason('absolute-ceiling graceful')).toBe(GRACEFUL_STOP_GRACE_SEC);
+  });
+
+  it('keeps recovery/stuck kills on the fast window', () => {
+    expect(stopGraceForReason('absolute-ceiling')).toBe(FAST_STOP_GRACE_SEC);
+    expect(stopGraceForReason('claim-stuck')).toBe(FAST_STOP_GRACE_SEC);
+    expect(stopGraceForReason('rebuild applied')).toBe(FAST_STOP_GRACE_SEC);
+  });
+});
 
 describe('resolveProviderName', () => {
   it('prefers session over container config', () => {

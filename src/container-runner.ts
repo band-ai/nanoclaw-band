@@ -261,10 +261,10 @@ async function spawnContainer(session: Session): Promise<void> {
  * blocked behind a dying container for minutes. A future explicitly graceful
  * caller can opt into the longer path by including "graceful" in its reason.
  */
-const FAST_STOP_GRACE_SEC = 10;
-const GRACEFUL_STOP_GRACE_SEC = 30 * 60;
+export const FAST_STOP_GRACE_SEC = 10;
+export const GRACEFUL_STOP_GRACE_SEC = 30 * 60;
 
-function stopGraceForReason(reason: string): number {
+export function stopGraceForReason(reason: string): number {
   return reason.includes('graceful') ? GRACEFUL_STOP_GRACE_SEC : FAST_STOP_GRACE_SEC;
 }
 

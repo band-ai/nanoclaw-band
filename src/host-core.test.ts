@@ -30,11 +30,7 @@ import {
   clearOutbox,
 } from './session-manager.js';
 import { getSession, findSession } from './db/sessions.js';
-import {
-  registerChannelAdapter,
-  initChannelAdapters,
-  teardownChannelAdapters,
-} from './channels/channel-registry.js';
+import { registerChannelAdapter, initChannelAdapters, teardownChannelAdapters } from './channels/channel-registry.js';
 import type { ChannelAdapter, InboundEvent } from './channels/adapter.js';
 
 // Mock container runner to prevent actual Docker spawning
