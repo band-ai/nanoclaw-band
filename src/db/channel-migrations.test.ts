@@ -68,27 +68,9 @@ describe('module_state ownership (M2)', () => {
     expect(hasTable(db, 'module_state')).toBe(false);
   });
 
-  it('is created when Band migrations are registered', async () => {
-    // Simulate band.ts side-effect import by calling registerChannelMigrations
-    // with the real Band migration list.
-    const { moduleBandState } = await import('./migrations/module-band-state.js');
-    registerChannelMigrations('band-m2-test', [moduleBandState]);
-    const db = initTestDb();
-    runMigrations(db);
-    expect(hasTable(db, 'module_state')).toBe(true);
-  });
-
-  it('is idempotent when module_state already exists (existing origin DB)', async () => {
-    // Pre-create module_state (simulates an existing origin DB that had it
-    // from migration 019). CREATE TABLE IF NOT EXISTS makes re-running a no-op.
-    const db = initTestDb();
-    db.exec(
-      `CREATE TABLE module_state (module_name TEXT NOT NULL, key TEXT NOT NULL, value_json TEXT NOT NULL, updated_at TEXT NOT NULL, PRIMARY KEY (module_name, key));`,
-    );
-
-    const { moduleBandState } = await import('./migrations/module-band-state.js');
-    registerChannelMigrations('band-idempotent', [moduleBandState]);
-    expect(() => runMigrations(db)).not.toThrow();
-    expect(hasTable(db, 'module_state')).toBe(true);
-  });
+  // The Band-specific cases — that registering the real `module-band-state`
+  // migration creates `module_state`, and that it's idempotent over an existing
+  // table — live in src/channels/band.test.ts. Keeping them out of this generic
+  // registry test is what lets a Band-free core compile without importing any
+  // Band migration file (the additivity guarantee).
 });

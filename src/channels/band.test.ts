@@ -1450,3 +1450,46 @@ describe('bandAgentControlEnv', () => {
     expect(bandAgentControlEnv('ag-band-2')).toEqual({});
   });
 });
+
+describe('band channel migrations (M2)', () => {
+  // module_state is Band-owned: created by the `module-band-state` channel
+  // migration registered from band.ts, not by core. These cases live here (not
+  // in the generic db/channel-migrations.test.ts) so a Band-free core never
+  // imports a Band migration file. vi.resetModules() gives each test a fresh
+  // channel-migration registry, so the unique channel names never collide.
+  beforeEach(() => {
+    vi.resetModules();
+  });
+
+  afterEach(() => {
+    closeTestDb?.();
+    closeTestDb = null;
+  });
+
+  it('creates module_state when the Band migration is registered', async () => {
+    const { runMigrations, registerChannelMigrations } = await import('../db/migrations/index.js');
+    const { moduleBandState } = await import('../db/migrations/module-band-state.js');
+    const { initTestDb, closeDb, hasTable } = await import('../db/connection.js');
+    registerChannelMigrations('band-m2-test', [moduleBandState]);
+    const db = initTestDb();
+    closeTestDb = closeDb;
+    runMigrations(db);
+    expect(hasTable(db, 'module_state')).toBe(true);
+  });
+
+  it('is idempotent when module_state already exists (existing origin DB)', async () => {
+    const { runMigrations, registerChannelMigrations } = await import('../db/migrations/index.js');
+    const { moduleBandState } = await import('../db/migrations/module-band-state.js');
+    const { initTestDb, closeDb, hasTable } = await import('../db/connection.js');
+    const db = initTestDb();
+    closeTestDb = closeDb;
+    // Simulate an existing origin DB that already had module_state from the old
+    // core migration 019. CREATE TABLE IF NOT EXISTS makes the re-run a no-op.
+    db.exec(
+      `CREATE TABLE module_state (module_name TEXT NOT NULL, key TEXT NOT NULL, value_json TEXT NOT NULL, updated_at TEXT NOT NULL, PRIMARY KEY (module_name, key));`,
+    );
+    registerChannelMigrations('band-idempotent', [moduleBandState]);
+    expect(() => runMigrations(db)).not.toThrow();
+    expect(hasTable(db, 'module_state')).toBe(true);
+  });
+});
