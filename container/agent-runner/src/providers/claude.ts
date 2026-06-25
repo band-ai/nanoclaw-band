@@ -5,6 +5,7 @@ import path from 'path';
 import { query as sdkQuery, type HookCallback, type PreCompactHookInput } from '@anthropic-ai/claude-agent-sdk';
 
 import { clearContainerToolInFlight, setContainerToolInFlight } from '../db/connection.js';
+import { isUserVisibleToolName, markUserVisibleTool } from '../mcp-tools/server.js';
 import { registerProvider } from './provider-registry.js';
 import type { AgentProvider, AgentQuery, McpServerConfig, ProviderEvent, ProviderOptions, QueryInput } from './types.js';
 
@@ -12,7 +13,23 @@ function log(msg: string): void {
   console.error(`[claude-provider] ${msg}`);
 }
 
-function mergeEnv(...sources: Array<Record<string, string | undefined>>): Record<string, string> {
+// Seed user-visible tools from the env var injected by buildContainerArgs.
+// The env var carries JSON: e.g. '["mcp__nanoclaw__band_send_message"]'.
+// Errors are swallowed — a malformed value means no extra tools are seeded.
+((): void => {
+  const raw = process.env.NANOCLAW_USER_VISIBLE_TOOLS;
+  if (!raw) return;
+  try {
+    const names = JSON.parse(raw) as unknown[];
+    for (const name of names) {
+      if (typeof name === 'string') markUserVisibleTool(name);
+    }
+  } catch {
+    // malformed JSON — no-op
+  }
+})();
+
+export function mergeEnv(...sources: Array<Record<string, string | undefined>>): Record<string, string> {
   const merged: Record<string, string> = {};
   for (const source of sources) {
     for (const [key, value] of Object.entries(source)) {
@@ -101,10 +118,6 @@ function userVisibleToolNames(message: unknown): string[] {
     if (item.type !== 'tool_use' || typeof item.name !== 'string') return [];
     return isUserVisibleToolName(item.name) ? [item.name] : [];
   });
-}
-
-function isUserVisibleToolName(name: string): boolean {
-  return name === 'mcp__nanoclaw__send_message' || name === 'mcp__nanoclaw__band_send_message';
 }
 
 /**
@@ -432,7 +445,7 @@ export class ClaudeProvider implements AgentProvider {
     const mcpServers = Object.fromEntries(
       Object.entries(this.mcpServers).map(([name, server]) => [
         name,
-        { ...server, env: mergeEnv(server.env, input.env ?? {}) },
+        { ...server, env: mergeEnv(input.env ?? {}, server.env) },
       ]),
     );
 
