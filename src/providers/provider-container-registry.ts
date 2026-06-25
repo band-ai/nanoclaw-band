@@ -44,11 +44,28 @@ export interface ProviderContainerContext {
   hostEnv: NodeJS.ProcessEnv;
 }
 
+/** A single MCP server contributed by a channel or provider. */
+export interface McpServerContribution {
+  command: string;
+  args: string[];
+  env?: Record<string, string>;
+}
+
 export interface ProviderContainerContribution {
   /** Extra volume mounts (merged with the default session/group/agent-runner mounts). */
   mounts?: VolumeMount[];
   /** Extra env vars to pass to the container (`-e KEY=VALUE`). */
   env?: Record<string, string>;
+  /**
+   * Extra MCP servers to pass into the container via NANOCLAW_EXTRA_MCP_SERVERS.
+   * Later contributions override earlier on name collision (channel wins over provider).
+   */
+  mcpServers?: Record<string, McpServerContribution>;
+  /**
+   * Tool names the agent should treat as user-visible (shown in typing/progress UI).
+   * Concatenated across all contributions.
+   */
+  userVisibleTools?: string[];
 }
 
 /**

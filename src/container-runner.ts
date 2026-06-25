@@ -353,10 +353,14 @@ async function resolveContainerContribution(
   return mergeContainerContributions(providerContribution, channelContribution, ...agentContributions);
 }
 
-function mergeContainerContributions(...contributions: ProviderContainerContribution[]): ProviderContainerContribution {
+export function mergeContainerContributions(
+  ...contributions: ProviderContainerContribution[]
+): ProviderContainerContribution {
   return {
     mounts: contributions.flatMap((c) => c.mounts ?? []),
     env: Object.assign({}, ...contributions.map((c) => c.env ?? {})),
+    mcpServers: Object.assign({}, ...contributions.map((c) => c.mcpServers ?? {})),
+    userVisibleTools: contributions.flatMap((c) => c.userVisibleTools ?? []),
   };
 }
 
@@ -541,6 +545,17 @@ async function buildContainerArgs(
     for (const [key, value] of Object.entries(providerContribution.env)) {
       args.push('-e', `${key}=${value}`);
     }
+  }
+
+  // Channel-contributed MCP servers — serialized as JSON and picked up by
+  // buildMcpServers() in the container's main(). Empty object = omit the env
+  // var so the container sees no extra servers rather than an empty map.
+  if (providerContribution.mcpServers && Object.keys(providerContribution.mcpServers).length > 0) {
+    args.push('-e', `NANOCLAW_EXTRA_MCP_SERVERS=${JSON.stringify(providerContribution.mcpServers)}`);
+  }
+  // User-visible tool names seeded into the container at startup.
+  if (providerContribution.userVisibleTools && providerContribution.userVisibleTools.length > 0) {
+    args.push('-e', `NANOCLAW_USER_VISIBLE_TOOLS=${JSON.stringify(providerContribution.userVisibleTools)}`);
   }
 
   // Egress lockdown when enabled — throws if it can't be established, aborting
