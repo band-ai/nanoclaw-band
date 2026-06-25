@@ -31,6 +31,11 @@ import { ensureMemoryScaffold } from './memory-scaffold.js';
 // Providers barrel — each enabled provider self-registers on import.
 // Provider skills append imports to providers/index.ts.
 import './providers/index.js';
+// Band lifecycle hooks self-register on import (start: memory pre-load,
+// stop: consolidation). Must follow the providers barrel so providers are
+// registered first, and precede the runStartHooks call below. The /add-band
+// skill appends this line, like other channel self-registration imports.
+import './band-lifecycle.js';
 import { createProvider, type ProviderName } from './providers/factory.js';
 import { buildMcpServers } from './mcp-servers.js';
 import { runStartHooks, runStopHooks } from './lifecycle.js';
