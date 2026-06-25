@@ -368,6 +368,10 @@ class BandChannelAdapter implements ChannelAdapter {
   public readonly name = 'Band.ai';
   public readonly channelType = BAND_CHANNEL_TYPE;
   public readonly supportsThreads = false;
+  // Band acks inbound persistence via the delivery ledger (C3 seam) and needs
+  // a graceful stop window for end-of-session memory consolidation (C4 seam).
+  public readonly supportsDeliveryAck = true;
+  public readonly needsGracefulStop = true;
 
   private setupConfig: ChannelSetup | null = null;
   private connected = false;

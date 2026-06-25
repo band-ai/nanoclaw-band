@@ -198,6 +198,24 @@ describe('band channel adapter', () => {
     expect(getActiveAdapters().some((adapter) => adapter.channelType === 'band')).toBe(true);
   });
 
+  it('reports supportsDeliveryAck and needsGracefulStop capability flags (B1)', async () => {
+    setBandEnv();
+    await import('./band.js');
+    const { initChannelAdapters, getActiveAdapters } = await import('./channel-registry.js');
+
+    await initChannelAdapters(() => ({
+      onInbound: () => {},
+      onInboundEvent: () => {},
+      onMetadata: () => {},
+      onAction: () => {},
+    }));
+
+    const adapter = getActiveAdapters().find((a) => a.channelType === 'band');
+    expect(adapter).toBeDefined();
+    expect(adapter?.supportsDeliveryAck).toBe(true);
+    expect(adapter?.needsGracefulStop).toBe(true);
+  });
+
   it('marks Band messages processed only after a persisted route result', async () => {
     setBandEnv();
     await import('./band.js');
