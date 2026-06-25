@@ -32,23 +32,6 @@ export const migration019: Migration = {
       CREATE INDEX IF NOT EXISTS idx_inbound_delivery_last_seen
         ON inbound_delivery_ledger(last_seen);
 
-      CREATE TABLE IF NOT EXISTS outbound_delivery_markers (
-        marker_key          TEXT PRIMARY KEY,
-        session_id          TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
-        outbound_message_id TEXT,
-        channel_type        TEXT NOT NULL,
-        platform_id         TEXT NOT NULL,
-        tool_call_id        TEXT,
-        platform_message_id TEXT,
-        delivered_at        TEXT NOT NULL
-      );
-
-      CREATE INDEX IF NOT EXISTS idx_outbound_delivery_markers_outbound
-        ON outbound_delivery_markers(session_id, outbound_message_id, channel_type, platform_id);
-
-      CREATE INDEX IF NOT EXISTS idx_outbound_delivery_markers_tool_call
-        ON outbound_delivery_markers(tool_call_id);
-
       CREATE TABLE IF NOT EXISTS module_state (
         module_name TEXT NOT NULL,
         key         TEXT NOT NULL,

@@ -86,15 +86,6 @@ export const migration020: Migration = {
     prefixRewrite('pending_approvals', 'platform_id');
     valueRewrite('pending_approvals', 'channel_type');
 
-    // Outbound markers embed channel/platform in marker_key ('|thenvoi|...').
-    prefixRewrite('outbound_delivery_markers', 'platform_id');
-    valueRewrite('outbound_delivery_markers', 'channel_type');
-    db.prepare(
-      `UPDATE outbound_delivery_markers
-       SET marker_key = replace(replace(marker_key, '|thenvoi|', '|band|'), '|thenvoi:', '|band:')
-       WHERE marker_key LIKE '%|thenvoi%'`,
-    ).run();
-
     // Module state: row key + platformId strings inside the JSON value.
     db.prepare(
       `UPDATE module_state
