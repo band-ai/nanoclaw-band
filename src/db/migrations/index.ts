@@ -56,6 +56,24 @@ export const migrations: Migration[] = [
   migration020,
 ];
 
+// Channel-migration registry. Channels (Band, etc.) register their own
+// migrations here on import. runMigrations appends them after core,
+// keyed on `name` like core — so an already-applied channel migration is
+// skipped by name, and a base install that never registers a channel
+// never runs its migrations.
+const channelMigrations = new Map<string, Migration[]>();
+
+export function registerChannelMigrations(channel: string, list: Migration[]): void {
+  if (channelMigrations.has(channel)) {
+    throw new Error(`Channel migrations already registered: ${channel}`);
+  }
+  channelMigrations.set(channel, list);
+}
+
+function allMigrations(): Migration[] {
+  return [...migrations, ...[...channelMigrations.values()].flat()];
+}
+
 /** Row shape of PRAGMA foreign_key_check. Child rowids are stable across a
  *  parent-table recreate (child tables aren't touched), so this JSON identity
  *  is a reliable before/after diff key. */
@@ -69,7 +87,7 @@ interface FkViolation {
 const fkIdentity = (v: FkViolation): string =>
   JSON.stringify({ table: v.table, rowid: v.rowid, parent: v.parent, fkid: v.fkid });
 
-export function runMigrations(db: Database.Database, list: Migration[] = migrations): void {
+export function runMigrations(db: Database.Database, list: Migration[] = allMigrations()): void {
   db.exec(`
     CREATE TABLE IF NOT EXISTS schema_version (
       version INTEGER PRIMARY KEY,
