@@ -28,8 +28,6 @@
     "test:watch": "vitest"
   },
   "dependencies": {
-    "@band-ai/rest-client": "0.0.121",
-    "@band-ai/sdk": "0.1.6",
     "@chat-adapter/telegram": "4.26.0",
     "@clack/core": "^1.2.0",
     "@clack/prompts": "^1.2.0",
