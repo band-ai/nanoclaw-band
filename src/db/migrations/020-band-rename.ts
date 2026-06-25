@@ -20,7 +20,7 @@ import type { Migration } from './index.js';
  * 'thenvoi', and closing forces fresh sessions with 'band' routing on the
  * next inbound message.
  */
-export const migration020: Migration = {
+export const bandRename: Migration = {
   version: 20,
   name: 'band-rename',
   up: (db: Database.Database) => {

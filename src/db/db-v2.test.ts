@@ -42,10 +42,28 @@ import {
   listModuleState,
   setModuleState,
 } from './index.js';
+import { registerChannelMigrations } from './migrations/index.js';
 
 function now() {
   return new Date().toISOString();
 }
+
+// module_state is not in core schema — it's created by a channel migration
+// (Band, in production). Register a local one so the generic module-state.ts
+// helper has its table here without coupling this core test to the Band channel.
+// Doubles as coverage for the channel-migration registry seam.
+registerChannelMigrations('db-v2-test', [
+  {
+    version: 1,
+    name: 'db-v2-test-module-state',
+    up: (db) =>
+      db.exec(
+        `CREATE TABLE IF NOT EXISTS module_state (
+           module_name TEXT NOT NULL, key TEXT NOT NULL, value_json TEXT NOT NULL,
+           updated_at TEXT NOT NULL, PRIMARY KEY (module_name, key));`,
+      ),
+  },
+]);
 
 beforeEach(() => {
   const db = initTestDb();

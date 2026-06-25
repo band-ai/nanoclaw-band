@@ -21,6 +21,9 @@ import { writeSessionMessage } from '../session-manager.js';
 import { wakeContainer } from '../container-runner.js';
 import { registerDeliveryAction } from '../delivery.js';
 import { getModuleState, setModuleState, deleteModuleState } from '../db/module-state.js';
+import { registerChannelMigrations } from '../db/migrations/index.js';
+import { moduleBandState } from '../db/migrations/module-band-state.js';
+import { bandRename } from '../db/migrations/020-band-rename.js';
 import { log } from '../log.js';
 import { getBandConfig, type BandConfig } from '../modules/band-config.js';
 
@@ -1389,3 +1392,8 @@ registerChannelAdapter('band', {
     return new BandChannelAdapter(config);
   },
 });
+
+// Band channel migrations. Registered here (not in the core barrel) so a
+// Band-free install never runs them. Order matters: module_state must exist
+// before band-rename can rewrite its rows.
+registerChannelMigrations(BAND_CHANNEL_TYPE, [moduleBandState, bandRename]);

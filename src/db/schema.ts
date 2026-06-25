@@ -171,7 +171,9 @@ CREATE TABLE inbound_delivery_ledger (
   PRIMARY KEY (channel_type, platform_id, platform_message_id)
 );
 
--- Cross-module state for host modules such as Band main-room/contact-hub state.
+-- Cross-module state (Band-owned). Managed by Band channel migrations
+-- (module-band-state + band-rename in src/channels/band.ts). Absent on
+-- Band-free installs.
 CREATE TABLE module_state (
   module_name TEXT NOT NULL,
   key         TEXT NOT NULL,

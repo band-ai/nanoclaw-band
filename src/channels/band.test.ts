@@ -149,6 +149,12 @@ describe('band channel adapter', () => {
     fakeChats = [{ id: 'room-1', title: 'Room 1', type: 'direct' }];
     fakeParticipants = {};
     clearBandEnv();
+    // Import band.js BEFORE runMigrations so its registerChannelMigrations('band', …)
+    // lands first — Band owns the module_state table (it's no longer in core
+    // schema). This mirrors production order: src/channels/index.ts is imported
+    // before main() calls runMigrations. Each `it` re-imports band.js, which is
+    // idempotent against the same post-resetModules module instance.
+    await import('./band.js');
     const { closeDb, initTestDb, runMigrations } = await import('../db/index.js');
     const db = initTestDb();
     runMigrations(db);

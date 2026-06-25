@@ -31,14 +31,6 @@ export const migration019: Migration = {
 
       CREATE INDEX IF NOT EXISTS idx_inbound_delivery_last_seen
         ON inbound_delivery_ledger(last_seen);
-
-      CREATE TABLE IF NOT EXISTS module_state (
-        module_name TEXT NOT NULL,
-        key         TEXT NOT NULL,
-        value_json  TEXT NOT NULL,
-        updated_at  TEXT NOT NULL,
-        PRIMARY KEY (module_name, key)
-      );
     `);
   },
 };
