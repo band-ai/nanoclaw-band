@@ -171,20 +171,9 @@ CREATE TABLE inbound_delivery_ledger (
   PRIMARY KEY (channel_type, platform_id, platform_message_id)
 );
 
--- Outbound delivery correlation used by channel fallbacks to avoid duplicating
--- messages already sent through platform MCP/tool paths.
-CREATE TABLE outbound_delivery_markers (
-  marker_key          TEXT PRIMARY KEY,
-  session_id          TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
-  outbound_message_id TEXT,
-  channel_type        TEXT NOT NULL,
-  platform_id         TEXT NOT NULL,
-  tool_call_id        TEXT,
-  platform_message_id TEXT,
-  delivered_at        TEXT NOT NULL
-);
-
--- Cross-module state for host modules such as Band main-room/contact-hub state.
+-- Cross-module state (Band-owned). Managed by Band channel migrations
+-- (module-band-state + band-rename in src/channels/band.ts). Absent on
+-- Band-free installs.
 CREATE TABLE module_state (
   module_name TEXT NOT NULL,
   key         TEXT NOT NULL,

@@ -46,6 +46,8 @@ import {
 import { log } from './log.js';
 import { openInboundDb, openOutboundDb, openOutboundDbRw, inboundDbPath, heartbeatPath } from './session-manager.js';
 import { isContainerRunning, killContainer, wakeContainer } from './container-runner.js';
+import { getMessagingGroup } from './db/messaging-groups.js';
+import { getChannelAdapter } from './channels/channel-registry.js';
 import type { Session } from './types.js';
 
 /**
@@ -242,6 +244,19 @@ function bashTimeoutMs(state: ContainerState | null): number | null {
   return typeof state.tool_declared_timeout_ms === 'number' ? state.tool_declared_timeout_ms : null;
 }
 
+/**
+ * Returns true when any adapter handling the session's messaging group
+ * declares needsGracefulStop. The host sweep uses this to tag ceiling kills
+ * with 'graceful' so stopGraceForReason grants the long window.
+ */
+function sessionNeedsGracefulStop(session: Session): boolean {
+  if (!session.messaging_group_id) return false;
+  const mg = getMessagingGroup(session.messaging_group_id);
+  if (!mg) return false;
+  const adapter = getChannelAdapter(mg.instance ?? mg.channel_type);
+  return adapter?.needsGracefulStop === true;
+}
+
 function enforceRunningContainerSla(
   inDb: Database.Database,
   outDb: Database.Database,
@@ -263,7 +278,8 @@ function enforceRunningContainerSla(
       heartbeatAgeMs: decision.heartbeatAgeMs,
       ceilingMs: decision.ceilingMs,
     });
-    killContainer(session.id, 'absolute-ceiling');
+    const stopReason = sessionNeedsGracefulStop(session) ? 'absolute-ceiling graceful' : 'absolute-ceiling';
+    killContainer(session.id, stopReason);
     resetStuckProcessingRows(inDb, outDb, session, 'absolute-ceiling');
     return;
   }

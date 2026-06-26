@@ -20,11 +20,6 @@ export {
   type ModuleStateRow,
 } from './module-state.js';
 export {
-  getOutboundDeliveryMarker,
-  recordOutboundDeliveryMarker,
-  type OutboundDeliveryMarker,
-} from './outbound-delivery-markers.js';
-export {
   createAgentGroup,
   getAgentGroup,
   getAgentGroupByFolder,

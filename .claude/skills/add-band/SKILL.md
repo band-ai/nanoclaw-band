@@ -5,7 +5,33 @@ description: Add Band.ai channel integration. The product formerly known as Then
 
 # Add Band.ai Channel
 
-Adds Band.ai chat support to NanoClaw. Band is the product (formerly Thenvoi; domain `app.band.ai`). The channel registers as `band`, platform IDs use the `band:` prefix, and configuration uses `BAND_*` environment variables (legacy `THENVOI_*` names are honored as a fallback). Only the npm package scope keeps the old name (`@thenvoi/rest-client`) until the renamed packages are published.
+Adds Band.ai chat support to NanoClaw. The channel registers as `band`, platform
+IDs use the `band:` prefix, and configuration uses `BAND_*` environment variables
+(legacy `THENVOI_*` names are honored as a fallback).
+
+Band installs **additively**, exactly like every other channel skill: copy the
+Band files in from the `band` branch, append three self-registration imports,
+install the pinned SDK, build. No `git merge`, no tags, no source-level edits to
+core. The generic core seams Band rides — the inbound-delivery ledger,
+channel-migration registry, container lifecycle hooks, and user-visible-tool
+registry — already live in trunk, so nothing in core needs to change. The Band
+channel migrations register themselves on import (no separate migration wiring).
+
+## Prerequisites
+
+> **The `band` branch must be published first.** This skill copies every Band
+> file from `origin/band`. That long-lived branch (parallel to the `channels`
+> branch other channels ship from) is **not yet pushed**. Until it is,
+> `git fetch origin band` will fail and there is nothing to copy. Push the `band`
+> branch before running this skill. Do not substitute a different branch unless
+> you have confirmed it carries the same Band file set and is kept in sync with
+> trunk's seam types.
+
+> **Install onto a Band-free base.** This skill assumes core does **not** already
+> contain the Band files (a clean trunk / `validate/band-free-base` checkout). If
+> Band code is already inlined into your tree, you are not installing additively —
+> stop and reconcile first. The Pre-flight check below tells you which case you
+> are in.
 
 ## Install
 
@@ -13,110 +39,121 @@ Adds Band.ai chat support to NanoClaw. Band is the product (formerly Thenvoi; do
 
 Skip to **Credentials** if all of these are already in place:
 
-- `src/channels/band.ts` exists
-- `src/channels/channel-container-registry.ts` exists
+- `src/channels/band.ts` and `src/modules/band-config.ts` exist
+- `src/db/migrations/module-band-state.ts` and `src/db/migrations/020-band-rename.ts` exist
 - `src/channels/index.ts` contains `import './band.js';`
-- `src/db/inbound-delivery-ledger.ts`, `src/db/module-state.ts`, and `src/db/outbound-delivery-markers.ts` exist
-- `container/agent-runner/src/mcp-tools/band.ts` exists
+- `container/agent-runner/src/mcp-tools/band.ts` and `container/agent-runner/src/band-lifecycle.ts` exist
 - `container/agent-runner/src/mcp-tools/index.ts` contains `import './band.js';`
-- `container/agent-runner/src/band-memory-load.ts` and `container/agent-runner/src/band-memory-consolidate.ts` exist
-- `@thenvoi/sdk` and `@thenvoi/rest-client` are listed in `package.json`
-- `@thenvoi/sdk` and `@thenvoi/rest-client` are listed in `container/agent-runner/package.json`
-- `docker-compose.yml`, `Dockerfile.host`, `container/Dockerfile`, and `.env.compose.template` exist
-- `container/agent-runner/src/providers/claude.ts` contains `CLAUDE_CODE_EXECUTABLE`
-- `container/agent-runner/src/providers/mock.ts` wraps default replies in `<message to="...">` when a prompt has a source destination
-- `src/container-runner.ts` calls `rewriteOneCliProxyArgs(args)` after OneCLI applies container config
+- `container/agent-runner/src/index.ts` contains `import './band-lifecycle.js';`
+- `@band-ai/sdk` and `@band-ai/rest-client` are listed in `package.json`
+- `@band-ai/sdk` is listed in `container/agent-runner/package.json`
 
 Otherwise continue. Every step below is safe to re-run.
 
-### 1. Fetch the Band integration branch
-
-Fetch the branch that carries the v2 Band.ai integration:
+### 1. Fetch the band branch
 
 ```bash
-git fetch origin migrate/band-v2-foundation
+git fetch origin band
 ```
 
-If this integration has landed under a different branch name, use that branch in the `git show` commands below.
+If this fails, see **Prerequisites** above — the branch is not yet published.
 
-### 2. Copy the Band runtime file set
+### 2. Copy the Band files in
 
-Band touches channel ingestion, route idempotency, outbound delivery markers, container env projection, and the agent-runner MCP/tools loop. Copy the whole tested file set from the integration branch instead of only the obvious `band.ts` files; a partial copy can compile but fail at runtime, or fail typecheck because shared route contracts drifted.
+Copy the full tested Band file set (adapter, config, two channel migrations, the
+container MCP tool + memory hooks + lifecycle registration, and all their tests):
 
 ```bash
-git checkout origin/migrate/band-v2-foundation -- \
-  .dockerignore \
-  .env.compose.template \
-  .env.example \
-  .gitignore \
-  Dockerfile.host \
-  docker-compose.yml \
-  docs/docker-compose-deployment.md \
-  container/Dockerfile \
-  container/agent-runner/bun.lock \
-  container/agent-runner/package.json \
-  container/agent-runner/src/band-memory-consolidate.test.ts \
-  container/agent-runner/src/band-memory-consolidate.ts \
-  container/agent-runner/src/band-memory-load.test.ts \
-  container/agent-runner/src/band-memory-load.ts \
-  container/agent-runner/src/index.ts \
-  container/agent-runner/src/integration.test.ts \
-  container/agent-runner/src/mcp-tools/index.ts \
-  container/agent-runner/src/mcp-tools/server.ts \
-  container/agent-runner/src/mcp-tools/band.instructions.md \
-  container/agent-runner/src/mcp-tools/band.test.ts \
-  container/agent-runner/src/mcp-tools/band.ts \
-  container/agent-runner/src/poll-loop.test.ts \
-  container/agent-runner/src/poll-loop.ts \
-  container/agent-runner/src/providers/claude.ts \
-  container/agent-runner/src/providers/mock.ts \
-  container/agent-runner/src/providers/types.ts \
-  package.json \
-  pnpm-lock.yaml \
-  src/channels/adapter.ts \
-  src/channels/channel-container-registry.test.ts \
-  src/channels/channel-container-registry.ts \
-  src/channels/cli.ts \
-  src/channels/index.ts \
-  src/channels/band.test.ts \
+for f in \
   src/channels/band.ts \
-  src/circuit-breaker.test.ts \
-  src/circuit-breaker.ts \
-  src/container-runner.test.ts \
-  src/container-runner.ts \
-  src/container-runtime.test.ts \
-  src/container-runtime.ts \
-  src/db/db-v2.test.ts \
-  src/db/inbound-delivery-ledger.ts \
-  src/db/index.ts \
-  src/db/migrations/014-route-foundation-state.ts \
-  src/db/migrations/015-band-rename.ts \
-  src/db/migrations/index.ts \
-  src/db/module-state.ts \
-  src/db/outbound-delivery-markers.ts \
-  src/db/schema.ts \
-  src/db/session-db.test.ts \
-  src/db/session-db.ts \
-  src/db/sessions.ts \
-  src/host-core.test.ts \
-  src/index.ts \
-  src/modules/agent-to-agent/agent-route.test.ts \
+  src/channels/band.test.ts \
   src/modules/band-config.ts \
-  src/providers/claude.ts \
-  src/providers/index.ts \
-  src/router.ts
+  src/db/migrations/module-band-state.ts \
+  src/db/migrations/020-band-rename.ts \
+  container/agent-runner/src/mcp-tools/band.ts \
+  container/agent-runner/src/mcp-tools/band.test.ts \
+  container/agent-runner/src/mcp-tools/band.instructions.md \
+  container/agent-runner/src/band-lifecycle.ts \
+  container/agent-runner/src/band-memory-load.ts \
+  container/agent-runner/src/band-memory-load.test.ts \
+  container/agent-runner/src/band-memory-consolidate.ts \
+  container/agent-runner/src/band-memory-consolidate.test.ts ; do
+  mkdir -p "$(dirname "$f")"
+  git show "origin/band:$f" > "$f"
+done
 ```
 
-This command also brings in the self-registration imports, migration registration, and db barrel exports. If the checkout has local changes in any listed file, review `git diff` first and merge deliberately instead of blindly overwriting.
+`src/channels/band.ts` registers the two Band channel migrations on import
+(`registerChannelMigrations('band', [moduleBandState, bandRename])`), so the
+copied files carry their own migration wiring — **do not** edit the core
+migration barrel.
 
-### 3. Install packages from the copied lockfiles
+### 3. Append the three self-registration imports (skip any already present)
+
+`src/channels/index.ts` — registers the host channel adapter:
+
+```typescript
+import './band.js';
+```
+
+`container/agent-runner/src/mcp-tools/index.ts` — registers the room-scoped
+`band_*` tools:
+
+```typescript
+import './band.js';
+```
+
+`container/agent-runner/src/index.ts` — registers the start/stop lifecycle hooks
+(participant-memory load + end-of-session consolidation). This import **must come
+after** the `import './providers/index.js';` line (so providers register first)
+and **before** the `runStartHooks(...)` call:
+
+```typescript
+import './band-lifecycle.js';
+```
+
+### 4. Install the pinned dependencies
+
+Pinned to exact versions (never a range, per the supply-chain policy). The host
+needs both the SDK and the REST client; the agent-runner container tree needs the
+SDK only.
 
 ```bash
-pnpm install --frozen-lockfile
-cd container/agent-runner && bun install --frozen-lockfile
+# host (Node + pnpm)
+pnpm add @band-ai/sdk@0.1.6 @band-ai/rest-client@0.0.121
+
+# container (agent-runner is a separate Bun package tree — bun, not pnpm)
+cd container/agent-runner && bun add @band-ai/sdk@0.1.6 && cd -
 ```
 
-### 4. Configure environment
+> `@band-ai/sdk@0.1.6` still exports its link class under the **pre-rename** name
+> `ThenvoiLink`. The host adapter imports it as `ThenvoiLink as BandLink`; the
+> container modules import `ThenvoiLink` directly (plus `AgentTools` from
+> `@band-ai/sdk/runtime`). This is expected — do not "fix" the import to a
+> `BandLink` export that the published package does not have. [VERIFY.md](VERIFY.md)
+> step 2 guards against version skew here.
+
+### 5. Build host + container
+
+```bash
+pnpm run build
+./container/build.sh
+```
+
+The base Band channel — receiving and replying in Band rooms via the room-scoped
+`band_*` container tools — needs **no** python3 and **no** band-mcp. Rebuilding
+the image lets the agent-runner overlay pick up the copied container files.
+
+### 6. Verify
+
+Run the checks in [VERIFY.md](VERIFY.md). At minimum:
+
+```bash
+pnpm test -- src/channels/band.test.ts
+cd container/agent-runner && bun test src/mcp-tools/band.test.ts && cd -
+```
+
+## Credentials
 
 Add the agent credentials to `.env`:
 
@@ -125,97 +162,111 @@ BAND_AGENT_ID=your-agent-id
 BAND_API_KEY=your-agent-api-key
 # Optional. Defaults to https://app.band.ai when unset.
 BAND_BASE_URL=https://app.band.ai
-
-# Optional. UUID of the Band user who owns this agent. Used by the contact
-# hub-room strategy (added as the room owner) and other paths that need to
-# address the owner directly. Falls back to GET /agent/me when unset.
+# Optional. UUID of the Band user who owns this agent. Falls back to GET /agent/me.
 BAND_OWNER_ID=
-
-# Memory feature flags. See "Memory knobs" below.
-BAND_MEMORY_TOOLS=false
-BAND_MEMORY_LOAD_ON_START=false
-BAND_MEMORY_CONSOLIDATION=false
-
-# Contact-event strategy: disabled | hub_room.
-# See "Contact strategies" below.
-BAND_CONTACT_STRATEGY=disabled
-# Optional. Agent group that should handle Contact Hub synthetic messages.
-# If unset and exactly one agent group exists, NanoClaw uses that group.
-BAND_CONTACT_AGENT_GROUP_ID=
 ```
 
-For normal hosted Band.ai, leave `BAND_BASE_URL` unset or set it to `https://app.band.ai`. Direct `BAND_API_KEY` injection into agent containers is only for local HTTP validation or explicit `BAND_INJECT_API_KEY=true`; hosted HTTPS sessions should use OneCLI secret injection. Existing installs with `THENVOI_*` variables keep working — `BAND_*` simply takes precedence when both are set.
+### Where these values come from
 
-#### Memory knobs
+- **`BAND_API_KEY` (create scope):** your personal Band API key from app.band.ai
+  → Settings → API Keys. Used **only** to mint the agent below; not stored
+  long-term.
+- **`BAND_AGENT_ID` + `BAND_API_KEY` (agent scope):** run the bundled helper,
+  which registers a Band external agent and prints both. The printed
+  `BAND_API_KEY` is the **agent-scoped** key and replaces the create-scope one:
 
-- `BAND_MEMORY_TOOLS` — exposes `mcp__nanoclaw__band_list_memories`, `band_store_memory`, `band_supersede_memory`, etc. to the agent. The other two memory knobs are no-ops without this enabled.
-- `BAND_MEMORY_LOAD_ON_START` — at container startup, fetch each room participant's stored memories via the SDK (`thenvoi_list_memories`, scope=`subject`, top 10 per participant) and append them to the system prompt as `## Existing Memories About Room Participants`. Also injects a synthetic `[System]` message into the room when a new participant joins mid-session (`participant_added`), with up to 10 of that participant's memories. Failure is non-fatal: the agent still starts.
-- `BAND_MEMORY_CONSOLIDATION` — after the poll loop exits (typically on SIGTERM from `docker stop` when the host kills the container), run a one-shot consolidation pass against the same provider session. The pass is forbidden from sending chat messages or `<message to="…">` blocks; only memory tools are available at runtime. Output is drained, not delivered. No-op unless `BAND_MEMORY_TOOLS` is also enabled.
+  ```bash
+  export BAND_API_KEY=<your create-scope key>     # or omit to paste at the prompt
+  eval "$(.claude/skills/add-band/scripts/register-agent.sh)"
+  # → prints BAND_AGENT_ID=<uuid> and BAND_API_KEY=<agent-scoped key>
+  ```
 
-#### Contact strategies
+  Append the two printed lines to `.env` (the agent-scoped `BAND_API_KEY`
+  overwrites the create-scope value). These are the exact names the adapter reads
+  (`src/modules/band-config.ts`). The script never echoes the create-scope key
+  and never passes it on `argv`.
+- **`BAND_OWNER_ID` (optional):** the Band user UUID that owns this agent —
+  app.band.ai → your profile. Leave unset to let the adapter fall back to
+  `GET /agent/me`.
+- **Room IDs:** you do **not** set these. Discovery writes Band rooms into
+  `messaging_groups` automatically; you wire them with `/manage-channels`
+  (platform id `band:<room-id>`). The container vars `BAND_ROOM_ID` /
+  `BAND_REST_URL` are injected per-session by the adapter — never put them in
+  `.env`.
 
-`BAND_CONTACT_STRATEGY` controls what the host does with `contact_request_received`, `contact_request_updated`, `contact_added`, and `contact_removed` events emitted by Band:
+For hosted Band.ai, leave `BAND_BASE_URL` unset (or `https://app.band.ai`) and let
+OneCLI inject `BAND_API_KEY` at request time — direct env injection into
+containers is only for local HTTP validation or explicit `BAND_INJECT_API_KEY=true`.
+Installs with legacy `THENVOI_*` variables keep working; `BAND_*` takes precedence.
 
-- `disabled` (default) — events are dropped silently. The agent never sees contacts; outbound contact tools still work.
-- `hub_room` — lazily provision a per-agent "Contact Hub" Band chat room, add `BAND_OWNER_ID` (or the value resolved from `GET /agent/me`) as a member, persist its room id in `data/v2.db` module state, wire it to `BAND_CONTACT_AGENT_GROUP_ID` (or the only agent group when exactly one exists), and forward every contact event into the hub as a synthetic message. The owner replies in the hub.
+Memory pre-load/consolidation and contact-event handling are off by default. To
+enable them, see [reference/configuration.md](reference/configuration.md).
 
-Sync the environment file if this instance uses `data/env/env`:
+If this instance reads its environment from `data/env/env`, sync it:
 
 ```bash
 mkdir -p data/env && cp .env data/env/env
 ```
 
-### 5. Build and test
-
-```bash
-pnpm install
-pnpm run build
-pnpm test -- src/channels/band.test.ts
-cd container/agent-runner && bun test src/mcp-tools/band.test.ts
-```
-
 ## Wire Band rooms
 
-The Band adapter discovers rooms into `messaging_groups`, but discovery alone does not wire a room to an agent. Run `/manage-channels` and wire the desired Band room using:
+Discovery writes rooms into `messaging_groups` but does **not** wire them to an
+agent. Run `/manage-channels` and wire the room:
 
 - **type**: `band`
 - **platform ID format**: `band:<room-id>`
-- **session mode**: `shared` for room-local conversations, or `agent-shared` only when intentionally merging multiple channel surfaces into one agent session
+- **session mode**: `shared` for room-local conversations; `agent-shared` only when
+  intentionally merging multiple surfaces into one agent session
 
-For v1-style Band parity, use an engagement policy that responds in the selected room rather than silently accumulating ignored chatter.
+## Outbound origination: Band MCP (optional, advanced)
+
+The native `band_*` tools above are room-scoped — they act inside a Band room the
+agent already serves, and they cover the entire base channel (receive + reply). No
+band-mcp is needed for that, and the base install above adds nothing to the
+Dockerfile.
+
+Letting your **global / DM** assistant *originate* Band activity from outside Band
+("make a Band chat with X and post Y there") is a separate, optional capability:
+the standalone `band-mcp` server, wired into **one** global / non-room agent
+group's container config (never into a Band-room agent group). It requires manual
+Dockerfile edits to install the Python package and an OneCLI `X-API-Key` secret.
+See [reference/configuration.md](reference/configuration.md#outbound-origination-band-mcp-global-agent-only).
 
 ## Channel Info
 
 - **type**: `band`
 - **user-facing name**: Band.ai
-- **terminology**: Band has rooms/chats. The main control room is the owner-visible direct room and blocks room/participant mutation tools.
+- **terminology**: rooms/chats; the main control room is the owner-visible direct
+  room and blocks room/participant mutation tools
 - **platform-id-format**: `band:<roomId>`
 - **supports-threads**: no
-- **typical-use**: Direct Band room or shared collaboration room with SDK-backed platform tools
-- **default-isolation**: Same agent group for your own Band rooms. Separate agent groups for rooms with different people, projects, or data boundaries.
+- **default-isolation**: same agent group for your own Band rooms; separate agent
+  groups for rooms with different people, projects, or data boundaries
 
 ## Features
 
-- Native Band message ingestion through the Band SDK
-- SDK-backed Claude-visible tools exposed as `band_*`
-- Fallback outbound delivery for ordinary NanoClaw `messages_out` chat rows
-- Main control room detection and container env propagation
-- Main-room participant/room mutation guardrails
-- Memory tools gated by `BAND_MEMORY_TOOLS` and disabled for the run if the Band memory API is unavailable
-- Optional participant-memory pre-load at startup (`BAND_MEMORY_LOAD_ON_START`)
-- Optional end-of-session memory consolidation pass (`BAND_MEMORY_CONSOLIDATION`)
+- Native Band ingestion through the Band SDK
+- Claude-visible platform tools exposed as `band_*`
+- Fallback outbound delivery for ordinary `messages_out` chat rows
+- Main-room detection, container env propagation, and mutation guardrails
+- Optional participant-memory pre-load and end-of-session consolidation
+  (`BAND_MEMORY_*`) — see [reference/configuration.md](reference/configuration.md)
 - Contact-event handling: drop or hub-room forwarding (`BAND_CONTACT_STRATEGY`)
-- Hosted Band sessions avoid direct API-key env injection; local HTTP validation can opt in
 
 ## Troubleshooting
 
-If messages appear in Band but the agent does not answer, check that the room is wired, not only discovered:
+Messages appear in Band but the agent stays silent → the room is discovered but
+not wired:
 
 ```bash
 pnpm exec tsx scripts/q.ts data/v2.db "SELECT id, channel_type, platform_id, name FROM messaging_groups WHERE channel_type='band'"
 pnpm exec tsx scripts/q.ts data/v2.db "SELECT messaging_group_id, agent_group_id, session_mode FROM messaging_group_agents"
 ```
 
-If tools are missing inside the container, verify that the session is Band-backed and that `container/agent-runner/src/mcp-tools/index.ts` imports `./band.js`.
+Tools missing inside the container → confirm the session is Band-backed and that
+`container/agent-runner/src/mcp-tools/index.ts` imports `./band.js`.
 
-If memory tools return disabled/unavailable, leave them disabled for that run. Do not claim cross-room memory was stored unless the `band_store_memory` call succeeds.
+Memory tools return disabled/unavailable → leave them disabled for that run; do
+not claim memory was stored unless a `band_store_memory` call succeeded.
+
+To uninstall, see [REMOVE.md](REMOVE.md). To smoke-test, see [VERIFY.md](VERIFY.md).

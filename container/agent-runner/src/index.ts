@@ -31,10 +31,14 @@ import { ensureMemoryScaffold } from './memory-scaffold.js';
 // Providers barrel — each enabled provider self-registers on import.
 // Provider skills append imports to providers/index.ts.
 import './providers/index.js';
+// Channel lifecycle-hook modules self-register on import (start/stop hooks).
+// Such an import must follow the providers barrel (so providers register
+// first) and precede the runStartHooks call below; channel install skills
+// append their `import './<channel>-lifecycle.js';` here.
 import { createProvider, type ProviderName } from './providers/factory.js';
+import { buildMcpServers } from './mcp-servers.js';
+import { runStartHooks, runStopHooks } from './lifecycle.js';
 import { runPollLoop } from './poll-loop.js';
-import { loadParticipantMemories } from './band-memory-load.js';
-import { runMemoryConsolidation } from './band-memory-consolidate.js';
 import { getContinuation } from './db/session-state.js';
 
 function log(msg: string): void {
@@ -57,12 +61,12 @@ async function main(): Promise<void> {
   // memory lives in /workspace/agent/CLAUDE.local.md (auto-loaded).
   let instructions = buildSystemPromptAddendum(config.assistantName || undefined);
 
-  // Band.ai memory pre-load (no-op when not Band or when feature is off).
-  // Appended once at startup so the agent has participant context from the
-  // first turn instead of needing to call list_memories itself.
-  const memoryBlock = await loadParticipantMemories();
-  if (memoryBlock) {
-    instructions = `${instructions}\n\n${memoryBlock}`;
+  // Start hooks: channel/provider callbacks that may return a system-prompt
+  // addendum (e.g. Band memory pre-load). Core ships no hooks; channels
+  // register them via band-lifecycle.ts (imported as a side effect).
+  const startAddenda = await runStartHooks({ assistantName: config.assistantName || undefined, cwd: CWD });
+  for (const addendum of startAddenda) {
+    instructions = `${instructions}\n\n${addendum}`;
   }
 
   // Discover additional directories mounted at /workspace/extra/*
@@ -88,22 +92,19 @@ async function main(): Promise<void> {
     Object.entries(process.env).filter((entry): entry is [string, string] => typeof entry[1] === 'string'),
   );
 
-  // Build MCP servers config: nanoclaw built-in + any from container.json.
-  // The built-in server is a subprocess of the provider, so it needs the same
-  // container env as the runner for channel-provided tools (Band/Thenvoi, etc.)
-  // to register and for OneCLI proxy variables to reach SDK REST calls.
-  const mcpServers: Record<string, { command: string; args: string[]; env: Record<string, string> }> = {
-    nanoclaw: {
-      command: 'bun',
-      args: ['run', mcpServerPath],
-      env: mcpEnv,
+  const mcpServers = buildMcpServers({
+    builtin: {
+      nanoclaw: {
+        command: 'bun',
+        args: ['run', mcpServerPath],
+        env: mcpEnv,
+      },
     },
-  };
-
-  for (const [name, serverConfig] of Object.entries(config.mcpServers)) {
-    mcpServers[name] = serverConfig;
-    log(`Additional MCP server: ${name} (${serverConfig.command})`);
-  }
+    configServers: config.mcpServers,
+    mcpEnv,
+    extraMcpJson: process.env.NANOCLAW_EXTRA_MCP_SERVERS,
+    log,
+  });
 
   const provider = createProvider(providerName, {
     assistantName: config.assistantName || undefined,
@@ -143,15 +144,10 @@ async function main(): Promise<void> {
     signal: shutdown.signal,
   });
 
-  // Post-loop hooks. Continuation is read fresh from outbound.db — the loop
-  // persists it on every `init` event, so this picks up the latest session id.
+  // Stop hooks: run after poll loop exits (on SIGTERM/SIGINT). Errors are
+  // swallowed per hook so one failure can't block the others.
   const continuation = getContinuation(providerName);
-  await runMemoryConsolidation({
-    provider,
-    providerName,
-    cwd: CWD,
-    continuation,
-  });
+  await runStopHooks({ provider, providerName, cwd: CWD, continuation });
 }
 
 main().catch((err) => {
