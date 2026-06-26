@@ -9,16 +9,18 @@
 # argv (`ps`). Only the returned agent-scoped id + key are printed; the Band API
 # key is never echoed.
 #
-# Output (stdout — capture- / eval-able). These are the EXACT names the adapter
-# reads (src/modules/band-config.ts): BAND_AGENT_ID + BAND_API_KEY. The emitted
+# Output (stdout — dotenv lines). These are the EXACT names the adapter reads
+# (src/modules/band-config.ts): BAND_AGENT_ID + BAND_API_KEY. The emitted
 # BAND_API_KEY is the agent-scoped key and replaces the create-scope key you
-# pasted below — persist it in .env.
+# pasted below — persist it in .env. Do not eval this output; append or upsert
+# it as dotenv content.
 #   BAND_AGENT_ID=<uuid>
 #   BAND_API_KEY=<agent-scoped-key>
 #
 # Usage:
 #   export BAND_API_KEY=...                  # your CREATE-scope key, or paste at the prompt
-#   eval "$(scripts/register-agent.sh)"      # sets BAND_AGENT_ID + BAND_API_KEY (agent-scoped)
+#   scripts/register-agent.sh > /tmp/band-agent.env
+#   # then copy/upsert the two output lines into .env
 #
 # Env knobs: BAND_BASE_URL (default https://app.band.ai),
 #            BAND_AGENT_NAME, BAND_AGENT_DESCRIPTION, BAND_USER_AGENT.
@@ -39,7 +41,16 @@ if [ -z "${BAND_API_KEY:-}" ]; then
 fi
 [ -n "${BAND_API_KEY:-}" ] || { echo "band: Band API key (agent-create scope) required" >&2; exit 1; }
 
-req_body=$(printf '{"agent":{"name":"%s","description":"%s"}}' "$name" "$desc")
+if command -v jq >/dev/null 2>&1; then
+  req_body=$(jq -cn --arg name "$name" --arg description "$desc" '{agent:{name:$name,description:$description}}')
+elif command -v python3 >/dev/null 2>&1; then
+  req_body=$(
+    NAME="$name" DESCRIPTION="$desc" python3 -c 'import json, os; print(json.dumps({"agent": {"name": os.environ["NAME"], "description": os.environ["DESCRIPTION"]}}))'
+  )
+else
+  echo "band: need jq or python3 to build and parse JSON safely" >&2
+  exit 1
+fi
 
 # Only the secret X-API-Key header goes through stdin (-K -), never argv.
 resp=$(curl -sS -X POST "$base/api/v1/me/agents/register" \

@@ -10,7 +10,7 @@ IDs use the `band:` prefix, and configuration uses `BAND_*` environment variable
 (legacy `THENVOI_*` names are honored as a fallback).
 
 Band installs **additively**, exactly like every other channel skill: copy the
-Band files in from the `band` branch, append three self-registration imports,
+Band files in from the `band/adapter` branch, append three self-registration imports,
 install the pinned SDK, build. No `git merge`, no tags, no source-level edits to
 core. The generic core seams Band rides — the inbound-delivery ledger,
 channel-migration registry, container lifecycle hooks, and user-visible-tool
@@ -19,13 +19,16 @@ channel migrations register themselves on import (no separate migration wiring).
 
 ## Prerequisites
 
-> **The `band` branch must be published first.** This skill copies every Band
-> file from `origin/band`. That long-lived branch (parallel to the `channels`
-> branch other channels ship from) is **not yet pushed**. Until it is,
-> `git fetch origin band` will fail and there is nothing to copy. Push the `band`
-> branch before running this skill. Do not substitute a different branch unless
-> you have confirmed it carries the same Band file set and is kept in sync with
-> trunk's seam types.
+> **The `band/adapter` branch must be published first.** This skill copies every
+> Band file from `origin/band/adapter` — a long-lived source branch parallel to
+> the `channels` branch other channels ship from. It is **not yet pushed**; until
+> it is, `git fetch origin band/adapter` will fail and there is nothing to copy.
+> Push the `band/adapter` branch before running this skill. Do not substitute a
+> different branch unless you have confirmed it carries the same Band file set and
+> is kept in sync with trunk's seam types.
+>
+> (The source is named `band/adapter`, not `band`, because a bare `band` ref
+> cannot coexist with the `band/platform` branch in the same repository.)
 
 > **Install onto a Band-free base.** This skill assumes core does **not** already
 > contain the Band files (a clean trunk / `validate/band-free-base` checkout). If
@@ -34,6 +37,31 @@ channel migrations register themselves on import (no separate migration wiring).
 > are in.
 
 ## Install
+
+### Base requirement — the channel seams must already be present
+
+Band rides six generic core **seams** (channel-migration registry, delivery-ack
+gating, graceful-stop window, MCP/user-visible-tool contribution, container
+lifecycle hooks, env-precedence). They ship in the fork `main`, **not** in this
+skill — so installing Band onto a base that lacks them (e.g. a plain upstream
+checkout) would copy the files and then fail the build with cryptic
+"undefined export" errors. Verify the base first:
+
+```bash
+missing=0
+grep -q 'registerChannelMigrations' src/db/migrations/index.ts                  || { echo "missing seam: channel-migration registry"; missing=1; }
+grep -q 'supportsDeliveryAck'        src/channels/adapter.ts                     || { echo "missing seam: delivery-ack capability"; missing=1; }
+grep -q 'needsGracefulStop'          src/channels/adapter.ts                     || { echo "missing seam: graceful-stop capability"; missing=1; }
+grep -q 'userVisibleTools'           src/providers/provider-container-registry.ts || { echo "missing seam: mcpServers/userVisibleTools contribution"; missing=1; }
+test -f container/agent-runner/src/lifecycle.ts                                  || { echo "missing seam: container lifecycle hooks"; missing=1; }
+test -f container/agent-runner/src/mcp-servers.ts                                || { echo "missing seam: buildMcpServers"; missing=1; }
+[ "$missing" = 0 ] && echo "seams present — base is ready" || echo "STOP: base lacks the channel seams"
+```
+
+If any seam is missing you are **not** on a seam-equipped base — do **not**
+proceed with the copy. Pull the fork `main` (which carries the seams), then
+re-run. The seams are generic core (not Band-specific) and are a candidate to
+upstream to qwibitai/nanoclaw, after which any upstream install is a valid base.
 
 ### Pre-flight (idempotent)
 
@@ -50,10 +78,10 @@ Skip to **Credentials** if all of these are already in place:
 
 Otherwise continue. Every step below is safe to re-run.
 
-### 1. Fetch the band branch
+### 1. Fetch the band/adapter branch
 
 ```bash
-git fetch origin band
+git fetch origin band/adapter
 ```
 
 If this fails, see **Prerequisites** above — the branch is not yet published.
@@ -79,7 +107,7 @@ for f in \
   container/agent-runner/src/band-memory-consolidate.ts \
   container/agent-runner/src/band-memory-consolidate.test.ts ; do
   mkdir -p "$(dirname "$f")"
-  git show "origin/band:$f" > "$f"
+  git show "origin/band/adapter:$f" > "$f"
 done
 ```
 
@@ -177,12 +205,14 @@ BAND_OWNER_ID=
 
   ```bash
   export BAND_API_KEY=<your create-scope key>     # or omit to paste at the prompt
-  eval "$(.claude/skills/add-band/scripts/register-agent.sh)"
-  # → prints BAND_AGENT_ID=<uuid> and BAND_API_KEY=<agent-scoped key>
+  .claude/skills/add-band/scripts/register-agent.sh > /tmp/band-agent.env
+  # → /tmp/band-agent.env holds BAND_AGENT_ID=<uuid> and BAND_API_KEY=<agent-scoped key>
   ```
 
-  Append the two printed lines to `.env` (the agent-scoped `BAND_API_KEY`
-  overwrites the create-scope value). These are the exact names the adapter reads
+  Append (or upsert) the two lines from `/tmp/band-agent.env` into `.env` — the
+  agent-scoped `BAND_API_KEY` overwrites the create-scope value. **Do not `eval`
+  the output**; treat it as dotenv content (an embedded shell metacharacter in a
+  value would execute under `eval`). These are the exact names the adapter reads
   (`src/modules/band-config.ts`). The script never echoes the create-scope key
   and never passes it on `argv`.
 - **`BAND_OWNER_ID` (optional):** the Band user UUID that owns this agent —
