@@ -35,6 +35,31 @@ channel migrations register themselves on import (no separate migration wiring).
 
 ## Install
 
+### Base requirement — the channel seams must already be present
+
+Band rides six generic core **seams** (channel-migration registry, delivery-ack
+gating, graceful-stop window, MCP/user-visible-tool contribution, container
+lifecycle hooks, env-precedence). They ship in the fork `main`, **not** in this
+skill — so installing Band onto a base that lacks them (e.g. a plain upstream
+checkout) would copy the files and then fail the build with cryptic
+"undefined export" errors. Verify the base first:
+
+```bash
+missing=0
+grep -q 'registerChannelMigrations' src/db/migrations/index.ts                  || { echo "missing seam: channel-migration registry"; missing=1; }
+grep -q 'supportsDeliveryAck'        src/channels/adapter.ts                     || { echo "missing seam: delivery-ack capability"; missing=1; }
+grep -q 'needsGracefulStop'          src/channels/adapter.ts                     || { echo "missing seam: graceful-stop capability"; missing=1; }
+grep -q 'userVisibleTools'           src/providers/provider-container-registry.ts || { echo "missing seam: mcpServers/userVisibleTools contribution"; missing=1; }
+test -f container/agent-runner/src/lifecycle.ts                                  || { echo "missing seam: container lifecycle hooks"; missing=1; }
+test -f container/agent-runner/src/mcp-servers.ts                                || { echo "missing seam: buildMcpServers"; missing=1; }
+[ "$missing" = 0 ] && echo "seams present — base is ready" || echo "STOP: base lacks the channel seams"
+```
+
+If any seam is missing you are **not** on a seam-equipped base — do **not**
+proceed with the copy. Pull the fork `main` (which carries the seams), then
+re-run. The seams are generic core (not Band-specific) and are a candidate to
+upstream to qwibitai/nanoclaw, after which any upstream install is a valid base.
+
 ### Pre-flight (idempotent)
 
 Skip to **Credentials** if all of these are already in place:
