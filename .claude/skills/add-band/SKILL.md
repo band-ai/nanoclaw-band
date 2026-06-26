@@ -10,7 +10,7 @@ IDs use the `band:` prefix, and configuration uses `BAND_*` environment variable
 (legacy `THENVOI_*` names are honored as a fallback).
 
 Band installs **additively**, exactly like every other channel skill: copy the
-Band files in from the `band` branch, append three self-registration imports,
+Band files in from the `band/adapter` branch, append three self-registration imports,
 install the pinned SDK, build. No `git merge`, no tags, no source-level edits to
 core. The generic core seams Band rides — the inbound-delivery ledger,
 channel-migration registry, container lifecycle hooks, and user-visible-tool
@@ -19,13 +19,16 @@ channel migrations register themselves on import (no separate migration wiring).
 
 ## Prerequisites
 
-> **The `band` branch must be published first.** This skill copies every Band
-> file from `origin/band`. That long-lived branch (parallel to the `channels`
-> branch other channels ship from) is **not yet pushed**. Until it is,
-> `git fetch origin band` will fail and there is nothing to copy. Push the `band`
-> branch before running this skill. Do not substitute a different branch unless
-> you have confirmed it carries the same Band file set and is kept in sync with
-> trunk's seam types.
+> **The `band/adapter` branch must be published first.** This skill copies every
+> Band file from `origin/band/adapter` — a long-lived source branch parallel to
+> the `channels` branch other channels ship from. It is **not yet pushed**; until
+> it is, `git fetch origin band/adapter` will fail and there is nothing to copy.
+> Push the `band/adapter` branch before running this skill. Do not substitute a
+> different branch unless you have confirmed it carries the same Band file set and
+> is kept in sync with trunk's seam types.
+>
+> (The source is named `band/adapter`, not `band`, because a bare `band` ref
+> cannot coexist with the `band/platform` branch in the same repository.)
 
 > **Install onto a Band-free base.** This skill assumes core does **not** already
 > contain the Band files (a clean trunk / `validate/band-free-base` checkout). If
@@ -75,10 +78,10 @@ Skip to **Credentials** if all of these are already in place:
 
 Otherwise continue. Every step below is safe to re-run.
 
-### 1. Fetch the band branch
+### 1. Fetch the band/adapter branch
 
 ```bash
-git fetch origin band
+git fetch origin band/adapter
 ```
 
 If this fails, see **Prerequisites** above — the branch is not yet published.
@@ -104,7 +107,7 @@ for f in \
   container/agent-runner/src/band-memory-consolidate.ts \
   container/agent-runner/src/band-memory-consolidate.test.ts ; do
   mkdir -p "$(dirname "$f")"
-  git show "origin/band:$f" > "$f"
+  git show "origin/band/adapter:$f" > "$f"
 done
 ```
 
