@@ -202,12 +202,14 @@ BAND_OWNER_ID=
 
   ```bash
   export BAND_API_KEY=<your create-scope key>     # or omit to paste at the prompt
-  eval "$(.claude/skills/add-band/scripts/register-agent.sh)"
-  # → prints BAND_AGENT_ID=<uuid> and BAND_API_KEY=<agent-scoped key>
+  .claude/skills/add-band/scripts/register-agent.sh > /tmp/band-agent.env
+  # → /tmp/band-agent.env holds BAND_AGENT_ID=<uuid> and BAND_API_KEY=<agent-scoped key>
   ```
 
-  Append the two printed lines to `.env` (the agent-scoped `BAND_API_KEY`
-  overwrites the create-scope value). These are the exact names the adapter reads
+  Append (or upsert) the two lines from `/tmp/band-agent.env` into `.env` — the
+  agent-scoped `BAND_API_KEY` overwrites the create-scope value. **Do not `eval`
+  the output**; treat it as dotenv content (an embedded shell metacharacter in a
+  value would execute under `eval`). These are the exact names the adapter reads
   (`src/modules/band-config.ts`). The script never echoes the create-scope key
   and never passes it on `argv`.
 - **`BAND_OWNER_ID` (optional):** the Band user UUID that owns this agent —
