@@ -91,11 +91,18 @@ the fork remote by URL (adding it if absent), then fetch from *that* remote:
 FORK_URL="${NANOCLAW_REPO:-https://github.com/band-ai/nanoclaw-band}"
 FORK_REMOTE=$(git remote -v | awk '$2 ~ /nanoclaw-band/ {print $1; exit}')
 [ -n "$FORK_REMOTE" ] || { git remote add band "$FORK_URL"; FORK_REMOTE=band; }
-git fetch "$FORK_REMOTE" band/adapter
+# Use an explicit refspec so the remote-tracking ref
+# refs/remotes/$FORK_REMOTE/band/adapter is created. A bare
+# `git fetch $FORK_REMOTE band/adapter` only writes FETCH_HEAD on single-branch
+# or shallow clones (the common bootstrap case), leaving the
+# `$FORK_REMOTE/band/adapter` ref the copy step reads unresolved.
+git fetch "$FORK_REMOTE" "+refs/heads/band/adapter:refs/remotes/$FORK_REMOTE/band/adapter"
 ```
 
 If the fetch fails, see **Prerequisites** above — the branch is not yet published.
-Keep `$FORK_REMOTE` set for the copy step below (run both in the same shell).
+Keep `$FORK_REMOTE` set for the copy step below (run both in the same shell). The
+copy step resolves `git show "$FORK_REMOTE/band/adapter:<file>"`, which is exactly
+the ref the explicit refspec above creates.
 
 ### 2. Copy the Band files in
 
