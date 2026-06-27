@@ -5,6 +5,9 @@ import { readEnvFile } from '../env.js';
 // fallback so existing .env files keep working.
 const BAND_ENV_SUFFIXES = [
   'AGENT_ID',
+  // Agent-scoped key. BAND_AGENT_API_KEY is the canonical name the register-agent
+  // flow now writes; BAND_API_KEY is the legacy name, kept as a fallback.
+  'AGENT_API_KEY',
   'API_KEY',
   'BASE_URL',
   'OWNER_ID',
@@ -52,7 +55,7 @@ export interface BandConfig {
 
 export function getBandConfig(): BandConfig | null {
   const agentId = env('AGENT_ID');
-  const apiKey = env('API_KEY');
+  const apiKey = env('AGENT_API_KEY') || env('API_KEY');
   const baseUrl = env('BASE_URL') || DEFAULT_BAND_BASE_URL;
   if (!agentId || !apiKey) return null;
 
