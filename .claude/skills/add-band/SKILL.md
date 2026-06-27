@@ -78,13 +78,24 @@ Skip to **Credentials** if all of these are already in place:
 
 Otherwise continue. Every step below is safe to re-run.
 
-### 1. Fetch the band/adapter branch
+### 1. Resolve the fork remote and fetch the band/adapter branch
+
+This skill ships in the Band fork, but the checkout's `origin` may be **upstream
+nanoclaw** — e.g. an existing install that added the fork only as a side remote.
+Upstream carries no Band branches, so never assume `origin` is the fork. Resolve
+the fork remote by URL (adding it if absent), then fetch from *that* remote:
 
 ```bash
-git fetch origin band/adapter
+# The remote whose URL points at the Band fork: origin in a fresh fork clone, or
+# a side remote (e.g. `band`) on an existing upstream checkout. Add it if absent.
+FORK_URL="${NANOCLAW_REPO:-https://github.com/band-ai/nanoclaw-band}"
+FORK_REMOTE=$(git remote -v | awk '$2 ~ /nanoclaw-band/ {print $1; exit}')
+[ -n "$FORK_REMOTE" ] || { git remote add band "$FORK_URL"; FORK_REMOTE=band; }
+git fetch "$FORK_REMOTE" band/adapter
 ```
 
-If this fails, see **Prerequisites** above — the branch is not yet published.
+If the fetch fails, see **Prerequisites** above — the branch is not yet published.
+Keep `$FORK_REMOTE` set for the copy step below (run both in the same shell).
 
 ### 2. Copy the Band files in
 
@@ -107,7 +118,7 @@ for f in \
   container/agent-runner/src/band-memory-consolidate.ts \
   container/agent-runner/src/band-memory-consolidate.test.ts ; do
   mkdir -p "$(dirname "$f")"
-  git show "origin/band/adapter:$f" > "$f"
+  git show "$FORK_REMOTE/band/adapter:$f" > "$f"
 done
 ```
 
