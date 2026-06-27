@@ -118,6 +118,7 @@ function setBandEnv(): void {
 function clearBandEnv(): void {
   for (const suffix of [
     'AGENT_ID',
+    'AGENT_API_KEY',
     'API_KEY',
     'BASE_URL',
     'MEMORY_TOOLS',
