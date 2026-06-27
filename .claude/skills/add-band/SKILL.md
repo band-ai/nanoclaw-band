@@ -65,7 +65,7 @@ upstream to qwibitai/nanoclaw, after which any upstream install is a valid base.
 
 ### Pre-flight (idempotent)
 
-Skip to **Credentials** if all of these are already in place:
+Skip to **Bring Band online (end-to-end)** if all of these are already in place:
 
 - `src/channels/band.ts` and `src/modules/band-config.ts` exist
 - `src/db/migrations/module-band-state.ts` and `src/db/migrations/020-band-rename.ts` exist
@@ -192,72 +192,113 @@ pnpm test -- src/channels/band.test.ts
 cd container/agent-runner && bun test src/mcp-tools/band.test.ts && cd -
 ```
 
-## Credentials
+## Bring Band online (end-to-end)
 
-Add the agent credentials to `.env`:
+After the build + verify pass, drive the operator from credentials to a live,
+wired Band agent. **Do every step you can yourself** — register the agent, restart
+the host, query the DB, run the wiring — and hand the operator only what needs
+them (pasting a create-scope key, opening a Band room, sending the test message).
+Don't stop after the build; carry the flow through to a message round-trip.
 
-```bash
-BAND_AGENT_ID=your-agent-id
-BAND_API_KEY=your-agent-api-key
-# Optional. Defaults to https://app.band.ai when unset.
-BAND_BASE_URL=https://app.band.ai
-# Optional. UUID of the Band user who owns this agent. Falls back to GET /agent/me.
-BAND_OWNER_ID=
-```
+### Step 1 — Credentials
 
-### Where these values come from
-
-- **`BAND_API_KEY` (create scope):** your personal Band API key from app.band.ai
-  → Settings → API Keys. Used **only** to mint the agent below; not stored
-  long-term.
-- **`BAND_AGENT_ID` + `BAND_API_KEY` (agent scope):** run the bundled helper,
-  which registers a Band external agent and prints both. The printed
-  `BAND_API_KEY` is the **agent-scoped** key and replaces the create-scope one:
-
-  ```bash
-  export BAND_API_KEY=<your create-scope key>     # or omit to paste at the prompt
-  .claude/skills/add-band/scripts/register-agent.sh > /tmp/band-agent.env
-  # → /tmp/band-agent.env holds BAND_AGENT_ID=<uuid> and BAND_API_KEY=<agent-scoped key>
-  ```
-
-  Append (or upsert) the two lines from `/tmp/band-agent.env` into `.env` — the
-  agent-scoped `BAND_API_KEY` overwrites the create-scope value. **Do not `eval`
-  the output**; treat it as dotenv content (an embedded shell metacharacter in a
-  value would execute under `eval`). These are the exact names the adapter reads
-  (`src/modules/band-config.ts`). The script never echoes the create-scope key
-  and never passes it on `argv`.
-- **`BAND_OWNER_ID` (optional):** the Band user UUID that owns this agent —
-  app.band.ai → your profile. Leave unset to let the adapter fall back to
-  `GET /agent/me`.
-- **Room IDs:** you do **not** set these. Discovery writes Band rooms into
-  `messaging_groups` automatically; you wire them with `/manage-channels`
-  (platform id `band:<room-id>`). The container vars `BAND_ROOM_ID` /
-  `BAND_REST_URL` are injected per-session by the adapter — never put them in
-  `.env`.
-
-For hosted Band.ai, leave `BAND_BASE_URL` unset (or `https://app.band.ai`) and let
-OneCLI inject `BAND_API_KEY` at request time — direct env injection into
-containers is only for local HTTP validation or explicit `BAND_INJECT_API_KEY=true`.
-Installs with legacy `THENVOI_*` variables keep working; `BAND_*` takes precedence.
-
-Memory pre-load/consolidation and contact-event handling are off by default. To
-enable them, see [reference/configuration.md](reference/configuration.md).
-
-If this instance reads its environment from `data/env/env`, sync it:
+The adapter reads an **agent-scoped** key from `.env`. Check whether it's already
+there before doing anything:
 
 ```bash
-mkdir -p data/env && cp .env data/env/env
+grep -qE '^(BAND|THENVOI)_AGENT_ID=' .env && \
+grep -qE '^(BAND|THENVOI)_(AGENT_)?API_KEY=' .env && echo "creds present" || echo "creds missing"
 ```
 
-## Wire Band rooms
+**Present → skip to Step 2.** Missing → register a Band external agent. That call
+needs a **create-scope** Band API key (app.band.ai → Settings → API Keys), used
+only to mint the agent. Ask the operator to paste it at the prompt — never put it
+on `argv`, never `eval` the output:
 
-Discovery writes rooms into `messaging_groups` but does **not** wire them to an
-agent. Run `/manage-channels` and wire the room:
+```bash
+.claude/skills/add-band/scripts/register-agent.sh > /tmp/band-agent.env
+# writes:  BAND_AGENT_ID=<uuid>   and   BAND_AGENT_API_KEY=<agent-scoped key>
+```
 
-- **type**: `band`
-- **platform ID format**: `band:<room-id>`
-- **session mode**: `shared` for room-local conversations; `agent-shared` only when
-  intentionally merging multiple surfaces into one agent session
+Upsert those two lines into `.env` (don't duplicate existing keys). The script
+never echoes the create-scope key and never passes it on `argv`; treat its output
+as dotenv content. `BAND_AGENT_API_KEY` is the canonical name
+`src/modules/band-config.ts` reads — legacy `BAND_API_KEY` and the `THENVOI_*`
+family still work, with `BAND_*` taking precedence. Optional vars, all defaulted:
+
+```bash
+# BAND_BASE_URL   defaults to https://app.band.ai (leave unset for hosted Band)
+# BAND_OWNER_ID   Band user UUID that owns the agent; falls back to GET /agent/me
+```
+
+For hosted Band.ai, leave `BAND_BASE_URL` unset and let OneCLI inject the key at
+request time — direct env injection into containers is only for local HTTP
+validation or explicit `BAND_INJECT_API_KEY=true`. Memory pre-load/consolidation
+and contact-event handling are off by default ([reference/configuration.md](reference/configuration.md)).
+
+If this instance mirrors env to `data/env/env`, sync it:
+
+```bash
+[ -f data/env/env ] && cp .env data/env/env
+```
+
+### Step 2 — Start the host so it discovers rooms
+
+You never enter room IDs by hand: on host start the adapter connects and writes
+every room the agent can see into `messaging_groups`. Start (or restart) the host
+so it picks up the new creds and the rebuilt image:
+
+```bash
+# macOS:  launchctl kickstart -k gui/$(id -u)/com.nanoclaw
+# Linux:  systemctl --user restart nanoclaw
+# Dev:    pnpm run dev
+```
+
+If no service is installed yet, run `/setup` first, then return here.
+
+### Step 3 — Confirm discovery
+
+```bash
+pnpm exec tsx scripts/q.ts data/v2.db "SELECT id, platform_id, name FROM messaging_groups WHERE channel_type='band'"
+```
+
+- **Rows present** → go to Step 4.
+- **No rows** → the agent is in no rooms yet. With an owner set, the adapter
+  auto-provisions a **Nano Hub** direct room on first connect; otherwise ask the
+  operator to add the agent to a Band room (or DM it) at app.band.ai, then re-run
+  the query. Discovery is event-driven — allow a few seconds after the room
+  appears.
+
+### Step 4 — Wire a room with `/manage-channels`
+
+Discovery does **not** wire a room to an agent. **Invoke `/manage-channels`** to do
+it: it routes you to `/init-first-agent` when no owner / agent group exists yet,
+and otherwise asks the isolation question and writes the wiring row. The
+Band-specific answers it needs (also in **Channel Info** below):
+
+- **channel / type**: `band`
+- **platform ID**: `band:<room-id>` (a row from Step 3)
+- **session mode**: `shared` for room-local conversations; `agent-shared` only
+  when intentionally merging multiple surfaces into one session
+- **default isolation**: same agent group for your own rooms; a separate agent
+  group for rooms with different people, projects, or data boundaries
+
+When the target agent group already exists, you can wire non-interactively instead
+of running the `/manage-channels` prompts:
+
+```bash
+pnpm exec tsx setup/index.ts --step register -- \
+  --platform-id "band:<room-id>" --name "<room name>" \
+  --folder "<agent-folder>" --channel "band" \
+  --session-mode "shared" --assistant-name "<assistant name>"
+```
+
+### Step 5 — Verify end-to-end
+
+With the room wired and the host running, send a message in that Band room (mention
+the agent if it's mention-gated). It should reply within a few seconds. If it
+stays silent, trace the round trip per [VERIFY.md](VERIFY.md) step 8 and the
+**Troubleshooting** section below.
 
 ## Outbound origination: Band MCP (optional, advanced)
 
