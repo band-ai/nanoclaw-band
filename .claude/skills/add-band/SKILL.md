@@ -26,9 +26,6 @@ channel migrations register themselves on import (no separate migration wiring).
 > Push the `band/adapter` branch before running this skill. Do not substitute a
 > different branch unless you have confirmed it carries the same Band file set and
 > is kept in sync with trunk's seam types.
->
-> (The source is named `band/adapter`, not `band`, because a bare `band` ref
-> cannot coexist with the `band/platform` branch in the same repository.)
 
 > **Install onto a Band-free base.** This skill assumes core does **not** already
 > contain the Band files (a clean trunk / `validate/band-free-base` checkout). If
