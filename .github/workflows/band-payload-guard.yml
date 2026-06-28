@@ -1,0 +1,56 @@
+name: Band payload guard
+
+# Enforces the single-source-of-truth topology: the band/adapter payload branch
+# must be a purely-additive overlay on main — only new Band-owned files, never a
+# modification or deletion of a core file, and never touching the /add-band skill
+# (which lives only on main). This keeps the install collision-free: the skill
+# copies the payload's files and appends its own barrel imports + pinned deps.
+
+on:
+  push:
+    branches: [band/adapter]
+  pull_request:
+    branches: [band/adapter]
+  workflow_dispatch:
+
+jobs:
+  payload-is-additive:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: band/adapter must be an additive, skills-clean, 0-behind overlay on main
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin main
+          BASE=origin/main
+
+          echo "Changed paths vs $BASE:"
+          git diff --name-status "$BASE" HEAD || true
+          echo
+
+          # 1. Additions only — no modified / deleted / renamed core files.
+          nonadd=$(git diff --name-status "$BASE" HEAD | grep -vE '^A' || true)
+          if [ -n "$nonadd" ]; then
+            echo "::error::band/adapter must be purely additive vs main. Offending paths:"
+            echo "$nonadd"
+            exit 1
+          fi
+
+          # 2. Never touch the skill — the /add-band orchestrator is owned by main.
+          skills=$(git diff --name-only "$BASE" HEAD -- .claude/skills/ || true)
+          if [ -n "$skills" ]; then
+            echo "::error::band/adapter must not touch .claude/skills/ (the /add-band skill lives only on main). Offending paths:"
+            echo "$skills"
+            exit 1
+          fi
+
+          # 3. Stay current with main (0-behind) so the overlay always applies cleanly.
+          behind=$(git rev-list --count HEAD..origin/main)
+          if [ "$behind" -ne 0 ]; then
+            echo "::error::band/adapter is $behind commit(s) behind main — merge origin/main in to keep the payload current."
+            exit 1
+          fi
+
+          echo "OK — band/adapter is additive, skills-clean, and 0-behind main."
