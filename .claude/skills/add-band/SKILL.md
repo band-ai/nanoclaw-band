@@ -204,18 +204,21 @@ Don't stop after the build; carry the flow through to a message round-trip.
 
 ### Step 1 — Credentials
 
-The adapter reads an **agent-scoped** key from `.env`. Check whether it's already
-there before doing anything:
+The adapter reads an **agent-scoped** key from `.env`. **`register-agent.sh` is
+not idempotent — each run POSTs a brand-new Band agent (new id + key).** So gate
+on an existing key: a key already in `.env` means the agent was minted on a prior
+run, and the whole step (register + vault + `.env` write) must be **skipped**.
 
 ```bash
-grep -qE '^(BAND|THENVOI)_AGENT_ID=' .env && \
-grep -qE '^(BAND|THENVOI)_(AGENT_)?API_KEY=' .env && echo "creds present" || echo "creds missing"
+grep -qE '^(BAND|THENVOI)_(AGENT_)?API_KEY=' .env && echo "key present → skip to Step 2" || echo "no key → register below"
 ```
 
-**Present → skip to Step 2.** Missing → register a Band external agent. That call
-needs a **create-scope** Band API key (app.band.ai → Settings → API Keys), used
-only to mint the agent. Ask the operator to paste it at the prompt — never put it
-on `argv`, never `eval` the output:
+**Key present → skip to Step 2** — do **not** re-run the script; it would mint a
+duplicate agent. (If `.env` has a key but no `BAND_AGENT_ID` — a hand-edit — add
+the matching id rather than re-registering; the host needs both.) Otherwise
+register a Band external agent. That call needs a **create-scope** Band API key
+(app.band.ai → Settings → API Keys), used only to mint the agent. Ask the operator
+to paste it at the prompt — never put it on `argv`, never `eval` the output:
 
 ```bash
 .claude/skills/add-band/scripts/register-agent.sh > /tmp/band-agent.env
