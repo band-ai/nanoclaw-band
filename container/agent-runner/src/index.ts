@@ -35,7 +35,6 @@ import './providers/index.js';
 // Such an import must follow the providers barrel (so providers register
 // first) and precede the runStartHooks call below; channel install skills
 // append their `import './<channel>-lifecycle.js';` here.
-import './band-lifecycle.js';
 import { createProvider, type ProviderName } from './providers/factory.js';
 import { buildMcpServers } from './mcp-servers.js';
 import { runStartHooks, runStopHooks } from './lifecycle.js';
