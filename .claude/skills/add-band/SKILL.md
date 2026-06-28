@@ -215,8 +215,10 @@ grep -qE '^(BAND|THENVOI)_(AGENT_)?API_KEY=' .env && echo "key present → skip 
 
 **Key present → skip to Step 2** — do **not** re-run the script; it would mint a
 duplicate agent. (If `.env` has a key but no `BAND_AGENT_ID` — a hand-edit — add
-the matching id rather than re-registering; the host needs both.) Otherwise
-register a Band external agent. That call needs a **create-scope** Band API key
+the matching id rather than re-registering; the host needs both. If the key is
+**dead** — you deleted the agent on Band — or you want to **rotate** it, see
+[Re-register or rotate the key](#re-register-or-rotate-the-key) at the end of this
+step.) Otherwise register a Band external agent. That call needs a **create-scope** Band API key
 (app.band.ai → Settings → API Keys), used only to mint the agent. Ask the operator
 to paste it at the prompt — never put it on `argv`, never `eval` the output:
 
@@ -267,6 +269,34 @@ If this instance mirrors env to `data/env/env`, sync it:
 ```bash
 [ -f data/env/env ] && cp .env data/env/env
 ```
+
+#### Re-register or rotate the key
+
+The skip-on-existing-key gate assumes the key in `.env` is live. Two cases need an
+explicit reset:
+
+- **Rotate the key, same agent** — you regenerated the agent's key on Band but the
+  agent still exists. Put the new key in `.env` (`BAND_AGENT_API_KEY`), then point
+  the vault secret at it — no new agent is minted:
+
+  ```bash
+  onecli secrets list                 # find the "Band" secret's id
+  onecli secrets update --id <secret-id> --value "$NEW_KEY" \
+    --host-pattern app.band.ai --header-name X-API-Key --value-format '{value}'
+  ```
+
+- **Dead agent → mint a fresh one** — you deleted the agent on Band (the `.env`
+  key is now invalid) or just want a new one. The stale key would make the gate
+  skip forever, so clear it from all three places, then re-run **Step 1**:
+
+  ```bash
+  # 1. drop the stale agent creds from .env (and the data/env/env mirror)
+  sed -i.bak -E '/^(BAND|THENVOI)_(AGENT_ID|AGENT_API_KEY|API_KEY)=/d' .env && rm -f .env.bak
+  [ -f data/env/env ] && cp .env data/env/env
+  # 2. delete the OneCLI vault secret (id from `onecli secrets list`)
+  onecli secrets delete --id <secret-id>
+  # 3. re-run Step 1 — the gate now sees no key and mints a fresh agent
+  ```
 
 ### Step 2 — Start the host so it discovers rooms
 
