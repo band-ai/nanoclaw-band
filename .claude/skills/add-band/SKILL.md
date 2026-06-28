@@ -19,13 +19,14 @@ channel migrations register themselves on import (no separate migration wiring).
 
 ## Prerequisites
 
-> **The `band/adapter` branch must be published first.** This skill copies every
-> Band file from `origin/band/adapter` — a long-lived source branch parallel to
-> the `channels` branch other channels ship from. It is **not yet pushed**; until
-> it is, `git fetch origin band/adapter` will fail and there is nothing to copy.
-> Push the `band/adapter` branch before running this skill. Do not substitute a
-> different branch unless you have confirmed it carries the same Band file set and
-> is kept in sync with trunk's seam types.
+> **The Band payload lives on `band/adapter` in the fork.** This skill copies every
+> Band file from `band-ai/band/adapter` — a long-lived source branch (parallel to
+> the `channels` branch other channels ship from), published on
+> `band-ai/nanoclaw-band` and kept 0-behind `main` by CI. The on-ramp bootstrap
+> adds the `band-ai` remote and fetches it; step 1 below does the same idempotently
+> for a standalone run. Do not substitute a different branch unless you have
+> confirmed it carries the same Band file set and is kept in sync with trunk's seam
+> types.
 
 > **Install onto a Band-free base.** This skill assumes core does **not** already
 > contain the Band files (a clean trunk / `validate/band-free-base` checkout). If
@@ -75,31 +76,28 @@ Skip to **Bring Band online (end-to-end)** if all of these are already in place:
 
 Otherwise continue. Every step below is safe to re-run.
 
-### 1. Resolve the fork remote and fetch the band/adapter branch
+### 1. Ensure the `band-ai` remote and fetch the band/adapter branch
 
-This skill ships in the Band fork, but the checkout's `origin` may be **upstream
-nanoclaw** — e.g. an existing install that added the fork only as a side remote.
-Upstream carries no Band branches, so never assume `origin` is the fork. Resolve
-the fork remote by URL (adding it if absent), then fetch from *that* remote:
+The Band payload lives on the fork (`band-ai/nanoclaw-band`), never on a user's
+`origin` or on upstream nanoclaw. The on-ramp bootstrap adds a remote named
+`band-ai` pointing at the fork; ensure it exists (idempotent) so a standalone run
+behaves identically, then fetch the payload branch from it:
 
 ```bash
-# The remote whose URL points at the Band fork: origin in a fresh fork clone, or
-# a side remote (e.g. `band`) on an existing upstream checkout. Add it if absent.
+# The Band fork remote. `git remote add` is skipped if `band-ai` already exists.
 FORK_URL="${NANOCLAW_REPO:-https://github.com/band-ai/nanoclaw-band}"
-FORK_REMOTE=$(git remote -v | awk '$2 ~ /nanoclaw-band/ {print $1; exit}')
-[ -n "$FORK_REMOTE" ] || { git remote add band "$FORK_URL"; FORK_REMOTE=band; }
-# Use an explicit refspec so the remote-tracking ref
-# refs/remotes/$FORK_REMOTE/band/adapter is created. A bare
-# `git fetch $FORK_REMOTE band/adapter` only writes FETCH_HEAD on single-branch
-# or shallow clones (the common bootstrap case), leaving the
-# `$FORK_REMOTE/band/adapter` ref the copy step reads unresolved.
-git fetch "$FORK_REMOTE" "+refs/heads/band/adapter:refs/remotes/$FORK_REMOTE/band/adapter"
+git remote get-url band-ai >/dev/null 2>&1 || git remote add band-ai "$FORK_URL"
+# Explicit refspec so the remote-tracking ref refs/remotes/band-ai/band/adapter is
+# created. A bare `git fetch band-ai band/adapter` only writes FETCH_HEAD on
+# single-branch or shallow clones (the common bootstrap case), leaving the
+# `band-ai/band/adapter` ref the copy step reads unresolved.
+git fetch band-ai "+refs/heads/band/adapter:refs/remotes/band-ai/band/adapter"
 ```
 
-If the fetch fails, see **Prerequisites** above — the branch is not yet published.
-Keep `$FORK_REMOTE` set for the copy step below (run both in the same shell). The
-copy step resolves `git show "$FORK_REMOTE/band/adapter:<file>"`, which is exactly
-the ref the explicit refspec above creates.
+If the fetch fails, the `band-ai` remote URL is wrong or unreachable — re-check it
+against **Prerequisites** above. The copy step below resolves
+`git show "band-ai/band/adapter:<file>"`, exactly the ref the explicit refspec
+above creates.
 
 ### 2. Copy the Band files in
 
@@ -122,7 +120,7 @@ for f in \
   container/agent-runner/src/band-memory-consolidate.ts \
   container/agent-runner/src/band-memory-consolidate.test.ts ; do
   mkdir -p "$(dirname "$f")"
-  git show "$FORK_REMOTE/band/adapter:$f" > "$f"
+  git show "band-ai/band/adapter:$f" > "$f"
 done
 ```
 
@@ -224,21 +222,42 @@ on `argv`, never `eval` the output:
 # writes:  BAND_AGENT_ID=<uuid>   and   BAND_AGENT_API_KEY=<agent-scoped key>
 ```
 
-Upsert those two lines into `.env` (don't duplicate existing keys). The script
-never echoes the create-scope key and never passes it on `argv`; treat its output
-as dotenv content. `BAND_AGENT_API_KEY` is the canonical name
-`src/modules/band-config.ts` reads — legacy `BAND_API_KEY` and the `THENVOI_*`
-family still work, with `BAND_*` taking precedence. Optional vars, all defaulted:
+The script never echoes the create-scope key and never passes it on `argv`; treat
+its output as dotenv content. Route the agent key to **both** places it's needed —
+the host reads it from `.env`, the container gets it from the OneCLI vault:
+
+1. **`.env` (host).** Upsert both lines into `.env` (don't duplicate existing
+   keys). The host adapter reads `BAND_AGENT_API_KEY` directly and opens the Band
+   WebSocket + REST client with it (`src/modules/band-config.ts` →
+   `src/channels/band.ts`); without it `getBandConfig()` returns null and the
+   channel never starts — so the key must sit in `.env` locally. `BAND_AGENT_API_KEY`
+   is canonical; legacy `BAND_API_KEY` and the `THENVOI_*` family still work, with
+   `BAND_*` taking precedence.
+
+2. **OneCLI vault (container).** For hosted `app.band.ai` the container never
+   receives the raw key — OneCLI injects the `X-API-Key` header on egress. Store
+   the same agent key in the vault, reading it back from `.env` (never paste it):
+
+   ```bash
+   KEY=$(grep -E '^(BAND|THENVOI)_(AGENT_)?API_KEY=' .env | head -1 | cut -d= -f2-)
+   onecli secrets create --name Band --type generic --value "$KEY" \
+     --host-pattern app.band.ai --header-name X-API-Key --value-format '{value}'
+   rm -f /tmp/band-agent.env   # don't leave the key sitting in /tmp
+   ```
+
+   The agent's OneCLI `secretMode` must be `all` (or assign this secret to it).
+   Direct env injection of the key into a container happens only for local HTTP
+   validation or explicit `BAND_INJECT_API_KEY=true`.
+
+Optional vars, all defaulted:
 
 ```bash
 # BAND_BASE_URL   defaults to https://app.band.ai (leave unset for hosted Band)
 # BAND_OWNER_ID   Band user UUID that owns the agent; falls back to GET /agent/me
 ```
 
-For hosted Band.ai, leave `BAND_BASE_URL` unset and let OneCLI inject the key at
-request time — direct env injection into containers is only for local HTTP
-validation or explicit `BAND_INJECT_API_KEY=true`. Memory pre-load/consolidation
-and contact-event handling are off by default ([reference/configuration.md](reference/configuration.md)).
+Memory pre-load/consolidation and contact-event handling are off by default
+([reference/configuration.md](reference/configuration.md)).
 
 If this instance mirrors env to `data/env/env`, sync it:
 

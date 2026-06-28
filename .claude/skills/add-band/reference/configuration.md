@@ -96,7 +96,7 @@ Band's API authenticates with the **`X-API-Key`** header. `Authorization: Bearer
 Create the vault secret accordingly, reading the key from `.env` (never paste it):
 
 ```bash
-KEY=$(grep -E '^(BAND|THENVOI)_API_KEY=' .env | head -1 | cut -d= -f2-)
+KEY=$(grep -E '^(BAND|THENVOI)_(AGENT_)?API_KEY=' .env | head -1 | cut -d= -f2-)
 onecli secrets create --name Band --type generic --value "$KEY" \
   --host-pattern app.band.ai --header-name X-API-Key --value-format '{value}'
 ```
