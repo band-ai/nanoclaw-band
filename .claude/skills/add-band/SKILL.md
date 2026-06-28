@@ -210,7 +210,7 @@ on an existing key: a key already in `.env` means the agent was minted on a prio
 run, and the whole step (register + vault + `.env` write) must be **skipped**.
 
 ```bash
-grep -qE '^(BAND|THENVOI)_(AGENT_)?API_KEY=' .env && echo "key present → skip to Step 2" || echo "no key → register below"
+grep -qE '^(BAND|THENVOI)_(AGENT_)?API_KEY=' .env 2>/dev/null && echo "key present → skip to Step 2" || echo "no key → register below"
 ```
 
 **Key present → skip to Step 2** — do **not** re-run the script; it would mint a
@@ -223,7 +223,8 @@ step.) Otherwise register a Band external agent. That call needs a **create-scop
 to paste it at the prompt — never put it on `argv`, never `eval` the output:
 
 ```bash
-.claude/skills/add-band/scripts/register-agent.sh > /tmp/band-agent.env
+# umask 077 so the temp file holding the live key isn't world-readable.
+( umask 077; .claude/skills/add-band/scripts/register-agent.sh > /tmp/band-agent.env )
 # writes:  BAND_AGENT_ID=<uuid>   and   BAND_AGENT_API_KEY=<agent-scoped key>
 ```
 
@@ -247,12 +248,18 @@ the host reads it from `.env`, the container gets it from the OneCLI vault:
    KEY=$(grep -E '^(BAND|THENVOI)_(AGENT_)?API_KEY=' .env | head -1 | cut -d= -f2-)
    onecli secrets create --name Band --type generic --value "$KEY" \
      --host-pattern app.band.ai --header-name X-API-Key --value-format '{value}'
-   rm -f /tmp/band-agent.env   # don't leave the key sitting in /tmp
    ```
 
    The agent's OneCLI `secretMode` must be `all` (or assign this secret to it).
    Direct env injection of the key into a container happens only for local HTTP
    validation or explicit `BAND_INJECT_API_KEY=true`.
+
+Once the key is in `.env` (and the vault, for hosted Band), wipe the temp file —
+it holds the live agent key. This runs regardless of which routing path you took:
+
+```bash
+rm -f /tmp/band-agent.env
+```
 
 Optional vars, all defaulted:
 
