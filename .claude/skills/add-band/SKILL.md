@@ -36,7 +36,7 @@ permission three steps in.
    untrusted-code integration. That is by design, not an error. Before step 1,
    tell the operator plainly:
 
-   > Installing Band copies 13 files from `https://github.com/band-ai/nanoclaw-band`
+   > Installing Band copies 14 files from `https://github.com/band-ai/nanoclaw-band`
    > (branch `band/adapter`) and installs `@band-ai/sdk@0.1.6` +
    > `@band-ai/rest-client@0.0.121`. Both will ask for your approval.
 
@@ -136,7 +136,7 @@ shell).
 
 ### 2. Copy the Band files in (repo-root anchored, then validated)
 
-The full tested set is 13 files (adapter, config, two channel migrations, the
+The full tested set is 14 files (adapter, config, two channel migrations, the
 container MCP tool + memory hooks + lifecycle registration, and their tests). Copy
 them and **immediately validate** against the branch, so a wrong cwd or partial
 copy is caught now, not three steps later:
@@ -152,6 +152,7 @@ container/agent-runner/src/mcp-tools/band.ts
 container/agent-runner/src/mcp-tools/band.test.ts
 container/agent-runner/src/mcp-tools/band.instructions.md
 container/agent-runner/src/band-lifecycle.ts
+container/agent-runner/src/band-lifecycle.test.ts
 container/agent-runner/src/band-memory-load.ts
 container/agent-runner/src/band-memory-load.test.ts
 container/agent-runner/src/band-memory-consolidate.ts
@@ -238,7 +239,7 @@ Run [VERIFY.md](VERIFY.md). At minimum:
 
 ```bash
 ( cd "$ROOT" && pnpm test -- src/channels/band.test.ts )
-( cd "$ROOT/container/agent-runner" && bun test src/mcp-tools/band.test.ts )
+( cd "$ROOT/container/agent-runner" && bun test src/mcp-tools/band.test.ts src/band-lifecycle.test.ts )
 ```
 
 ## Bring Band online (end-to-end)
