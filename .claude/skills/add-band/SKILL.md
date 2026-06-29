@@ -47,8 +47,9 @@ permission three steps in.
 
 3. **Human touchpoints (everything else is automatic):** possibly pasting a
    create-scope Band key *only if no credentials exist yet*; opening or DMing a
-   Band room so it's discoverable; and sending the final test message. Phase 0
-   below tells you which of these actually apply.
+   Band room so it's discoverable; **choosing the access level** to grant the
+   owner's Band identity (owner / admin / member — Step 6); and sending the final
+   test message. Phase 0 below tells you which of these actually apply.
 
 ## Phase 0 — Anchor to the repo root and detect state (no questions)
 
@@ -438,7 +439,71 @@ pnpm exec tsx setup/index.ts --step register -- \
   --session-mode "shared" --assistant-name "<assistant name>"
 ```
 
-### Step 6 — Verify end-to-end
+**Then always ensure the reply destination + restart (do not skip — run this every
+install).** Wiring routes inbound, but the agent can only **reply** to a room it has
+a **destination** for. `setup register` creates that destination automatically; raw
+`ncl wirings create` does **not**. With no Band destination the formatter's
+reply-target lookup (`findByRouting(channelType, platformId)` in
+`container/agent-runner/src/destinations.ts`) finds nothing, so the agent replies on
+whatever other destination it has (e.g. a Telegram DM) and the reply never reaches
+Band — usually with a `No adapter for channel type` warning if that channel isn't
+loaded here. So after wiring, verify-and-create the destination (idempotent), then
+restart so the system-prompt destination list rebuilds (it is built once at spawn —
+`destinations.ts:82`):
+
+```bash
+AGID="<agent-group-id>"; BAND_MG="<band-messaging-group-id>"   # the Step 4 room row
+ncl destinations list --agent-group-id "$AGID" | grep -q "$BAND_MG" \
+  || ncl destinations add --agent-group-id "$AGID" --local-name band-hub \
+       --target-type channel --target-id "$BAND_MG"
+ncl groups restart --id "$AGID"   # respawns with the Band destination in its prompt
+```
+
+### Step 6 — Recognize the owner's Band identity (ask the access level)
+
+Wiring routes the room, but a sender still has to clear the agent group's **access
+gate**. When Band is added to an install that **already has an owner on another
+channel** (e.g. Telegram), the owner's *Band* identity — `band:<owner-uuid>` — is a
+brand-new platform id with **no role and no membership**, so their first Band
+message is dropped:
+
+```
+MESSAGE DROPPED — unknown sender (approval requested)  userId="band:<uuid>"  accessReason="not_member"
+```
+
+(The unknown-sender approval fallback can't even reach them if that other channel's
+adapter isn't loaded in this checkout.)
+
+Resolve the owner's Band UUID — try, in order:
+
+```bash
+grep -oE 'ownerId="[0-9a-f-]+"' logs/nanoclaw.log | tail -1   # hub-creation log line
+grep -E '^BAND_OWNER_ID=' .env                                # or explicit env
+ncl users list | grep '^band:'                                # or the auto-registered band: user
+```
+
+(A `band:` user row auto-appears the instant a message arrives — **even when it was
+dropped** — so after a failed first attempt the identity is already in `ncl users
+list`.)
+
+Check whether that identity already has a role or membership; if not, **ask the
+operator what level to grant** (AskUserQuestion) — exactly as `/init-first-agent`
+does for the first channel:
+
+- **owner** — global, full control. The right default when it's the operator's own
+  hub. `ncl roles grant --user "band:<uuid>" --role owner`
+- **admin** — manage groups + approve actions; global, or `--agent-group-id <id>`
+  to scope. `ncl roles grant --user "band:<uuid>" --role admin [--agent-group-id <id>]`
+- **member** — least privilege; this group only, no admin.
+  `ncl members add --user "band:<uuid>" --group <agent-group-id>`
+
+> The role/member verbs take `--user` / `--group` (**not** `--user-id` /
+> `--agent-group-id`, despite the field list those verbs print).
+
+A message that was **already dropped is not reprocessed** — have the operator send a
+fresh one after the grant.
+
+### Step 7 — Verify end-to-end
 
 With the room wired and the service running, send a message in that Band room
 (mention the agent if it's mention-gated). It should reply within a few seconds.
@@ -529,6 +594,22 @@ not wired:
 ```bash
 pnpm exec tsx scripts/q.ts data/v2.db "SELECT id, channel_type, platform_id, name FROM messaging_groups WHERE channel_type='band'"
 pnpm exec tsx scripts/q.ts data/v2.db "SELECT messaging_group_id, agent_group_id, session_mode FROM messaging_group_agents"
+```
+
+Your Band message is dropped — `MESSAGE DROPPED — unknown sender` /
+`accessReason="not_member"` in the logs → the sender's Band identity
+(`band:<uuid>`) has no role or membership on the wired agent group. Common when an
+owner already exists on another channel: their Band identity is a separate platform
+id. Grant access per **Step 6**, then resend (dropped messages are not reprocessed).
+
+Agent replies but nothing shows up in Band — often paired with a
+`No adapter for channel type` warning and an outbound row whose `channel_type` is
+some *other* channel (e.g. `telegram`) → the agent group has no **destination** for
+the Band room, so its reply routed elsewhere. Add the destination and restart per
+the destination block in **Step 5**. Confirm with:
+
+```bash
+ncl destinations list --agent-group-id <agent-group-id>   # expect a target_type=channel row for the Band messaging group
 ```
 
 Tools missing inside the container → confirm the session is Band-backed, that the
