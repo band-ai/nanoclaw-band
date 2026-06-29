@@ -99,25 +99,35 @@ straight to **Verify** then **Bring Band online**.
 
 ## Phase 1 — Install the code
 
-### 1. Fetch the `band/adapter` payload
+### 1. Fetch the fork — payload from `band/adapter`, skill from `main`
 
-Band's files live on the long-lived `band/adapter` branch in the fork
-(`band-ai/nanoclaw-band`), kept 0-behind `main` by CI. It is **not** on upstream
-nanoclaw. Resolve whichever remote points at the fork — `origin` in a fork clone,
-or `band` when the on-ramp bootstrap layered Band onto an existing checkout — then
-fetch with an explicit refspec and **echo the source** so provenance is visible
-(this is the source the operator approved in step 2 above):
+The fork (`band-ai/nanoclaw-band`) carries **two refs you must keep straight** —
+they are not interchangeable:
+
+- **`band/adapter`** — the Band *payload* (adapter, config, migrations, container
+  tools, tests). A long-lived source branch parallel to the `channels` branch,
+  kept 0-behind `main` by CI. Step 2 copies from here; upstream `main` is Band-free
+  and does not carry these files.
+- **`main`** — the canonical home of *this skill*. Refresh the skill and resolve any
+  skill-path conflict from here (see **Upgrading / staying in sync**).
+
+Resolve whichever remote points at the fork — `origin` in a fork clone, or `band`
+when the on-ramp bootstrap layered Band onto an existing checkout — then fetch both
+refs with explicit refspecs and **echo the source** so provenance is visible (this
+is the source the operator approved in step 2 above):
 
 ```bash
 FORK_URL="${NANOCLAW_REPO:-https://github.com/band-ai/nanoclaw-band}"
 FORK_REMOTE=$(git remote -v | awk '$2 ~ /nanoclaw-band/ {print $1; exit}')
 [ -n "$FORK_REMOTE" ] || { git remote add band "$FORK_URL"; FORK_REMOTE=band; }
-echo "Band payload source: $(git remote get-url "$FORK_REMOTE")  (remote: $FORK_REMOTE, branch: band/adapter)"
-# Explicit refspec creates refs/remotes/$FORK_REMOTE/band/adapter. A bare
+echo "Band source: $(git remote get-url "$FORK_REMOTE")  (remote: $FORK_REMOTE — payload: band/adapter, skill: main)"
+# Explicit refspecs create refs/remotes/$FORK_REMOTE/{band/adapter,main}. A bare
 # `git fetch $FORK_REMOTE band/adapter` only writes FETCH_HEAD on shallow /
 # single-branch clones (the bootstrap case), leaving the ref the copy step reads
 # unresolved.
-git fetch "$FORK_REMOTE" "+refs/heads/band/adapter:refs/remotes/$FORK_REMOTE/band/adapter"
+git fetch "$FORK_REMOTE" \
+  "+refs/heads/band/adapter:refs/remotes/$FORK_REMOTE/band/adapter" \
+  "+refs/heads/main:refs/remotes/$FORK_REMOTE/main"
 ```
 
 If the fetch fails, the fork remote is wrong or unreachable — the URL above is the
@@ -467,6 +477,48 @@ See [reference/configuration.md](reference/configuration.md#outbound-origination
 - Optional participant-memory pre-load and end-of-session consolidation
   (`BAND_MEMORY_*`) — see [reference/configuration.md](reference/configuration.md)
 - Contact-event handling: drop or hub-room forwarding (`BAND_CONTACT_STRATEGY`)
+
+## Upgrading / staying in sync
+
+Skill and payload both come from the fork but from **two different refs** (Phase 1
+step 1) — keep them straight:
+
+| What | Source ref | Why |
+|------|-----------|-----|
+| This skill (`.claude/skills/add-band/`) | fork `main` | Canonical home of the skill. |
+| The Band payload (`src/…`, `container/…`) | fork `band/adapter` | Branch with Band inlined; `main` is Band-free. |
+
+Prefer `main` for the skill:
+
+1. **It's authoritative.** `band/adapter` only mirrors the skill from `main` via the
+   sync workflow and can lag a few minutes behind a `main` push — so the fork's
+   `main` is strictly fresher for skill files.
+2. **It keeps the model clean:** skill ← `main`, payload ← `band/adapter`. Pulling
+   the skill from `band/adapter` "because it has everything" conflates the two and
+   quietly depends on the mirror being current.
+
+Resolve the fork remote (same as Phase 1 step 1), refresh the skill, then re-run it
+— every step is idempotent, so it re-copies the payload from `band/adapter` and
+reinstalls the pinned deps:
+
+```bash
+FORK_REMOTE=$(git remote -v | awk '$2 ~ /nanoclaw-band/ {print $1; exit}')
+[ -n "$FORK_REMOTE" ] || { git remote add band https://github.com/band-ai/nanoclaw-band; FORK_REMOTE=band; }
+git fetch "$FORK_REMOTE" "+refs/heads/main:refs/remotes/$FORK_REMOTE/main"
+git checkout "$FORK_REMOTE/main" -- .claude/skills/add-band/
+```
+
+**Merge conflict in the skill paths.** If an upstream merge (e.g. `/update-nanoclaw`)
+conflicts inside `.claude/skills/add-band/`, do **not** hand-resolve it — the skill
+files are the installer, not user data, so there is nothing to preserve. Take the
+fork's version wholesale, exactly like the payload copy step does:
+
+```bash
+git checkout "$FORK_REMOTE/main" -- .claude/skills/add-band/   # take theirs, skill paths only
+```
+
+Deterministic, conflict-proof, and consistent with the copy-not-merge philosophy the
+payload install already uses.
 
 ## Troubleshooting
 
