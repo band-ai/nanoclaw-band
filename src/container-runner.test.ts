@@ -2,7 +2,59 @@ import fs from 'fs';
 import path from 'path';
 import { describe, expect, it } from 'vitest';
 
-import { resolveProviderName } from './container-runner.js';
+import {
+  mergeContainerContributions,
+  resolveProviderName,
+  rewriteOneCliProxyArgs,
+  stopGraceForReason,
+  FAST_STOP_GRACE_SEC,
+  GRACEFUL_STOP_GRACE_SEC,
+} from './container-runner.js';
+
+describe('mergeContainerContributions', () => {
+  it('round-trips mcpServers and userVisibleTools from a channel contribution', () => {
+    const merged = mergeContainerContributions(
+      {},
+      {
+        env: { BAND_REST_URL: 'https://api' },
+        mcpServers: { band: { command: 'thenvoi-mcp', args: [], env: {} } },
+        userVisibleTools: ['mcp__nanoclaw__band_send_message'],
+      },
+    );
+    expect(merged.mcpServers).toEqual({ band: { command: 'thenvoi-mcp', args: [], env: {} } });
+    expect(merged.userVisibleTools).toEqual(['mcp__nanoclaw__band_send_message']);
+    expect(merged.env).toEqual({ BAND_REST_URL: 'https://api' });
+  });
+
+  it('concatenates userVisibleTools and shallow-merges mcpServers across both sides', () => {
+    const merged = mergeContainerContributions(
+      { mcpServers: { a: { command: 'a', args: [] } }, userVisibleTools: ['mcp__nanoclaw__send_message'] },
+      { mcpServers: { b: { command: 'b', args: [] } }, userVisibleTools: ['mcp__nanoclaw__band_send_message'] },
+    );
+    expect(Object.keys(merged.mcpServers ?? {}).sort()).toEqual(['a', 'b']);
+    expect(merged.userVisibleTools).toEqual(['mcp__nanoclaw__send_message', 'mcp__nanoclaw__band_send_message']);
+  });
+
+  it('defaults missing fields to empty', () => {
+    const merged = mergeContainerContributions({}, {});
+    expect(merged.mounts).toEqual([]);
+    expect(merged.env).toEqual({});
+    expect(merged.mcpServers).toEqual({});
+    expect(merged.userVisibleTools).toEqual([]);
+  });
+});
+
+describe('stopGraceForReason', () => {
+  it('grants the long graceful window when the reason contains "graceful"', () => {
+    expect(stopGraceForReason('absolute-ceiling graceful')).toBe(GRACEFUL_STOP_GRACE_SEC);
+  });
+
+  it('keeps recovery/stuck kills on the fast window', () => {
+    expect(stopGraceForReason('absolute-ceiling')).toBe(FAST_STOP_GRACE_SEC);
+    expect(stopGraceForReason('claim-stuck')).toBe(FAST_STOP_GRACE_SEC);
+    expect(stopGraceForReason('rebuild applied')).toBe(FAST_STOP_GRACE_SEC);
+  });
+});
 
 describe('resolveProviderName', () => {
   it('prefers session over container config', () => {
@@ -89,5 +141,32 @@ describe('container boot-failure tripwire (structural)', () => {
     const src = fs.readFileSync(path.join(process.cwd(), 'src', 'container-runner.ts'), 'utf-8');
     expect(src).toContain('stderrTail.push(line)');
     expect(src).toMatch(/Container exited non-zero.*stderrTail/s);
+  });
+});
+
+describe('rewriteOneCliProxyArgs', () => {
+  it('rewrites OneCLI proxy host args for compose child containers', () => {
+    const args = [
+      'run',
+      '-e',
+      'HTTPS_PROXY=http://x:token@host.docker.internal:10255',
+      '-e',
+      'NO_PROXY=localhost,host.docker.internal',
+      '--add-host=host.docker.internal:host-gateway',
+    ];
+
+    rewriteOneCliProxyArgs(args, 'onecli');
+
+    expect(args).toContain('HTTPS_PROXY=http://x:token@onecli:10255');
+    expect(args).toContain('NO_PROXY=localhost,host.docker.internal');
+    expect(args).toContain('--add-host=host.docker.internal:host-gateway');
+  });
+
+  it('leaves args unchanged without a compose hostname', () => {
+    const args = ['-e', 'HTTPS_PROXY=http://x:token@host.docker.internal:10255'];
+
+    rewriteOneCliProxyArgs(args, undefined);
+
+    expect(args).toEqual(['-e', 'HTTPS_PROXY=http://x:token@host.docker.internal:10255']);
   });
 });

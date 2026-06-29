@@ -32,6 +32,14 @@ export function registerTools(tools: McpToolDefinition[]): void {
   }
 }
 
+export function listRegisteredToolNames(): string[] {
+  return allTools.map((t) => t.tool.name);
+}
+
+export function getRegisteredTool(name: string): McpToolDefinition | undefined {
+  return toolMap.get(name);
+}
+
 export async function startMcpServer(): Promise<void> {
   const server = new Server({ name: 'nanoclaw', version: '2.0.0' }, { capabilities: { tools: {} } });
 
@@ -51,4 +59,21 @@ export async function startMcpServer(): Promise<void> {
   const transport = new StdioServerTransport();
   await server.connect(transport);
   log(`MCP server started with ${allTools.length} tools: ${allTools.map((t) => t.tool.name).join(', ')}`);
+}
+
+// User-visible tool registry. The Claude provider emits a 'user_visible_tool'
+// event when one of these tool names appears in an assistant message, which
+// causes the poll loop to show typing indicators. Core seeds
+// 'mcp__nanoclaw__send_message'; channels add their own names at startup
+// (e.g. Band adds 'mcp__nanoclaw__band_send_message') via the
+// NANOCLAW_USER_VISIBLE_TOOLS env var seeded by buildContainerArgs.
+
+const userVisibleTools = new Set<string>(['mcp__nanoclaw__send_message']);
+
+export function markUserVisibleTool(name: string): void {
+  userVisibleTools.add(name);
+}
+
+export function isUserVisibleToolName(name: string): boolean {
+  return userVisibleTools.has(name);
 }

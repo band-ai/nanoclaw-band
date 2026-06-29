@@ -1,6 +1,25 @@
 export { initDb, initTestDb, getDb, closeDb } from './connection.js';
 export { runMigrations } from './migrations/index.js';
 export {
+  beginInboundDelivery,
+  canPlatformProcessFromLedger,
+  getInboundDelivery,
+  markInboundDeliveryDropped,
+  markInboundDeliveryFailed,
+  markInboundDeliveryPersisted,
+  markInboundDeliveryProcessed,
+  type InboundDeliveryKey,
+  type InboundDeliveryRow,
+  type InboundDeliveryStatus,
+} from './inbound-delivery-ledger.js';
+export {
+  deleteModuleState,
+  getModuleState,
+  listModuleState,
+  setModuleState,
+  type ModuleStateRow,
+} from './module-state.js';
+export {
   createAgentGroup,
   getAgentGroup,
   getAgentGroupByFolder,
@@ -30,6 +49,8 @@ export {
   findSessionByAgentGroup,
   getSessionsByAgentGroup,
   getActiveSessions,
+  getActiveSessionsByMessagingGroup,
+  closeActiveSessionsForMessagingGroup,
   getRunningSessions,
   updateSession,
   deleteSession,

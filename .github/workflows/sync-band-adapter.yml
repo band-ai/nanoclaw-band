@@ -1,0 +1,73 @@
+name: Sync band/adapter with main
+
+# Keep the Band payload branch current. Whenever main advances (most often an
+# upstream NanoClaw merge landing in the fork), merge the new main into
+# band/adapter and push, so band/adapter stays 0-behind main.
+#
+# band/adapter is, by design, main + only the 13 additive Band-owned files (the
+# /add-band skill copies them and supplies deps at install time). So merging main
+# in only pulls main's own changes onto the payload — it never touches the Band
+# files and should never conflict. If it ever does — or the result stops being a
+# clean additive, skills-free overlay — the job fails loudly and leaves
+# band/adapter untouched for a human. It deliberately does NOT build/typecheck:
+# the payload is an overlay, not an independently buildable tree (the Band deps
+# live in the skill's install step, not in band/adapter's package.json).
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# Never let two syncs race on pushing band/adapter.
+concurrency:
+  group: sync-band-adapter
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: band/adapter
+          fetch-depth: 0
+
+      - name: Merge main into band/adapter (additive overlay only)
+        run: |
+          set -euo pipefail
+          git config user.name  "band-sync[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git fetch --no-tags origin main band/adapter
+
+          BASE=origin/main
+
+          # Already current? nothing to do.
+          behind=$(git rev-list --count HEAD..$BASE)
+          if [ "$behind" -eq 0 ]; then
+            echo "band/adapter already contains origin/main — nothing to sync."
+            exit 0
+          fi
+          echo "band/adapter is $behind commit(s) behind main — merging $BASE in."
+
+          # Merge main in. Abort on ANY conflict — never auto-resolve the payload.
+          if ! git merge --no-edit "$BASE"; then
+            git merge --abort || true
+            echo "::error::Merging main into band/adapter hit a conflict. Resolve by hand; band/adapter left untouched."
+            exit 1
+          fi
+
+          # The merged result must still be a clean additive overlay on main.
+          if git diff --name-status "$BASE" HEAD | grep -vE '^A'; then
+            echo "::error::After merge, band/adapter is no longer purely additive vs main (offending paths above). Not pushing."
+            exit 1
+          fi
+          if git diff --name-only "$BASE" HEAD -- .claude/skills/ | grep -q .; then
+            echo "::error::After merge, band/adapter touches .claude/skills/. Not pushing."
+            exit 1
+          fi
+
+          git push origin HEAD:band/adapter
+          echo "band/adapter synced to main ($(git rev-parse --short "$BASE"))."

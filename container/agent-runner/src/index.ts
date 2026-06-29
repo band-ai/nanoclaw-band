@@ -31,8 +31,15 @@ import { ensureMemoryScaffold } from './memory-scaffold.js';
 // Providers barrel — each enabled provider self-registers on import.
 // Provider skills append imports to providers/index.ts.
 import './providers/index.js';
+// Channel lifecycle-hook modules self-register on import (start/stop hooks).
+// Such an import must follow the providers barrel (so providers register
+// first) and precede the runStartHooks call below; channel install skills
+// append their `import './<channel>-lifecycle.js';` here.
 import { createProvider, type ProviderName } from './providers/factory.js';
+import { buildMcpServers } from './mcp-servers.js';
+import { runStartHooks, runStopHooks } from './lifecycle.js';
 import { runPollLoop } from './poll-loop.js';
+import { getContinuation } from './db/session-state.js';
 
 function log(msg: string): void {
   console.error(`[agent-runner] ${msg}`);
@@ -52,7 +59,15 @@ async function main(): Promise<void> {
   // /workspace/agent/CLAUDE.md — the composed entry imports the shared
   // base (/app/CLAUDE.md) and each enabled module's fragment. Per-group
   // memory lives in /workspace/agent/CLAUDE.local.md (auto-loaded).
-  const instructions = buildSystemPromptAddendum(config.assistantName || undefined);
+  let instructions = buildSystemPromptAddendum(config.assistantName || undefined);
+
+  // Start hooks: channel/provider callbacks that may return a system-prompt
+  // addendum (e.g. Band memory pre-load). Core ships no hooks; channels
+  // register them via band-lifecycle.ts (imported as a side effect).
+  const startAddenda = await runStartHooks({ assistantName: config.assistantName || undefined, cwd: CWD });
+  for (const addendum of startAddenda) {
+    instructions = `${instructions}\n\n${addendum}`;
+  }
 
   // Discover additional directories mounted at /workspace/extra/*
   const additionalDirectories: string[] = [];
@@ -73,19 +88,23 @@ async function main(): Promise<void> {
   const __dirname = path.dirname(fileURLToPath(import.meta.url));
   const mcpServerPath = path.join(__dirname, 'mcp-tools', 'index.ts');
 
-  // Build MCP servers config: nanoclaw built-in + any from container.json
-  const mcpServers: Record<string, { command: string; args: string[]; env: Record<string, string> }> = {
-    nanoclaw: {
-      command: 'bun',
-      args: ['run', mcpServerPath],
-      env: {},
-    },
-  };
+  const mcpEnv = Object.fromEntries(
+    Object.entries(process.env).filter((entry): entry is [string, string] => typeof entry[1] === 'string'),
+  );
 
-  for (const [name, serverConfig] of Object.entries(config.mcpServers)) {
-    mcpServers[name] = serverConfig;
-    log(`Additional MCP server: ${name} (${serverConfig.command})`);
-  }
+  const mcpServers = buildMcpServers({
+    builtin: {
+      nanoclaw: {
+        command: 'bun',
+        args: ['run', mcpServerPath],
+        env: mcpEnv,
+      },
+    },
+    configServers: config.mcpServers,
+    mcpEnv,
+    extraMcpJson: process.env.NANOCLAW_EXTRA_MCP_SERVERS,
+    log,
+  });
 
   const provider = createProvider(providerName, {
     assistantName: config.assistantName || undefined,
@@ -102,12 +121,33 @@ async function main(): Promise<void> {
   // and keeps its native memory untouched.
   if (provider.usesMemoryScaffold) ensureMemoryScaffold();
 
+  // Graceful shutdown: when the host stops the container (SIGTERM from
+  // `docker stop`), abort the poll loop so the in-flight query can wind
+  // down cleanly. After the loop returns, Band.ai consolidation runs
+  // (no-op when not enabled) before the process exits.
+  const shutdown = new AbortController();
+  let shuttingDown = false;
+  const onSignal = (sig: NodeJS.Signals) => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    log(`Received ${sig} — aborting poll loop`);
+    shutdown.abort();
+  };
+  process.on('SIGTERM', () => onSignal('SIGTERM'));
+  process.on('SIGINT', () => onSignal('SIGINT'));
+
   await runPollLoop({
     provider,
     providerName,
     cwd: CWD,
     systemContext: { instructions },
+    signal: shutdown.signal,
   });
+
+  // Stop hooks: run after poll loop exits (on SIGTERM/SIGINT). Errors are
+  // swallowed per hook so one failure can't block the others.
+  const continuation = getContinuation(providerName);
+  await runStopHooks({ provider, providerName, cwd: CWD, continuation });
 }
 
 main().catch((err) => {

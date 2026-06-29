@@ -17,6 +17,7 @@ import { migration016 } from './016-messaging-group-instance.js';
 import { moduleApprovalsPendingApprovals } from './module-approvals-pending-approvals.js';
 import { moduleApprovalsTitleOptions } from './module-approvals-title-options.js';
 import { migration018 } from './018-approvals-approver-user-id.js';
+import { migration019 } from './019-route-foundation-state.js';
 
 export interface Migration {
   version: number;
@@ -50,7 +51,35 @@ export const migrations: Migration[] = [
   migration014,
   migration015,
   migration016,
+  migration019,
 ];
+
+// Channel-migration registry. Channels (Band, etc.) register their own
+// migrations here on import. runMigrations appends them after core,
+// keyed on `name` like core — so an already-applied channel migration is
+// skipped by name, and a base install that never registers a channel
+// never runs its migrations.
+const channelMigrations = new Map<string, Migration[]>();
+
+export function registerChannelMigrations(channel: string, list: Migration[]): void {
+  if (channelMigrations.has(channel)) {
+    throw new Error(`Channel migrations already registered: ${channel}`);
+  }
+  channelMigrations.set(channel, list);
+}
+
+/** Test-only: clears the channel-migration registry. The registry is a
+ *  module-level Map, so without this it leaks across `it()` blocks in the
+ *  same file — re-registering the same real migration (e.g. module-band-state)
+ *  would surface it twice in allMigrations() and violate schema_version's
+ *  UNIQUE(name). Never call this in production code paths. */
+export function _resetChannelMigrationsForTesting(): void {
+  channelMigrations.clear();
+}
+
+function allMigrations(): Migration[] {
+  return [...migrations, ...[...channelMigrations.values()].flat()];
+}
 
 /** Row shape of PRAGMA foreign_key_check. Child rowids are stable across a
  *  parent-table recreate (child tables aren't touched), so this JSON identity
@@ -65,7 +94,7 @@ interface FkViolation {
 const fkIdentity = (v: FkViolation): string =>
   JSON.stringify({ table: v.table, rowid: v.rowid, parent: v.parent, fkid: v.fkid });
 
-export function runMigrations(db: Database.Database, list: Migration[] = migrations): void {
+export function runMigrations(db: Database.Database, list: Migration[] = allMigrations()): void {
   db.exec(`
     CREATE TABLE IF NOT EXISTS schema_version (
       version INTEGER PRIMARY KEY,

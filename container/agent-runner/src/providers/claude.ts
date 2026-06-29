@@ -5,11 +5,38 @@ import path from 'path';
 import { query as sdkQuery, type HookCallback, type PreCompactHookInput } from '@anthropic-ai/claude-agent-sdk';
 
 import { clearContainerToolInFlight, setContainerToolInFlight } from '../db/connection.js';
+import { isUserVisibleToolName, markUserVisibleTool } from '../mcp-tools/server.js';
 import { registerProvider } from './provider-registry.js';
 import type { AgentProvider, AgentQuery, McpServerConfig, ProviderEvent, ProviderOptions, QueryInput } from './types.js';
 
 function log(msg: string): void {
   console.error(`[claude-provider] ${msg}`);
+}
+
+// Seed user-visible tools from the env var injected by buildContainerArgs.
+// The env var carries JSON: e.g. '["mcp__nanoclaw__band_send_message"]'.
+// Errors are swallowed — a malformed value means no extra tools are seeded.
+((): void => {
+  const raw = process.env.NANOCLAW_USER_VISIBLE_TOOLS;
+  if (!raw) return;
+  try {
+    const names = JSON.parse(raw) as unknown[];
+    for (const name of names) {
+      if (typeof name === 'string') markUserVisibleTool(name);
+    }
+  } catch {
+    // malformed JSON — no-op
+  }
+})();
+
+export function mergeEnv(...sources: Array<Record<string, string | undefined>>): Record<string, string> {
+  const merged: Record<string, string> = {};
+  for (const source of sources) {
+    for (const [key, value] of Object.entries(source)) {
+      if (value !== undefined) merged[key] = value;
+    }
+  }
+  return merged;
 }
 
 // Deferred SDK builtins that either sidestep nanoclaw's own scheduling or
@@ -73,6 +100,24 @@ interface SDKUserMessage {
   message: { role: 'user'; content: string };
   parent_tool_use_id: null;
   session_id: string;
+}
+
+interface SDKToolUseContent {
+  type: 'tool_use';
+  name?: string;
+}
+
+function userVisibleToolNames(message: unknown): string[] {
+  if (!message || typeof message !== 'object') return [];
+  const content = (message as { message?: { content?: unknown } }).message?.content;
+  if (!Array.isArray(content)) return [];
+
+  return content.flatMap((part): string[] => {
+    if (!part || typeof part !== 'object') return [];
+    const item = part as SDKToolUseContent;
+    if (item.type !== 'tool_use' || typeof item.name !== 'string') return [];
+    return isUserVisibleToolName(item.name) ? [item.name] : [];
+  });
 }
 
 /**
@@ -320,6 +365,7 @@ function transcriptStartMs(transcriptPath: string): number | null {
  * with a 1M-context model variant or when emergency-tuning a deployment.
  */
 const CLAUDE_CODE_AUTO_COMPACT_WINDOW = process.env.CLAUDE_CODE_AUTO_COMPACT_WINDOW || '165000';
+const CLAUDE_CODE_EXECUTABLE = process.env.CLAUDE_CODE_EXECUTABLE || '/pnpm/claude';
 
 /**
  * Stale-session detection. Matches Claude Code's error text when a
@@ -395,6 +441,13 @@ export class ClaudeProvider implements AgentProvider {
     stream.push(input.prompt);
 
     const instructions = input.systemContext?.instructions;
+    const queryEnv = mergeEnv(this.env, input.env ?? {});
+    const mcpServers = Object.fromEntries(
+      Object.entries(this.mcpServers).map(([name, server]) => [
+        name,
+        { ...server, env: mergeEnv(input.env ?? {}, server.env) },
+      ]),
+    );
 
     const sdkResult = sdkQuery({
       prompt: stream,
@@ -402,21 +455,21 @@ export class ClaudeProvider implements AgentProvider {
         cwd: input.cwd,
         additionalDirectories: this.additionalDirectories,
         resume: input.continuation,
-        pathToClaudeCodeExecutable: '/pnpm/claude',
+        pathToClaudeCodeExecutable: CLAUDE_CODE_EXECUTABLE,
         systemPrompt: instructions ? { type: 'preset' as const, preset: 'claude_code' as const, append: instructions } : undefined,
         allowedTools: [
           ...TOOL_ALLOWLIST,
           ...Object.keys(this.mcpServers).map(mcpAllowPattern),
         ],
         disallowedTools: SDK_DISALLOWED_TOOLS,
-        env: this.env,
+        env: queryEnv,
         model: this.model,
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
         effort: this.effort as any,
         permissionMode: 'bypassPermissions',
         allowDangerouslySkipPermissions: true,
         settingSources: ['project', 'user', 'local'],
-        mcpServers: this.mcpServers,
+        mcpServers,
         hooks: {
           PreToolUse: [{ hooks: [preToolUseHook] }],
           PostToolUse: [{ hooks: [postToolUseHook] }],
@@ -439,6 +492,10 @@ export class ClaudeProvider implements AgentProvider {
 
         if (message.type === 'system' && message.subtype === 'init') {
           yield { type: 'init', continuation: message.session_id };
+        } else if (message.type === 'assistant') {
+          for (const name of userVisibleToolNames(message)) {
+            yield { type: 'user_visible_tool', name };
+          }
         } else if (message.type === 'result') {
           // `result` text exists only on subtype:"success"; error subtypes
           // (e.g. a non-retryable 403 billing_error) carry their message in

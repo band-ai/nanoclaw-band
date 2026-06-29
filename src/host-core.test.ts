@@ -16,6 +16,7 @@ import {
   createAgentGroup,
   createMessagingGroup,
   createMessagingGroupAgent,
+  getInboundDelivery,
 } from './db/index.js';
 import {
   resolveSession,
@@ -29,7 +30,8 @@ import {
   clearOutbox,
 } from './session-manager.js';
 import { getSession, findSession } from './db/sessions.js';
-import type { InboundEvent } from './channels/adapter.js';
+import { registerChannelAdapter, initChannelAdapters, teardownChannelAdapters } from './channels/channel-registry.js';
+import type { ChannelAdapter, InboundEvent } from './channels/adapter.js';
 
 // Mock container runner to prevent actual Docker spawning
 vi.mock('./container-runner.js', () => ({
@@ -47,6 +49,46 @@ vi.mock('./config.js', async () => {
 
 function now() {
   return new Date().toISOString();
+}
+
+/**
+ * Minimal ACK-mode channel adapter for router tests. The delivery ledger is
+ * only written for adapters with supportsDeliveryAck === true (C3 seam), so
+ * router tests that assert ledger rows must register one of these for the
+ * channel type they route.
+ */
+function ackAdapter(channelType: string, supportsDeliveryAck = true): ChannelAdapter {
+  let connected = false;
+  return {
+    name: channelType,
+    channelType,
+    supportsThreads: false,
+    supportsDeliveryAck,
+    async setup() {
+      connected = true;
+    },
+    async teardown() {
+      connected = false;
+    },
+    isConnected() {
+      return connected;
+    },
+    async deliver() {
+      return undefined;
+    },
+  };
+}
+
+async function registerAckAdapters(channelTypes: string[], supportsDeliveryAck = true): Promise<void> {
+  for (const ct of channelTypes) {
+    registerChannelAdapter(ct, { factory: () => ackAdapter(ct, supportsDeliveryAck) });
+  }
+  await initChannelAdapters(() => ({
+    onInbound: () => {},
+    onInboundEvent: () => {},
+    onMetadata: () => {},
+    onAction: () => {},
+  }));
 }
 
 const TEST_DIR = '/tmp/nanoclaw-test-host';
@@ -358,7 +400,7 @@ describe('session manager', () => {
 });
 
 describe('router', () => {
-  beforeEach(() => {
+  beforeEach(async () => {
     createAgentGroup({
       id: 'ag-1',
       name: 'Test Agent',
@@ -389,6 +431,13 @@ describe('router', () => {
       priority: 0,
       created_at: now(),
     });
+    // The delivery ledger is ACK-mode-only (C3 seam). These router cases assert
+    // ledger rows, so register ACK-mode adapters for the channels they route.
+    await registerAckAdapters(['discord', 'slack', 'band']);
+  });
+
+  afterEach(async () => {
+    await teardownChannelAdapters();
   });
 
   it('should route a message end-to-end', async () => {
@@ -407,7 +456,8 @@ describe('router', () => {
       },
     };
 
-    await routeInbound(event);
+    const result = await routeInbound(event);
+    expect(result.status).toBe('persisted');
 
     // Verify session was created
     const session = findSession('mg-1', null);
@@ -422,20 +472,28 @@ describe('router', () => {
     expect(rows).toHaveLength(1);
     expect(JSON.parse(rows[0].content).text).toBe('Hello agent!');
 
+    const ledger = getInboundDelivery({
+      channelType: 'discord',
+      platformId: 'chan-123',
+      platformMessageId: 'msg-in-1',
+    });
+    expect(ledger?.status).toBe('persisted');
+    expect(JSON.parse(ledger!.session_ids_json!)).toEqual([session!.id]);
+
     // Verify container was woken
     expect(wakeContainer).toHaveBeenCalled();
   });
 
   it('auto-creates messaging group only when the bot is addressed (mention/DM)', async () => {
     // The router's no-mg branch is escalation-gated: plain chatter on an
-    // unknown channel stays silent (no DB writes) so a bot that sits in
-    // many unwired channels doesn't bloat messaging_groups. Only explicit
-    // mentions and DMs trigger auto-create.
+    // unknown channel does not create messaging_groups, but it is recorded in
+    // the delivery ledger so ACK-aware adapters can avoid silent message loss.
+    // Only explicit mentions and DMs trigger auto-create.
     const { routeInbound } = await import('./router.js');
     const { getMessagingGroupByPlatform } = await import('./db/messaging-groups.js');
 
     // Plain message on unknown channel — should NOT auto-create.
-    await routeInbound({
+    const plainResult = await routeInbound({
       channelType: 'slack',
       platformId: 'C-PLAIN',
       threadId: null,
@@ -446,10 +504,14 @@ describe('router', () => {
         timestamp: now(),
       },
     });
+    expect(plainResult).toMatchObject({ status: 'dropped', reason: 'no_messaging_group', retryable: true });
     expect(getMessagingGroupByPlatform('slack', 'C-PLAIN')).toBeUndefined();
+    expect(
+      getInboundDelivery({ channelType: 'slack', platformId: 'C-PLAIN', platformMessageId: 'msg-plain' })?.status,
+    ).toBe('retrying');
 
     // Mention on unknown channel — SHOULD auto-create (next step: channel-registration flow).
-    await routeInbound({
+    const mentionedResult = await routeInbound({
       channelType: 'slack',
       platformId: 'C-MENTIONED',
       threadId: null,
@@ -461,7 +523,69 @@ describe('router', () => {
         isMention: true,
       },
     });
+    expect(mentionedResult).toMatchObject({ status: 'dropped', reason: 'no_agent_wired', retryable: true });
     expect(getMessagingGroupByPlatform('slack', 'C-MENTIONED')).toBeDefined();
+  });
+
+  it('audits non-mention messages in known-but-unwired rooms', async () => {
+    const { routeInbound } = await import('./router.js');
+    createMessagingGroup({
+      id: 'mg-unwired',
+      channel_type: 'band',
+      platform_id: 'band:room-unwired',
+      name: 'Unwired Band Room',
+      is_group: 1,
+      unknown_sender_policy: 'public',
+      created_at: now(),
+    });
+
+    const result = await routeInbound({
+      channelType: 'band',
+      platformId: 'band:room-unwired',
+      threadId: null,
+      message: {
+        id: 'band-msg-unwired-plain',
+        kind: 'chat',
+        content: JSON.stringify({ sender: 'Band User', text: 'hello?' }),
+        timestamp: now(),
+      },
+    });
+
+    expect(result).toMatchObject({ status: 'dropped', reason: 'no_agent_wired_unmentioned', retryable: true });
+    expect(
+      getInboundDelivery({
+        channelType: 'band',
+        platformId: 'band:room-unwired',
+        platformMessageId: 'band-msg-unwired-plain',
+      })?.status,
+    ).toBe('retrying');
+  });
+
+  it('dedupes repeated platform message ids after persistence', async () => {
+    const { routeInbound } = await import('./router.js');
+
+    const event: InboundEvent = {
+      channelType: 'discord',
+      platformId: 'chan-123',
+      threadId: null,
+      message: {
+        id: 'msg-duplicate-platform-id',
+        kind: 'chat',
+        content: JSON.stringify({ sender: 'User', text: 'deliver once' }),
+        timestamp: now(),
+      },
+    };
+
+    const first = await routeInbound(event);
+    const second = await routeInbound(event);
+    expect(first.status).toBe('persisted');
+    expect(second.status).toBe('persisted');
+
+    const session = findSession('mg-1', null)!;
+    const db = new Database(inboundDbPath('ag-1', session.id));
+    const rows = db.prepare('SELECT * FROM messages_in WHERE id = ?').all('msg-duplicate-platform-id:ag-1');
+    db.close();
+    expect(rows).toHaveLength(1);
   });
 
   it('should route multiple messages to the same session', async () => {
@@ -594,6 +718,80 @@ describe('router', () => {
     expect(wakeContainer).not.toHaveBeenCalled();
     // No session should have been created for this agent.
     expect(findSession('mg-1', null)).toBeUndefined();
+  });
+
+  it('writes ledger rows only for ACK-mode adapters', async () => {
+    const { routeInbound } = await import('./router.js');
+    // 'discord' is registered as ACK-mode in beforeEach via registerAckAdapters
+    const result = await routeInbound({
+      channelType: 'discord',
+      platformId: 'chan-123',
+      threadId: null,
+      message: { id: 'msg-ack-1', kind: 'chat', content: JSON.stringify({ text: 'hi' }), timestamp: now() },
+    });
+    expect(result.status).toBe('persisted');
+    const ledger = getInboundDelivery({
+      channelType: 'discord',
+      platformId: 'chan-123',
+      platformMessageId: 'msg-ack-1',
+    });
+    expect(ledger?.status).toBe('persisted');
+  });
+
+  it('does NOT write ledger rows for non-ACK adapters', async () => {
+    // Register a non-ACK adapter for a fresh channel and bring it up.
+    await registerAckAdapters(['no-ack-ch'], false);
+    // Need a messaging group wired for this channel.
+    createMessagingGroup({
+      id: 'mg-noack',
+      channel_type: 'no-ack-ch',
+      platform_id: 'noack-room',
+      instance: 'no-ack-ch',
+      name: null,
+      is_group: 0,
+      unknown_sender_policy: 'public',
+      created_at: now(),
+    });
+    createMessagingGroupAgent({
+      id: 'mga-noack',
+      messaging_group_id: 'mg-noack',
+      agent_group_id: 'ag-1',
+      engage_mode: 'pattern',
+      engage_pattern: '.',
+      sender_scope: 'all',
+      ignored_message_policy: 'drop',
+      session_mode: 'shared',
+      priority: 0,
+      created_at: now(),
+    });
+
+    const { routeInbound } = await import('./router.js');
+    const result = await routeInbound({
+      channelType: 'no-ack-ch',
+      platformId: 'noack-room',
+      threadId: null,
+      message: { id: 'msg-noack-1', kind: 'chat', content: JSON.stringify({ text: 'hi' }), timestamp: now() },
+    });
+    expect(result.status).toBe('persisted');
+    const ledger = getInboundDelivery({
+      channelType: 'no-ack-ch',
+      platformId: 'noack-room',
+      platformMessageId: 'msg-noack-1',
+    });
+    expect(ledger).toBeUndefined();
+  });
+
+  it('returns audited:false on drops from non-ACK adapters', async () => {
+    const { routeInbound } = await import('./router.js');
+    // Route to unknown channel with no adapter — ackMode is false.
+    const result = await routeInbound({
+      channelType: 'no-adapter-ch',
+      platformId: 'some-room',
+      threadId: null,
+      message: { id: 'msg-drop-noack', kind: 'chat', content: JSON.stringify({ text: 'hi' }), timestamp: now() },
+    });
+    expect(result.status).toBe('dropped');
+    if (result.status === 'dropped') expect(result.audited).toBe(false);
   });
 });
 

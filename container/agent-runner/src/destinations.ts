@@ -102,16 +102,25 @@ function buildDestinationsSection(): string {
     ].join('\n');
   }
 
+  // Label includes the display name and the kind of destination (channel type,
+  // e.g. "Band"/"Telegram", or "agent") so the model can map a user's natural
+  // reference ("send it on Band") to the right local name.
+  const destLabel = (d: DestinationEntry): string => {
+    const parts: string[] = [];
+    if (d.displayName && d.displayName !== d.name) parts.push(d.displayName);
+    if (d.type === 'agent') parts.push('agent');
+    else if (d.channelType) parts.push(d.channelType.charAt(0).toUpperCase() + d.channelType.slice(1));
+    return parts.length ? ` (${parts.join(' — ')})` : '';
+  };
+
   const lines = ['## Sending messages', ''];
   if (all.length === 1) {
     const d = all[0];
-    const label = d.displayName && d.displayName !== d.name ? ` (${d.displayName})` : '';
-    lines.push(`Your destination is \`${d.name}\`${label}.`);
+    lines.push(`Your destination is \`${d.name}\`${destLabel(d)}.`);
   } else {
     lines.push('You can send messages to the following destinations:', '');
     for (const d of all) {
-      const label = d.displayName && d.displayName !== d.name ? ` (${d.displayName})` : '';
-      lines.push(`- \`${d.name}\`${label}`);
+      lines.push(`- \`${d.name}\`${destLabel(d)}`);
     }
   }
   lines.push('');

@@ -125,6 +125,10 @@ pip, curl, node/bun with the proxy env) are unaffected. Any workflow that relies
 on a **non-proxy-aware** tool reaching the internet directly will fail by design.
 Lockdown is **off by default**; opt in with `NANOCLAW_EGRESS_LOCKDOWN=true`.
 
+### Compose deployment note
+
+The optional Compose deployment for the outer NanoClaw process does not change this runtime model. NanoClaw still launches agent runs as sibling `docker run` containers, which means the `nanoclaw` service mounts the Docker socket and joins the sibling containers to the Compose network. That is a deliberate operator tradeoff, not a new sandbox boundary. The security properties above still come from the per-agent container mounts, host-path remapping, and credential injection path, not from the Compose service itself.
+
 ## Privilege Comparison
 
 | Capability | Main Group | Non-Main Group |
@@ -165,39 +169,3 @@ Lockdown is **off by default**; opt in with `NANOCLAW_EGRESS_LOCKDOWN=true`.
 │  • No real credentials in environment or filesystem              │
 └──────────────────────────────────────────────────────────────────┘
 ```
-
-## Supply Chain Security (pnpm)
-
-NanoClaw uses pnpm with two supply chain defenses configured in `pnpm-workspace.yaml`:
-
-### Minimum Release Age
-
-`minimumReleaseAge: 4320` (3 days). pnpm will refuse to resolve any package version published less than 3 days ago. This defends against typosquatting and compromised maintainer accounts — most malicious publishes are detected and pulled within 72 hours.
-
-**Excluding a package from the release age gate** (`minimumReleaseAgeExclude`):
-
-This should be rare. When a zero-day fix or critical dependency requires an immediate update:
-
-1. The exclusion must be reviewed and approved by a human maintainer
-2. The entry must pin the **exact version** being excluded — never a range or wildcard
-   ```yaml
-   minimumReleaseAgeExclude:
-     some-package: "1.2.3"  # Approved by @user, 2026-04-14 — CVE-XXXX-YYYY fix
-   ```
-3. The exclusion should be removed once the version ages past the threshold (i.e. after 3 days)
-4. Automated agents (Claude, CI bots) must never add exclusions without human sign-off
-
-### Build Script Allowlist
-
-`onlyBuiltDependencies` restricts which packages can execute install/postinstall scripts. Only packages on this list are permitted to run build scripts during `pnpm install`. Currently allowed:
-
-- `better-sqlite3` — compiles native SQLite bindings
-- `esbuild` — downloads platform-specific binary
-- `protobufjs` — generates protobuf bindings (used by Baileys/libsignal)
-- `sharp` — downloads platform-specific image processing binary
-
-Adding a package to this list requires human approval — build scripts execute arbitrary code with the installing user's permissions.
-
-### `.npmrc` Safety Net
-
-The `.npmrc` file contains `minReleaseAge=3d` as a fallback. The authoritative setting is in `pnpm-workspace.yaml`, but `.npmrc` provides defense-in-depth if npm is ever invoked directly (e.g. by a tool that doesn't respect pnpm).

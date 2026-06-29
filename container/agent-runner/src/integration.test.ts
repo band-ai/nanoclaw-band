@@ -7,6 +7,7 @@ import { getContinuation, setContinuation } from './db/session-state.js';
 import { MockProvider } from './providers/mock.js';
 import type { ProviderExchange } from './providers/types.js';
 import { runPollLoop } from './poll-loop.js';
+import type { AgentProvider, AgentQuery, ProviderEvent, QueryInput } from './providers/types.js';
 
 beforeEach(() => {
   initTestSessionDb();
@@ -296,10 +297,49 @@ describe('poll loop integration', () => {
     await loopPromise.catch(() => {});
   });
 
+  it('should not fallback-send final text after a user-visible MCP tool sent the reply', async () => {
+    insertMessage('m-tool', { sender: 'Alice', text: 'Reply with the Band tool' }, { platformId: 'chan-1', channelType: 'discord' });
+
+    const provider = new ToolSendingProvider();
+    const controller = new AbortController();
+    const loopPromise = runPollLoopWithTimeout(provider, controller.signal, 2000);
+
+    await waitFor(() => getPendingMessages().length === 0, 2000);
+    controller.abort();
+
+    expect(getUndeliveredMessages()).toHaveLength(0);
+
+    await loopPromise.catch(() => {});
+  });
 });
 
+class ToolSendingProvider implements AgentProvider {
+  readonly supportsNativeSlashCommands = false;
+
+  isSessionInvalid(_err: unknown): boolean {
+    return false;
+  }
+
+  query(_input: QueryInput): AgentQuery {
+    const events: AsyncIterable<ProviderEvent> = {
+      async *[Symbol.asyncIterator]() {
+        yield { type: 'activity' };
+        yield { type: 'init', continuation: 'tool-session' };
+        yield { type: 'user_visible_tool', name: 'mcp__nanoclaw__band_send_message' };
+        yield { type: 'result', text: 'Sent.' };
+      },
+    };
+
+    return {
+      push: () => {},
+      end: () => {},
+      events,
+      abort: () => {},
+    };
+  }
+}
 // Helper: run poll loop until aborted or timeout
-async function runPollLoopWithTimeout(provider: MockProvider, signal: AbortSignal, timeoutMs: number): Promise<void> {
+async function runPollLoopWithTimeout(provider: AgentProvider, signal: AbortSignal, timeoutMs: number): Promise<void> {
   return Promise.race([
     runPollLoop({
       provider,

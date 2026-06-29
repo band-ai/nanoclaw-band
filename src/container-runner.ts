@@ -24,11 +24,13 @@ import {
 import { materializeContainerJson } from './container-config.js';
 import { getContainerConfig } from './db/container-configs.js';
 import { updateContainerConfigScalars } from './db/container-configs.js';
-import { CONTAINER_RUNTIME_BIN, hostGatewayArgs, readonlyMountArgs, stopContainer } from './container-runtime.js';
+import { CONTAINER_RUNTIME_BIN, hostGatewayArgs, readonlyMountArgs, stopContainerAsync } from './container-runtime.js';
 import { EGRESS_NETWORK, egressNetworkArgs, ensureEgressNetwork } from './egress-lockdown.js';
+import { getChannelContainerConfig, getAgentContainerConfigs } from './channels/channel-container-registry.js';
 import { composeGroupClaudeMd } from './claude-md-compose.js';
 import { getAgentGroup } from './db/agent-groups.js';
 import { getDb, hasTable } from './db/connection.js';
+import { getMessagingGroup } from './db/messaging-groups.js';
 import { initGroupFilesystem } from './group-init.js';
 import { stopTypingRefresh } from './modules/typing/index.js';
 import { log } from './log.js';
@@ -53,8 +55,45 @@ import type { AgentGroup, Session } from './types.js';
 
 const onecli = new OneCLI({ url: ONECLI_URL, apiKey: ONECLI_API_KEY });
 
+function composeNetworkName(): string | undefined {
+  return process.env.NANOCLAW_DOCKER_NETWORK || undefined;
+}
+
+function composeOneCliHostname(): string | undefined {
+  return process.env.NANOCLAW_ONECLI_HOSTNAME || undefined;
+}
+
+export function toHostPath(
+  hostPath: string,
+  projectRoot = process.cwd(),
+  hostProjectRoot = process.env.NANOCLAW_HOST_PATH,
+): string {
+  if (!hostProjectRoot) return hostPath;
+  const absolutePath = path.resolve(hostPath);
+  const absoluteProjectRoot = path.resolve(projectRoot);
+  if (absolutePath === absoluteProjectRoot) return hostProjectRoot;
+  if (!absolutePath.startsWith(`${absoluteProjectRoot}${path.sep}`)) return hostPath;
+  return path.join(hostProjectRoot, path.relative(absoluteProjectRoot, absolutePath));
+}
+
+export function rewriteOneCliProxyArgs(args: string[], hostname = composeOneCliHostname()): void {
+  if (!hostname) return;
+  for (let i = 0; i < args.length; i += 1) {
+    if (/^https?_proxy=/i.test(args[i])) {
+      args[i] = args[i].replace(/host\.docker\.internal/g, hostname);
+    }
+  }
+}
+
+interface ActiveContainer {
+  process: ChildProcess;
+  containerName: string;
+  state: 'running' | 'stopping';
+  stopReason?: string;
+}
+
 /** Active containers tracked by session ID. */
-const activeContainers = new Map<string, { process: ChildProcess; containerName: string }>();
+const activeContainers = new Map<string, ActiveContainer>();
 
 /**
  * In-flight wake promises, keyed by session id. Deduplicates concurrent
@@ -87,9 +126,17 @@ export function isContainerRunning(sessionId: string): boolean {
  * can branch on the boolean.
  */
 export function wakeContainer(session: Session): Promise<boolean> {
-  if (activeContainers.has(session.id)) {
+  const active = activeContainers.get(session.id);
+  if (active?.state === 'running') {
     log.debug('Container already running', { sessionId: session.id });
     return Promise.resolve(true);
+  }
+  if (active?.state === 'stopping') {
+    log.debug('Container is stopping; wake will retry after shutdown', {
+      sessionId: session.id,
+      reason: active.stopReason,
+    });
+    return Promise.resolve(false);
   }
   const existing = wakePromises.get(session.id);
   if (existing) {
@@ -137,12 +184,12 @@ async function spawnContainer(session: Session): Promise<void> {
   const providerName = resolveProviderName(session.agent_provider, containerConfig.provider);
   initGroupFilesystem(agentGroup, { provider: providerName });
 
-  // Resolve the effective provider + any host-side contribution it declares
+  // Resolve the effective provider/channel contributions they declare
   // (extra mounts, env passthrough). Computed once and threaded through both
   // buildMounts and buildContainerArgs so side effects (mkdir, etc.) fire once.
-  const { provider, contribution } = resolveProviderContribution(session, agentGroup, containerConfig);
+  const contribution = await resolveContainerContribution(session, agentGroup, containerConfig);
 
-  const mounts = buildMounts(agentGroup, session, containerConfig, provider, contribution);
+  const mounts = buildMounts(agentGroup, session, containerConfig, providerName, contribution);
   const containerName = `nanoclaw-v2-${agentGroup.folder}-${Date.now()}`;
   // OneCLI agent identifier is always the agent group id — stable across
   // sessions and reversible via getAgentGroup() for approval routing.
@@ -152,7 +199,6 @@ async function spawnContainer(session: Session): Promise<void> {
     containerName,
     agentGroup,
     containerConfig,
-    provider,
     contribution,
     agentIdentifier,
   );
@@ -167,7 +213,7 @@ async function spawnContainer(session: Session): Promise<void> {
 
   const container = spawn(CONTAINER_RUNTIME_BIN, args, { stdio: ['ignore', 'pipe', 'pipe'] });
 
-  activeContainers.set(session.id, { process: container, containerName });
+  activeContainers.set(session.id, { process: container, containerName, state: 'running' });
   markContainerRunning(session.id);
 
   // Log stderr. A container that dies at boot (unknown provider, missing
@@ -211,6 +257,19 @@ async function spawnContainer(session: Session): Promise<void> {
   });
 }
 
+/**
+ * Stop grace periods for container shutdown. Most kill reasons are recovery
+ * paths (stuck claim, absolute ceiling, rebuild) and should not leave the host
+ * blocked behind a dying container for minutes. A future explicitly graceful
+ * caller can opt into the longer path by including "graceful" in its reason.
+ */
+export const FAST_STOP_GRACE_SEC = 10;
+export const GRACEFUL_STOP_GRACE_SEC = 30 * 60;
+
+export function stopGraceForReason(reason: string): number {
+  return reason.includes('graceful') ? GRACEFUL_STOP_GRACE_SEC : FAST_STOP_GRACE_SEC;
+}
+
 /** Kill a container for a session. */
 export function killContainer(sessionId: string, reason: string, onExit?: () => void): void {
   const entry = activeContainers.get(sessionId);
@@ -220,10 +279,25 @@ export function killContainer(sessionId: string, reason: string, onExit?: () => 
     entry.process.once('close', onExit);
   }
 
-  log.info('Killing container', { sessionId, reason, containerName: entry.containerName });
+  const timeoutSec = stopGraceForReason(reason);
+  entry.state = 'stopping';
+  entry.stopReason = reason;
+  log.info('Stopping container', { sessionId, reason, containerName: entry.containerName, timeoutSec });
+
   try {
-    stopContainer(entry.containerName);
-  } catch {
+    const stopper = stopContainerAsync(entry.containerName, timeoutSec);
+    stopper.on('error', (err) => {
+      log.warn('docker stop failed; falling back to SIGKILL', { sessionId, reason, err });
+      entry.process.kill('SIGKILL');
+    });
+    stopper.on('close', (code) => {
+      if (code !== 0) {
+        log.warn('docker stop exited non-zero; falling back to SIGKILL', { sessionId, reason, code });
+        entry.process.kill('SIGKILL');
+      }
+    });
+  } catch (err) {
+    log.warn('Failed to start docker stop; falling back to SIGKILL', { sessionId, reason, err });
     entry.process.kill('SIGKILL');
   }
 }
@@ -244,15 +318,15 @@ export function resolveProviderName(
   return (sessionProvider || containerConfigProvider || 'claude').toLowerCase();
 }
 
-function resolveProviderContribution(
+async function resolveContainerContribution(
   session: Session,
   agentGroup: AgentGroup,
   containerConfig: import('./container-config.js').ContainerConfig,
-): { provider: string; contribution: ProviderContainerContribution } {
+): Promise<ProviderContainerContribution> {
   const provider = resolveProviderName(session.agent_provider, containerConfig.provider);
-  const fn = getProviderContainerConfig(provider);
-  const contribution = fn
-    ? fn({
+  const providerFn = getProviderContainerConfig(provider);
+  const providerContribution = providerFn
+    ? providerFn({
         sessionDir: sessionDir(agentGroup.id, session.id),
         agentGroupId: agentGroup.id,
         groupDir: path.resolve(GROUPS_DIR, agentGroup.folder),
@@ -260,7 +334,36 @@ function resolveProviderContribution(
         hostEnv: process.env,
       })
     : {};
-  return { provider, contribution };
+
+  const messagingGroup = session.messaging_group_id ? (getMessagingGroup(session.messaging_group_id) ?? null) : null;
+  const channelFn = messagingGroup ? getChannelContainerConfig(messagingGroup.channel_type) : undefined;
+  const channelContribution = channelFn
+    ? await channelFn({
+        session,
+        messagingGroup,
+        agentGroupId: agentGroup.id,
+        hostEnv: process.env,
+      })
+    : {};
+
+  // Agent-scoped contributions apply to every session of the group regardless
+  // of the session's channel (e.g. Band grants cross-channel control tools).
+  const agentContributions = await Promise.all(
+    getAgentContainerConfigs().map((fn) => fn({ session, agentGroupId: agentGroup.id, hostEnv: process.env })),
+  );
+
+  return mergeContainerContributions(providerContribution, channelContribution, ...agentContributions);
+}
+
+export function mergeContainerContributions(
+  ...contributions: ProviderContainerContribution[]
+): ProviderContainerContribution {
+  return {
+    mounts: contributions.flatMap((c) => c.mounts ?? []),
+    env: Object.assign({}, ...contributions.map((c) => c.env ?? {})),
+    mcpServers: Object.assign({}, ...contributions.map((c) => c.mcpServers ?? {})),
+    userVisibleTools: contributions.flatMap((c) => c.userVisibleTools ?? []),
+  };
 }
 
 export function buildMounts(
@@ -360,7 +463,7 @@ export function buildMounts(
     mounts.push(...providerContribution.mounts);
   }
 
-  return mounts;
+  return mounts.map((mount) => ({ ...mount, hostPath: toHostPath(mount.hostPath, projectRoot) }));
 }
 
 /**
@@ -430,7 +533,6 @@ async function buildContainerArgs(
   containerName: string,
   agentGroup: AgentGroup,
   containerConfig: import('./container-config.js').ContainerConfig,
-  _provider: string,
   providerContribution: ProviderContainerContribution,
   agentIdentifier?: string,
 ): Promise<string[]> {
@@ -452,6 +554,17 @@ async function buildContainerArgs(
     for (const [key, value] of Object.entries(providerContribution.env)) {
       args.push('-e', `${key}=${value}`);
     }
+  }
+
+  // Channel-contributed MCP servers — serialized as JSON and picked up by
+  // buildMcpServers() in the container's main(). Empty object = omit the env
+  // var so the container sees no extra servers rather than an empty map.
+  if (providerContribution.mcpServers && Object.keys(providerContribution.mcpServers).length > 0) {
+    args.push('-e', `NANOCLAW_EXTRA_MCP_SERVERS=${JSON.stringify(providerContribution.mcpServers)}`);
+  }
+  // User-visible tool names seeded into the container at startup.
+  if (providerContribution.userVisibleTools && providerContribution.userVisibleTools.length > 0) {
+    args.push('-e', `NANOCLAW_USER_VISIBLE_TOOLS=${JSON.stringify(providerContribution.userVisibleTools)}`);
   }
 
   // Egress lockdown when enabled — throws if it can't be established, aborting
@@ -496,6 +609,12 @@ async function buildContainerArgs(
   if (!onecliApplied) {
     throw new Error('OneCLI gateway not applied — refusing to spawn container without credentials');
   }
+  // Compose deployment: rewrite the injected proxy host (host.docker.internal →
+  // the OneCLI service hostname) and join the compose network. No-ops unless the
+  // NANOCLAW_ONECLI_HOSTNAME / NANOCLAW_DOCKER_NETWORK env vars are set.
+  rewriteOneCliProxyArgs(args);
+  const networkName = composeNetworkName();
+  if (networkName) args.push('--network', networkName);
   log.info('OneCLI gateway applied', { containerName });
 
   // Override entrypoint: run v2 entry point directly via Bun (no tsc, no stdin).

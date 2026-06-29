@@ -335,6 +335,11 @@ export async function processQuery(
   let queryContinuation: string | undefined;
   let done = false;
   let unwrappedNudged = false;
+  // Set when the agent invokes a user-visible MCP tool (e.g. band_send_message)
+  // that already delivered content to the channel this turn. The SDK's final
+  // `result` text is then a terse tool summary ("Sent.") that must not be
+  // re-delivered by the fallback dispatch path.
+  let userVisibleToolUsed = false;
   // Prompt queue for the exchange hook — each result event consumes the
   // oldest unanswered prompt, except a wrapping-retry result, which answers
   // the same prompt again. Unused (and unmaintained) when the provider
@@ -473,6 +478,8 @@ export async function processQuery(
         // effectively orphaned and the next message started a blank
         // Claude session with no prior context.
         setContinuation(providerName, event.continuation);
+      } else if (event.type === 'user_visible_tool') {
+        userVisibleToolUsed = true;
       } else if (event.type === 'result') {
         // A result — with or without text — means the turn is done. Mark
         // the initial batch completed now so the host sweep doesn't see
@@ -481,7 +488,19 @@ export async function processQuery(
         // (send_message) mid-turn, or the message may not need a response
         // at all — either way the turn is finished.
         markCompleted(initialBatchIds);
-        if (event.text) {
+        if (event.text && userVisibleToolUsed) {
+          // The agent already sent a user-visible MCP message this turn; the
+          // SDK's final text is a terse tool-result summary. Log it, don't
+          // re-deliver, and record the exchange as completed.
+          log(`[tool-result] ${event.text.slice(0, 200)}`);
+          notifyExchangeComplete(onExchangeComplete, {
+            prompt: archivePrompts[0] ?? initialPrompt,
+            result: event.text,
+            continuation: queryContinuation ?? initialContinuation,
+            status: 'completed',
+          });
+          archivePrompts.shift();
+        } else if (event.text) {
           const { sent, hasUnwrapped } = dispatchResultText(event.text, routing);
           if (sent === 0 && event.isError === true) {
             // Non-retryable error turn (e.g. a 403 billing_error) with no
@@ -522,6 +541,8 @@ export async function processQuery(
         } else {
           archivePrompts.shift();
         }
+        // Reset for the next turn within this open query.
+        userVisibleToolUsed = false;
       }
     }
   } catch (err) {
@@ -568,6 +589,9 @@ function handleEvent(event: ProviderEvent, _routing: RoutingContext): void {
       break;
     case 'progress':
       log(`Progress: ${event.message}`);
+      break;
+    case 'user_visible_tool':
+      log(`User-visible tool: ${event.name}`);
       break;
   }
 }
