@@ -16,6 +16,7 @@ rm -f \
   container/agent-runner/src/mcp-tools/band.test.ts \
   container/agent-runner/src/mcp-tools/band.instructions.md \
   container/agent-runner/src/band-lifecycle.ts \
+  container/agent-runner/src/band-lifecycle.test.ts \
   container/agent-runner/src/band-memory-load.ts \
   container/agent-runner/src/band-memory-load.test.ts \
   container/agent-runner/src/band-memory-consolidate.ts \
