@@ -323,17 +323,27 @@ The skip-on-existing-key gate assumes the key in `.env` is live. Two resets:
 
 ### Step 2 — Rebuild the image if it's stale
 
-The agent image is slug-scoped and must contain the Band container files. An image
-built before the copy runs Band sessions **without** the `band_*` tools — a silent
-failure. Check its age and rebuild if needed (Phase 0 sourced the helper):
+The agent image is slug-scoped and must contain the Band container files **and the
+`@band-ai/sdk` dependency**. This matters more than it looks: the container MCP
+barrel imports `band.js` unconditionally, and `band.ts` imports `@band-ai/sdk` at
+module load — so a missing dep throws and the **entire MCP server fails to start,
+killing every tool on every session** (Band, CLI, Telegram, and core), not just the
+`band_*` tools. The agent still chats (the text reply path needs no MCP) but
+silently has zero tools. Rebuild, then **verify the dep actually landed** —
+`package.json` having it does not prove the image does (the image may predate the
+install, or buildkit may serve a stale COPY layer; see "Container Build Cache" in
+CLAUDE.md):
 
 ```bash
 IMAGE="$(container_image_base):latest"
-CREATED=$(docker inspect "$IMAGE" --format '{{.Created}}' 2>/dev/null || echo "")
-if [ -z "$CREATED" ]; then
-  echo "image $IMAGE absent — rebuilding"; ( cd "$ROOT" && ./container/build.sh )
+( cd "$ROOT" && ./container/build.sh )
+
+# Verify the rebuild installed the SDK; prune the builder and retry if not.
+if docker run --rm --entrypoint sh "$IMAGE" -c 'ls /app/node_modules/@band-ai/sdk' >/dev/null 2>&1; then
+  echo "ok: image contains @band-ai/sdk"
 else
-  echo "$IMAGE built ${CREATED%%T*} — rebuild if this predates your Band copy:"
+  echo "STALE: image lacks @band-ai/sdk — pruning builder cache and rebuilding"
+  docker builder prune -f
   ( cd "$ROOT" && ./container/build.sh )
 fi
 ```
@@ -370,6 +380,14 @@ fi
 If you fall back to `pnpm run dev` and it fails with `EADDRINUSE`, the default port
 3000 is taken (a known collision with band-prototype) — set `WEBHOOK_PORT=3100`
 (or any free port) in `.env` and retry.
+
+A service restart does **not** kill already-running session containers — they keep
+serving the **old** image until their 30-min ceiling. If you rebuilt in Step 2 while
+sessions were live, clear them so they respawn from the new image:
+
+```bash
+ncl groups restart --id <agent-group-id>   # repeat per Band-wired agent group
+```
 
 ### Step 4 — Confirm discovery
 

@@ -8,18 +8,36 @@ cd "$(git rev-parse --show-toplevel)"; export PROJECT_ROOT="$PWD"
 source setup/lib/install-slug.sh   # launchd_label / systemd_unit / container_image_base
 ```
 
-## 0. The agent image is fresh enough to contain the Band files
+## 0. The agent image actually contains the Band files + SDK
 
-A slug-scoped image built **before** the Band container files were copied runs
-Band sessions without the `band_*` tools — a silent failure. Confirm the image
-exists and note its build date; rebuild (`./container/build.sh`) if it predates
-your copy:
+A slug-scoped image built **before** the Band files were copied — or before
+`@band-ai/sdk` was installed — breaks the container. The MCP barrel imports
+`band.js` unconditionally and `band.ts` imports `@band-ai/sdk` at load, so a missing
+dep throws and crashes the **whole MCP server** (every tool on every session, not
+just `band_*`); the agent still chats but has no tools. The build date alone is not
+enough — verify the image's contents directly:
 
 ```bash
 IMAGE="$(container_image_base):latest"
+
+# exists + build date
 docker inspect "$IMAGE" --format 'image {{.Id}} built {{.Created}}' 2>/dev/null \
   || echo "image $IMAGE absent — rebuild with ./container/build.sh"
+
+# (a) the SDK is actually installed in the image
+docker run --rm --entrypoint sh "$IMAGE" -c 'ls /app/node_modules/@band-ai/sdk' >/dev/null 2>&1 \
+  && echo "ok: image has @band-ai/sdk" || echo "FAIL: stale image — rebuild (./container/build.sh)"
+
+# (b) the band tool module loads in-image (src mounted as at runtime)
+docker run --rm \
+  -v "$PWD/container/agent-runner/src:/app/src:ro" \
+  -e BAND_AGENT_ID=smoke -e BAND_REST_URL=https://app.band.ai -e BAND_API_KEY=smoke \
+  --entrypoint sh "$IMAGE" \
+  -c 'cd /app && bun -e "await import(\"./src/mcp-tools/band.ts\"); console.log(\"BAND_TOOLS_IMPORT_OK\")"'
 ```
+
+Expect `BAND_TOOLS_IMPORT_OK`. A "Cannot find module" means the image predates the
+dependency — rebuild.
 
 ## 1. Builds are clean (host + container)
 
@@ -28,7 +46,9 @@ pnpm run build
 cd container/agent-runner && bun run typecheck && cd -
 ```
 
-A clean build is the strongest SDK-resolution check. `src/channels/band.ts`
+A clean build proves the **source** typechecks and the **host** tree resolves the
+SDK — but not that the built image installed it (that is §0, and the agent runs in
+the image, not the host tree). `src/channels/band.ts`
 imports the link class as `ThenvoiLink as BandLink` from `@band-ai/sdk`, and the
 container modules (`mcp-tools/band.ts`, `band-memory-load.ts`,
 `band-memory-consolidate.ts`) import `ThenvoiLink` from `@band-ai/sdk` plus
