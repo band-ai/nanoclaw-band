@@ -1,99 +1,147 @@
-name: Sync upstream NanoClaw base
+name: Sync main with upstream NanoClaw
+
+# Keep this fork's main current with upstream nanocoai/nanoclaw. On a daily
+# schedule (or manual dispatch), merge upstream main into main and push.
+#
+# Unlike band/adapter — a purely additive overlay that never conflicts and so is
+# pushed directly by sync-band-adapter.yml — main carries the fork's own changes
+# to core (the Band seams), so an upstream merge CAN conflict. On ANY conflict the
+# job aborts and fails loudly, leaving main untouched for a human to merge by hand.
+#
+# ci.yml runs only on PRs, so a direct push to main gets no CI. To avoid landing a
+# clean-but-broken merge, this job build+tests the merged result (the same checks
+# as ci.yml) before pushing — that pre-push gate is the only one main gets here.
 
 on:
   workflow_dispatch:
     inputs:
       upstream_ref:
-        description: Upstream qwibitai/nanoclaw ref to mirror
+        description: Upstream nanocoai/nanoclaw ref to merge
         required: false
         type: string
         default: main
       dry_run:
-        description: Validate without pushing the mirror branch
+        description: Merge + validate without pushing main
         required: false
         type: boolean
         default: false
   schedule:
     - cron: '17 6 * * *'
 
+# Never let two syncs race on pushing main.
 concurrency:
-  group: upstream-sync-sync-upstream-2
+  group: upstream-sync
   cancel-in-progress: false
 
 permissions:
   contents: write
-  pull-requests: read
 
 jobs:
-  sync-upstream-base:
-    if: github.repository == 'thenvoi/nanoclaw-thenvoi'
+  sync-main:
+    if: github.repository == 'band-ai/nanoclaw-band'
     runs-on: ubuntu-latest
     env:
-      UPSTREAM_REPO: qwibitai/nanoclaw
-      UPSTREAM_REF_INPUT: ${{ github.event.inputs.upstream_ref }}
-      MIRROR_BRANCH: sync-upstream-2
-      DRY_RUN_INPUT: ${{ github.event.inputs.dry_run }}
+      UPSTREAM_REPO: nanocoai/nanoclaw
+      UPSTREAM_REF: ${{ github.event.inputs.upstream_ref || 'main' }}
+      DRY_RUN: ${{ github.event.inputs.dry_run || 'false' }}
     steps:
-      - name: Check out fork
+      - name: Check out fork main
         uses: actions/checkout@v4
         with:
+          ref: main
           fetch-depth: 0
           token: ${{ github.token }}
 
       - name: Configure git identity
         shell: bash
         run: |
-          git config user.name "github-actions[bot]"
+          git config user.name  "upstream-sync[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-      - name: Fetch upstream
-        id: upstream
+      - name: Merge upstream into main (abort on any conflict)
+        id: merge
         shell: bash
         run: |
           set -euo pipefail
-          upstream_ref="${UPSTREAM_REF_INPUT:-main}"
-          mirror_branch="${MIRROR_BRANCH}"
+          git remote add upstream "https://github.com/${UPSTREAM_REPO}.git" 2>/dev/null \
+            || git remote set-url upstream "https://github.com/${UPSTREAM_REPO}.git"
+          git fetch --no-tags upstream "${UPSTREAM_REF}"
+          BASE="upstream/${UPSTREAM_REF}"
 
-          git remote add upstream "https://github.com/${UPSTREAM_REPO}.git" 2>/dev/null || git remote set-url upstream "https://github.com/${UPSTREAM_REPO}.git"
-          git fetch upstream "${upstream_ref}" --tags
-          upstream_sha="$(git rev-parse "upstream/${upstream_ref}")"
+          # Already current? nothing to do.
+          behind=$(git rev-list --count "HEAD..${BASE}")
+          if [ "$behind" -eq 0 ]; then
+            echo "main already contains ${UPSTREAM_REPO}@${UPSTREAM_REF} — nothing to sync."
+            echo "synced=0" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "main is ${behind} commit(s) behind ${BASE} — merging it in."
 
-          echo "upstream_ref=${upstream_ref}" >> "$GITHUB_OUTPUT"
-          echo "upstream_sha=${upstream_sha}" >> "$GITHUB_OUTPUT"
-          echo "mirror_branch=${mirror_branch}" >> "$GITHUB_OUTPUT"
+          # Merge upstream in. Abort on ANY conflict — never auto-resolve core.
+          if ! git merge --no-edit "$BASE"; then
+            git merge --abort || true
+            echo "::error::Merging ${BASE} into main hit a conflict. Resolve by hand; main left untouched."
+            exit 1
+          fi
+          echo "synced=1" >> "$GITHUB_OUTPUT"
+          echo "base_sha=$(git rev-parse --short "$BASE")" >> "$GITHUB_OUTPUT"
 
-      - name: Validate upstream checkout
+      - name: Set up pnpm
+        if: steps.merge.outputs.synced == '1'
+        uses: pnpm/action-setup@v4
+
+      - name: Set up Node
+        if: steps.merge.outputs.synced == '1'
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+
+      - name: Set up Bun
+        if: steps.merge.outputs.synced == '1'
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.12
+
+      - name: Validate merged main (same checks as ci.yml)
+        if: steps.merge.outputs.synced == '1'
         shell: bash
         run: |
           set -euo pipefail
-          git checkout --detach "${{ steps.upstream.outputs.upstream_sha }}"
-          corepack enable
-          corepack prepare pnpm@10.33.0 --activate
           pnpm install --frozen-lockfile
-          pnpm run build
-          pnpm test
+          ( cd container/agent-runner && bun install --frozen-lockfile )
+          pnpm run format:check
+          pnpm exec tsc --noEmit
+          pnpm exec tsc -p container/agent-runner/tsconfig.json --noEmit
+          pnpm exec vitest run
+          ( cd container/agent-runner && bun test )
 
-      - name: Update mirror branch
-        if: ${{ github.event.inputs.dry_run != 'true' }}
+      - name: Push main
+        if: steps.merge.outputs.synced == '1' && env.DRY_RUN != 'true'
         shell: bash
         run: |
           set -euo pipefail
-          mirror_branch="${{ steps.upstream.outputs.mirror_branch }}"
-          upstream_sha="${{ steps.upstream.outputs.upstream_sha }}"
-
-          git checkout -B "${mirror_branch}" "${upstream_sha}"
-          git push origin "${mirror_branch}" --force-with-lease
+          # Fast-forward of main (we started at main and added a merge commit).
+          # If main moved meanwhile the non-FF push is rejected; the next run retries.
+          git push origin HEAD:main
+          echo "main synced to ${UPSTREAM_REPO}@${UPSTREAM_REF} (${{ steps.merge.outputs.base_sha }})."
 
       - name: Summary
+        if: always()
         shell: bash
         run: |
           {
-            echo "## Upstream NanoClaw base sync"
+            echo "## Sync main with upstream"
             echo
-            echo "- Upstream: \`${UPSTREAM_REPO}@${{ steps.upstream.outputs.upstream_ref }}\`"
-            echo "- Upstream commit: \`${{ steps.upstream.outputs.upstream_sha }}\`"
-            echo "- Mirror branch: \`${{ steps.upstream.outputs.mirror_branch }}\`"
-            echo "- Dry run: \`${DRY_RUN_INPUT:-false}\`"
-            echo
-            echo "Band.ai migration/runtime PRs should target \`${{ steps.upstream.outputs.mirror_branch }}\` so GitHub compares them against the latest upstream NanoClaw v2 base instead of the old fork main."
+            echo "- Upstream: \`${UPSTREAM_REPO}@${UPSTREAM_REF}\`"
+            if [ "${{ steps.merge.outputs.synced }}" = "1" ]; then
+              echo "- Merged upstream \`${{ steps.merge.outputs.base_sha }}\` into main"
+              if [ "${DRY_RUN}" = "true" ]; then
+                echo "- Dry run: validated, **not** pushed"
+              else
+                echo "- Pushed to \`main\`"
+              fi
+            else
+              echo "- main already up to date — nothing to sync"
+            fi
           } >> "$GITHUB_STEP_SUMMARY"
