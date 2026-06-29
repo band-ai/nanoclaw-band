@@ -410,17 +410,22 @@ describe('band channel adapter', () => {
     expect(onInbound).toHaveBeenCalledWith('band:room-1', null, expect.objectContaining({ id: 'msg-next' }));
   });
 
-  it('does not mark unmentioned Band room messages as mentions', async () => {
+  it('marks every delivered Band message as a mention, trusting the platform inbox gate', async () => {
+    // Band only pushes ACL-screened, agent-addressed messages into the agent's
+    // inbox, so anything we receive is by definition a mention. We must NOT
+    // re-derive isMention from metadata.mentions: if Band's mention shape ever
+    // differs from what we'd probe, a real mention would route as isMention=false
+    // and the engage_mode:'mention' wiring would silently drop it. So even a
+    // payload whose metadata names someone else (or carries no mentions at all)
+    // is forwarded with isMention=true.
     setBandEnv();
     await import('./band.js');
     const { initChannelAdapters } = await import('./channel-registry.js');
     const result: InboundRouteResult = {
-      status: 'dropped',
+      status: 'persisted',
       platformMessageId: 'msg-unmentioned',
-      reason: 'no_agent_engaged',
-      audited: true,
-      retryable: false,
-      intentional: false,
+      sessionIds: [],
+      sessionMessageIds: [],
     };
     const onInbound = vi.fn(async (_platformId: string, _threadId: string | null, _message: InboundMessage) => result);
 
@@ -447,10 +452,10 @@ describe('band channel adapter', () => {
     });
 
     await waitFor(() => onInbound.mock.calls.length === 1);
-    expect(onInbound.mock.calls[0][2]).toEqual(expect.objectContaining({ isMention: false }));
-    // A non-retryable drop (no_agent_engaged) is terminal — the message is
-    // consumed on the platform so the inbox cursor advances past it instead
-    // of head-of-line-blocking every later message in the room.
+    expect(onInbound.mock.calls[0][2]).toEqual(expect.objectContaining({ isMention: true }));
+    // A routed (persisted) message is terminal too — the message is consumed on
+    // the platform so the inbox cursor advances past it instead of
+    // head-of-line-blocking every later message in the room.
     await waitFor(() => fakeLinks[0].markProcessed.mock.calls.length === 1);
     expect(fakeLinks[0].markProcessing).toHaveBeenCalledWith('room-1', 'msg-unmentioned');
     expect(fakeLinks[0].markProcessed).toHaveBeenCalledWith('room-1', 'msg-unmentioned');
@@ -859,6 +864,130 @@ describe('band channel adapter', () => {
     });
 
     expect(config.env).toHaveProperty('BAND_IS_MAIN_CONTROL_ROOM', 'true');
+  });
+
+  it('auto-wires a new room in a multi-agent install to the hub agent, with no approval card', async () => {
+    // Band gates room ACL on the platform, so a new room in a multi-agent
+    // install must NOT escalate the "how should I treat this channel?" card —
+    // it auto-wires to the agent group already serving the Band hub, with the
+    // Band-correct scope (sender_scope='all', engage_mode='mention', public).
+    setBandEnv();
+    fakeChats = [{ id: 'room-new', title: 'New Room', type: 'group' }];
+
+    const { createAgentGroup, createMessagingGroup, createMessagingGroupAgent, setModuleState } = await import(
+      '../db/index.js'
+    );
+    // ag-other is created first, so getAllAgentGroups()[0] is NOT the hub agent —
+    // proving the room follows the hub's wiring, not the first-agent fallback.
+    createAgentGroup({ id: 'ag-other', name: 'Other', folder: 'other', agent_provider: null, created_at: '2020-01-01T00:00:00.000Z' });
+    createAgentGroup({ id: 'ag-hub', name: 'Hub Agent', folder: 'hub-agent', agent_provider: null, created_at: '2020-01-02T00:00:00.000Z' });
+    // Seed a wired hub + main-room state so resolveHubAgentGroupId resolves ag-hub.
+    createMessagingGroup({
+      id: 'mg-hub',
+      channel_type: 'band',
+      platform_id: 'band:hub-1',
+      name: 'Nano Hub',
+      is_group: 0,
+      unknown_sender_policy: 'public',
+      denied_at: null,
+      created_at: new Date().toISOString(),
+    });
+    createMessagingGroupAgent({
+      id: 'mga-hub',
+      messaging_group_id: 'mg-hub',
+      agent_group_id: 'ag-hub',
+      engage_mode: 'mention',
+      engage_pattern: null,
+      sender_scope: 'all',
+      ignored_message_policy: 'drop',
+      session_mode: 'shared',
+      priority: 0,
+      created_at: new Date().toISOString(),
+    });
+    setModuleState('band', 'main-room', {
+      roomId: 'hub-1',
+      platformId: 'band:hub-1',
+      updatedAt: new Date().toISOString(),
+    });
+
+    await import('./band.js');
+    const { initChannelAdapters } = await import('./channel-registry.js');
+    const result: InboundRouteResult = {
+      status: 'persisted',
+      platformMessageId: 'unused',
+      sessionIds: [],
+      sessionMessageIds: [],
+    };
+    await initChannelAdapters(() => ({
+      onInbound: async () => result,
+      onInboundEvent: async () => result,
+      onMetadata: () => {},
+      onAction: () => {},
+    }));
+
+    const { getMessagingGroupByPlatform, getMessagingGroupAgents } = await import('../db/index.js');
+    const mg = getMessagingGroupByPlatform('band', 'band:room-new');
+    expect(mg).toMatchObject({ unknown_sender_policy: 'public' });
+    const agents = getMessagingGroupAgents(mg!.id);
+    expect(agents).toHaveLength(1);
+    expect(agents[0]).toMatchObject({
+      agent_group_id: 'ag-hub',
+      engage_mode: 'mention',
+      sender_scope: 'all',
+    });
+  });
+
+  it('normalizes a pre-registered strict Band room to public on discovery (Scenario D)', async () => {
+    // `setup --step register` hardcodes unknown_sender_policy='strict' for every
+    // channel and also wires the room. autoWireDiscoveredRoom's public-flip
+    // early-returns on an already-wired room, so discovery's existing-row branch
+    // must assert the Band invariant (public) or a new user's first message drops
+    // silently under the access gate.
+    setBandEnv();
+    fakeChats = [{ id: 'room-1', title: 'Room 1', type: 'group' }];
+
+    const { createAgentGroup, createMessagingGroup, createMessagingGroupAgent } = await import('../db/index.js');
+    createAgentGroup({ id: 'ag-1', name: 'Agent 1', folder: 'agent-1', agent_provider: null, created_at: new Date().toISOString() });
+    createMessagingGroup({
+      id: 'mg-pre',
+      channel_type: 'band',
+      platform_id: 'band:room-1',
+      name: 'Room 1',
+      is_group: 1,
+      unknown_sender_policy: 'strict', // as setup/register.ts would create it
+      denied_at: null,
+      created_at: new Date().toISOString(),
+    });
+    createMessagingGroupAgent({
+      id: 'mga-pre',
+      messaging_group_id: 'mg-pre',
+      agent_group_id: 'ag-1',
+      engage_mode: 'mention',
+      engage_pattern: null,
+      sender_scope: 'all',
+      ignored_message_policy: 'drop',
+      session_mode: 'shared',
+      priority: 0,
+      created_at: new Date().toISOString(),
+    });
+
+    await import('./band.js');
+    const { initChannelAdapters } = await import('./channel-registry.js');
+    const result: InboundRouteResult = {
+      status: 'persisted',
+      platformMessageId: 'unused',
+      sessionIds: [],
+      sessionMessageIds: [],
+    };
+    await initChannelAdapters(() => ({
+      onInbound: async () => result,
+      onInboundEvent: async () => result,
+      onMetadata: () => {},
+      onAction: () => {},
+    }));
+
+    const { getMessagingGroupByPlatform } = await import('../db/index.js');
+    expect(getMessagingGroupByPlatform('band', 'band:room-1')).toMatchObject({ unknown_sender_policy: 'public' });
   });
 
   it('does not mark a direct room as main without owner-agent participant proof', async () => {

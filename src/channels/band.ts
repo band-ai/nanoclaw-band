@@ -15,6 +15,8 @@ import {
   updateMessagingGroup,
   createMessagingGroupAgent,
   getMessagingGroupAgentByPair,
+  getMessagingGroupAgents,
+  getMessagingGroupsByChannel,
 } from '../db/messaging-groups.js';
 import { closeActiveSessionsForMessagingGroup, getSession } from '../db/sessions.js';
 import { writeSessionMessage } from '../session-manager.js';
@@ -124,20 +126,6 @@ function containerReachableRestUrl(baseUrl: string): string {
 function shouldInjectDirectApiKey(baseUrl: string): boolean {
   const url = new URL(baseUrl);
   return url.protocol === 'http:' && (url.hostname === 'localhost' || url.hostname === '127.0.0.1');
-}
-
-function mentionReferencesAgent(mention: unknown, agentId: string): boolean {
-  if (typeof mention === 'string') return mention === agentId;
-  if (!mention || typeof mention !== 'object') return false;
-  const value = mention as Record<string, unknown>;
-  return [value.id, value.uuid, value.agent_id, value.agentId, value.participant_id, value.participantId].some(
-    (candidate) => candidate === agentId,
-  );
-}
-
-function metadataMentionsAgent(metadata: Record<string, unknown> | null | undefined, agentId: string): boolean {
-  const mentions = metadata?.mentions;
-  return Array.isArray(mentions) && mentions.some((mention) => mentionReferencesAgent(mention, agentId));
 }
 
 function now(): string {
@@ -268,14 +256,48 @@ function ensureHubMessagingGroup(roomId: string, agentGroupId: string | null): v
 }
 
 /**
- * Resolve the agent group that newly-discovered Band rooms should auto-wire
- * to. Only unambiguous when exactly one agent group exists — with zero or
- * many, return null and let the router's channel-approval card disambiguate.
- * Mirrors wireOwnerHub's resolution rule.
+ * The agent group already serving the Band owner hub — the natural "this
+ * install's Band agent". Resolved from the recorded main room → its messaging
+ * group → its (highest-priority) wiring.
+ *
+ * Falls back to the messaging group named like the hub (MAIN_ROOM_NAME) when
+ * main-room state was never set — which happens whenever no owner is configured
+ * (BAND_OWNER_ID unset and /agent/me yields none), so the owner-agent direct
+ * room is never flagged main. Without this fallback, resolveAutoWireAgentGroupId
+ * would drop to "first agent group", which is creation-ordered and often NOT the
+ * Band agent. Null only if no hub exists or it isn't wired.
+ */
+function resolveHubAgentGroupId(): string | null {
+  const main = getMainRoomState();
+  const mg =
+    (main ? getMessagingGroupByPlatform(BAND_CHANNEL_TYPE, main.platformId) : undefined) ??
+    getMessagingGroupsByChannel(BAND_CHANNEL_TYPE).find((g) => g.name === MAIN_ROOM_NAME);
+  if (!mg) return null;
+  const agents = getMessagingGroupAgents(mg.id);
+  return agents.length > 0 ? agents[0].agent_group_id : null;
+}
+
+/**
+ * Resolve the agent group that newly-discovered Band rooms should auto-wire to.
+ *
+ * Band gates room ACL + mention on the platform, so a new room never needs the
+ * owner's "how should I treat this channel?" approval card — we always pick a
+ * target when any agent group exists:
+ *   1. the agent group already serving the Band owner hub (the install's Band
+ *      agent), else
+ *   2. the sole agent group, else
+ *   3. the first agent group, as a deterministic fallback for a multi-agent
+ *      install with no resolvable hub anchor (the operator re-wires with
+ *      ncl / manage-channels if the room belongs elsewhere).
+ *
+ * Returning a target here means routeInbound sees agentCount>=1 and never
+ * escalates the channel-registration card — no prompt ever lands on the hub.
+ * Only a zero-agent-group install returns null (nothing exists to wire to).
  */
 function resolveAutoWireAgentGroupId(): string | null {
   const agentGroups = getAllAgentGroups();
-  return agentGroups.length === 1 ? agentGroups[0].id : null;
+  if (agentGroups.length === 0) return null;
+  return resolveHubAgentGroupId() ?? agentGroups[0].id;
 }
 
 /**
@@ -289,8 +311,9 @@ function resolveAutoWireAgentGroupId(): string | null {
  * delivers agent-mentioning messages to us, so every delivered message is
  * effectively a mention).
  *
- * No-op for denied rooms (an explicit owner denial still wins) and for
- * ambiguous multi-agent installs (the router's approval card handles those).
+ * No-op only for denied rooms (an explicit owner denial still wins) and when
+ * no agent group exists yet. Multi-agent installs no longer fall through to the
+ * router's approval card — resolveAutoWireAgentGroupId picks the hub's agent.
  */
 function autoWireDiscoveredRoom(roomId: string): void {
   const agentGroupId = resolveAutoWireAgentGroupId();
@@ -338,12 +361,28 @@ function upsertDiscoveredMessagingGroup(
       platform_id: platformId,
       name,
       is_group: isGroup,
-      unknown_sender_policy: 'request_approval',
+      // Band gates room membership on the platform — being in a room with the
+      // agent IS the authorization — so the host's per-sender access gate is
+      // redundant. Mark Band rooms 'public' at creation, not just after the
+      // single-agent auto-wire below: in a multi-agent install auto-wire is
+      // skipped and the operator wires the room by hand, and a leftover
+      // 'request_approval' would make the access gate drop / approval-gate every
+      // room member the platform already authorized. (Channel-registration
+      // approval for unwired rooms is a separate path — see router agentCount===0
+      // — and is unaffected by this.)
+      unknown_sender_policy: 'public',
       denied_at: null,
       created_at: now(),
     });
   } else {
-    updateMessagingGroup(existing.id, { name, is_group: isGroup });
+    // Normalize the policy here too, not only at creation. A Band row can be
+    // created by a path that doesn't know Band's trust model — notably
+    // `setup --step register`, which hardcodes 'strict' for every channel. That
+    // row also gets wired, so autoWireDiscoveredRoom's public-flip early-returns
+    // (already wired) and never reaches it. The existing-row branch is the only
+    // place discovery touches a pre-existing room, so it must assert the
+    // invariant: every Band room is 'public' (platform ACL = authorization).
+    updateMessagingGroup(existing.id, { name, is_group: isGroup, unknown_sender_policy: 'public' });
   }
 
   if (isMain) setMainRoom(roomId);
@@ -967,7 +1006,16 @@ class BandChannelAdapter implements ChannelAdapter {
           kind: 'chat',
           content,
           timestamp: payload.inserted_at,
-          isMention: metadataMentionsAgent(payload.metadata, this.config.agentId),
+          // Band screens room ACL and mention-gating on the platform and only
+          // pushes agent-addressed messages into the agent's inbox — both the
+          // websocket push and the drain read that already-filtered queue. So
+          // anything reaching here (after the own-echo / non-text filter above)
+          // is by definition a mention. Re-deriving it from `metadata.mentions`
+          // is a fragile double-check: if Band's mention shape ever differs from
+          // what we probe, a real mention silently routes as isMention=false and
+          // the `engage_mode:'mention'` wiring drops it (no_agent_engaged),
+          // killing the room. Trust the platform.
+          isMention: true,
         });
 
     // Forward progress is mandatory: the inbox drain is a FIFO cursor that
@@ -1015,7 +1063,9 @@ class BandChannelAdapter implements ChannelAdapter {
         kind: 'chat',
         content,
         timestamp: payload.inserted_at,
-        isMention: metadataMentionsAgent(payload.metadata, this.config.agentId),
+        // Platform-gated inbox — every delivered message is a mention. See the
+        // note in handleMessageCreated; don't re-derive from metadata.
+        isMention: true,
       });
       return fallback ?? { status: 'persisted', platformMessageId: payload.id, sessionIds: [], sessionMessageIds: [] };
     }
