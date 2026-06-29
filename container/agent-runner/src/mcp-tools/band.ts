@@ -1,7 +1,11 @@
-import { ThenvoiLink } from '@band-ai/sdk';
-import { AgentTools } from '@band-ai/sdk/runtime';
 import type { CallToolResult, Tool } from '@modelcontextprotocol/sdk/types.js';
-import type { AgentToolsProtocol } from '@band-ai/sdk';
+// Type-only imports are erased at runtime, so they never touch the SDK. The
+// runtime SDK values (ThenvoiLink / AgentTools) are loaded lazily at the bottom
+// of this file — see registerBandToolsLazily — so a missing/broken
+// @band-ai/sdk degrades to "Band tools absent" instead of throwing at module
+// load and taking down the whole MCP server (the barrel imports this module
+// unconditionally).
+import type { AgentToolsProtocol, ThenvoiLink } from '@band-ai/sdk';
 
 import { registerTools } from './server.js';
 import type { McpToolDefinition } from './types.js';
@@ -118,10 +122,19 @@ function restUrl(): string | undefined {
   return bandEnv('REST_URL');
 }
 
+// Runtime SDK constructors, populated by registerBandToolsLazily() once the
+// dynamic import succeeds. Tool handlers (and baseTools(), which they call)
+// only run after registration has completed, so these are set by then.
+type SdkModule = typeof import('@band-ai/sdk');
+type RuntimeModule = typeof import('@band-ai/sdk/runtime');
+let ThenvoiLinkCtor: SdkModule['ThenvoiLink'] | undefined;
+let AgentToolsCtor: RuntimeModule['AgentTools'] | undefined;
+
 let cachedLink: ThenvoiLink | null = null;
 function bandLink(): ThenvoiLink {
   if (!cachedLink) {
-    cachedLink = new ThenvoiLink({ agentId: bandEnv('AGENT_ID')!, apiKey: apiKey(), restUrl: restUrl() });
+    if (!ThenvoiLinkCtor) throw new Error('@band-ai/sdk not loaded');
+    cachedLink = new ThenvoiLinkCtor({ agentId: bandEnv('AGENT_ID')!, apiKey: apiKey(), restUrl: restUrl() });
   }
   return cachedLink;
 }
@@ -130,7 +143,8 @@ function sdkToolsForRoom(targetRoomId: string): AgentToolsProtocol {
   const cached = toolsByRoom.get(targetRoomId);
   if (cached) return cached;
 
-  const tools = new AgentTools({
+  if (!AgentToolsCtor) throw new Error('@band-ai/sdk not loaded');
+  const tools = new AgentToolsCtor({
     roomId: targetRoomId,
     rest: bandLink().rest,
     capabilities: {
@@ -327,6 +341,35 @@ function buildBandToolDefinitions(): McpToolDefinition[] {
   });
 }
 
-if (bandAgentToolsEnabled()) {
-  registerTools(buildBandToolDefinitions());
+/**
+ * Lazily load the Band SDK and register the `band_*` tools. Isolated behind a
+ * try/catch so a missing or broken `@band-ai/sdk` (e.g. a container image built
+ * before the dep was installed by /add-band) logs one clear line and disables
+ * Band tools — instead of throwing during the barrel's unconditional import of
+ * this module, which would prevent startMcpServer() from ever running and leave
+ * EVERY tool (core, CLI, other channels) dead. Returns true when Band tools
+ * were registered. `bandAgentToolsEnabled()` reads env only, so it is safe to
+ * call before the dynamic import.
+ */
+export async function registerBandToolsLazily(): Promise<boolean> {
+  if (!bandAgentToolsEnabled()) return false;
+  try {
+    const sdk = await import('@band-ai/sdk');
+    const runtime = await import('@band-ai/sdk/runtime');
+    ThenvoiLinkCtor = sdk.ThenvoiLink;
+    AgentToolsCtor = runtime.AgentTools;
+    registerTools(buildBandToolDefinitions());
+    return true;
+  } catch (err) {
+    console.error(
+      '[band] @band-ai/sdk unavailable — Band tools disabled. ' +
+        'Rebuild the agent image (./container/build.sh). ' +
+        (err instanceof Error ? err.message : String(err)),
+    );
+    return false;
+  }
 }
+
+// Bun supports top-level await, so the barrel's `import './band.js'` waits for
+// registration to settle before startMcpServer() runs.
+await registerBandToolsLazily();

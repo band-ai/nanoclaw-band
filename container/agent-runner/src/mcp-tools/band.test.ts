@@ -100,4 +100,18 @@ describe('Band.ai MCP tools', () => {
     expect(result.content[0].type).toBe('text');
     expect(result.content[0].text).toContain('needs a chat_room_id');
   });
+
+  // Regression guard: the SDK must be loaded via a lazy dynamic import inside a
+  // try/catch, never as a top-level value import. The barrel imports band.js
+  // unconditionally, so a top-level `import { ThenvoiLink } from '@band-ai/sdk'`
+  // that throws (missing/broken SDK) would propagate up and stop
+  // startMcpServer() from ever running — killing EVERY MCP tool, not just Band.
+  // (The lazy path's graceful degradation is proven by running this suite with
+  // the SDK import mocked to throw, in isolation.)
+  it('loads the SDK lazily — no top-level value import of @band-ai/sdk', async () => {
+    const src = await Bun.file(new URL('./band.ts', import.meta.url)).text();
+    const topLevelValueImport = /^import\s+(?!type\b)[^;]*from\s+['"]@band-ai\/sdk(?:\/runtime)?['"]/m;
+    expect(topLevelValueImport.test(src)).toBe(false);
+    expect(src).toContain("await import('@band-ai/sdk')");
+  });
 });
