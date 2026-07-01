@@ -40,6 +40,30 @@ pnpm exec tsx scripts/upgrade-state.ts set
 
 That's the same thing `/setup`, `/update-nanoclaw`, and `/migrate-nanoclaw` do at the end. Do it only when the upgrade actually completed — the marker is your assertion that this install reached the current version through a path you trust.
 
+## Restarting a checkout after a rebuild (skills)
+
+Any `/add-*` or `/customize`-style skill that runs `pnpm run build` can hit this
+tripwire on an old install: the rebuild is the first time the check ever
+actually runs, and a marker stamped before the tripwire existed (or never
+stamped at all) won't match. This is the expected "first time" case above, not
+a sign the skill's own changes are bad.
+
+Rather than restart the service directly, skills should call
+`scripts/safe-restart.sh`. It restarts this checkout's launchd/systemd service,
+watches `logs/nanoclaw.error.log` for the tripwire signature, and — only in
+reaction to an observed trip on the restart it just issued — stamps the marker
+and retries once. If the trip recurs after that, it stops instead of retrying
+again, since that means it isn't the benign stale-marker case:
+
+```bash
+scripts/safe-restart.sh
+```
+
+`pnpm exec tsx scripts/upgrade-state.ts check` (exit 0 + `current <version>`, or
+exit 1 + `drift code=<x> marker=<y>`) is the read-only version of the same
+comparison — useful as an up-front precondition check before a skill starts
+making changes, so a later trip isn't a surprise.
+
 ## The override
 
 `pnpm exec tsx scripts/upgrade-state.ts set` is the override: it declares "this install is good at the current version." Use it when you know the install is actually in a good state (e.g. you completed the steps manually). It's safe to re-run.
