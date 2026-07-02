@@ -51,6 +51,16 @@ permission three steps in.
    owner's Band identity (owner / admin / member — Step 6); and sending the final
    test message. Phase 0 below tells you which of these actually apply.
 
+4. **A stale-marker tripwire trip on restart is expected on old installs — it's
+   not this skill breaking something.** Phase 1 Step 5's `pnpm run build`
+   recompiles `dist/`; if this checkout's `dist/` predates NanoClaw's upgrade
+   tripwire (`src/upgrade-state.ts`), the rebuild is the first time that check
+   ever actually runs, and a marker recorded before the tripwire existed won't
+   match. Phase 0 checks for this up front so it's not a surprise; Step 3's
+   restart uses `scripts/safe-restart.sh`, which detects the trip and heals it
+   automatically (see docs/upgrade-recovery.md). If it still fails after that
+   one auto-heal, stop and investigate — that's a real problem, not this case.
+
 ## Phase 0 — Anchor to the repo root and detect state (no questions)
 
 **Anchor first.** Every step assumes the **repo root** as the working directory.
@@ -89,6 +99,14 @@ grep -qE '^(BAND|THENVOI)_(AGENT_)?API_KEY=' .env 2>/dev/null \
 echo "=== this checkout's service + image ==="
 echo "service label: $(launchd_label)   |   image: $(container_image_base):latest"
 echo "webhook port:  $(grep -E '^WEBHOOK_PORT=' .env 2>/dev/null | cut -d= -f2 || echo '3000 (default)')"
+
+echo "=== upgrade tripwire ==="
+if pnpm exec tsx scripts/upgrade-state.ts check; then
+  echo "marker: current — Step 3's restart will not trip"
+else
+  echo "marker: drifted — expected on an old install meeting the tripwire for the"
+  echo "  first time (see 'Before you start' point 4); Step 3's safe-restart.sh heals it"
+fi
 ```
 
 If the seam check says STOP, you are not on a seam-equipped base — pull the fork
@@ -372,22 +390,17 @@ a bare `com.nanoclaw`, and never `pnpm run dev` while a service holds the webhoo
 port (instant `EADDRINUSE`):
 
 ```bash
-if [ "$(uname -s)" = "Darwin" ]; then
-  SVC="$(launchd_label)"
-  if launchctl list "$SVC" >/dev/null 2>&1; then
-    echo "restarting $SVC"; launchctl kickstart -k "gui/$(id -u)/$SVC"
-  elif [ -f "$HOME/Library/LaunchAgents/$SVC.plist" ]; then
-    echo "loading $SVC (installed but not loaded)"; launchctl load "$HOME/Library/LaunchAgents/$SVC.plist"
-  else
-    echo "no service for this checkout — run /setup, or dev: set a free WEBHOOK_PORT in .env then 'pnpm run dev'"
-  fi
-elif command -v systemctl >/dev/null 2>&1; then
-  UNIT="$(systemd_unit).service"
-  if systemctl --user is-active --quiet "$UNIT"; then systemctl --user restart "$UNIT"
-  elif systemctl --user is-enabled --quiet "$UNIT" 2>/dev/null; then systemctl --user start "$UNIT"
-  else echo "no service for this checkout — run /setup, or dev: set a free WEBHOOK_PORT in .env then 'pnpm run dev'"; fi
-fi
+"$ROOT/scripts/safe-restart.sh"
 ```
+
+This restarts the checkout's launchd/systemd service and, if the restart trips
+the upgrade tripwire (expected on an old install — see **Before you start**
+point 4 and Phase 0's `upgrade tripwire` check above), stamps the marker and
+retries once automatically. If it still fails, it stops and tells you to
+investigate `logs/nanoclaw.error.log` by hand — don't clear the marker yourself
+at that point. If there's no service for this checkout, it says so and falls back
+to the same guidance as before: run `/setup`, or for dev, set a free
+`WEBHOOK_PORT` in `.env` and run `pnpm run dev`.
 
 If you fall back to `pnpm run dev` and it fails with `EADDRINUSE`, the default port
 3000 is taken (a known collision with band-prototype) — set `WEBHOOK_PORT=3100`
