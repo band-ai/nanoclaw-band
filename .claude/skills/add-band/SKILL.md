@@ -390,7 +390,10 @@ a bare `com.nanoclaw`, and never `pnpm run dev` while a service holds the webhoo
 port (instant `EADDRINUSE`):
 
 ```bash
-"$ROOT/scripts/safe-restart.sh"
+# Resolved fresh, not via $ROOT — shell state (including $ROOT) doesn't
+# survive between separate tool calls, only cwd does, so this must not
+# depend on Phase 0 having run in the same shell.
+"$(git rev-parse --show-toplevel)/scripts/safe-restart.sh"
 ```
 
 This restarts the checkout's launchd/systemd service and, if the restart trips
