@@ -53,10 +53,15 @@ Rather than restart the service directly, skills should call
 watches `logs/nanoclaw.error.log` for the tripwire signature, and — only in
 reaction to an observed trip on the restart it just issued — stamps the marker
 and retries once. If the trip recurs after that, it stops instead of retrying
-again, since that means it isn't the benign stale-marker case:
+again, since that means it isn't the benign stale-marker case.
+
+Resolve the path with `git rev-parse --show-toplevel` rather than assuming a
+`$ROOT`-style variable or a specific cwd — a skill's own setup (e.g. an
+"anchor to the repo root" step) doesn't survive into a later, separate tool
+call, since only cwd persists between them, not shell state:
 
 ```bash
-scripts/safe-restart.sh
+"$(git rev-parse --show-toplevel)/scripts/safe-restart.sh"
 ```
 
 `pnpm exec tsx scripts/upgrade-state.ts check` (exit 0 + `current <version>`, or
