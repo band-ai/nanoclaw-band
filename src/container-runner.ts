@@ -3,7 +3,7 @@
  * Spawns agent containers with session folder + agent group folder mounts.
  * The container runs the v2 agent-runner which polls the session DB.
  */
-import { ChildProcess, execSync, spawn } from 'child_process';
+import { ChildProcess, execFileSync, execSync, spawn } from 'child_process';
 import fs from 'fs';
 import path from 'path';
 
@@ -399,6 +399,18 @@ export function buildMounts(
 
   // Agent group folder at /workspace/agent (RW for working files + CLAUDE.local.md)
   mounts.push({ hostPath: groupDir, containerPath: '/workspace/agent', readonly: false });
+
+  // The compose deployment runs this host as root (for docker-socket access),
+  // so the session/group files it creates are root-owned, while the agent
+  // image runs as `node` (uid 1000). On a native-Linux host the agent then
+  // cannot write its session DBs — SQLite fails with SQLITE_READONLY and the
+  // container dies at startup. (macOS Docker Desktop masks bind-mount
+  // ownership, which hides the mismatch.) Align ownership with the agent user
+  // before every spawn; non-root hosts are handled by the --user mapping
+  // below instead.
+  if (process.getuid?.() === 0) {
+    execFileSync('chown', ['-R', '1000:1000', sessDir, groupDir]);
+  }
 
   // container.json — nested RO mount on top of RW group dir so the agent
   // can read its config but cannot modify it.
