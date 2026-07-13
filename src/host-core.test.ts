@@ -31,6 +31,7 @@ import {
 } from './session-manager.js';
 import { getSession, findSession } from './db/sessions.js';
 import { registerChannelAdapter, initChannelAdapters, teardownChannelAdapters } from './channels/channel-registry.js';
+import { registerForkMigrations } from './db/migrations/fork.js';
 import type { ChannelAdapter, InboundEvent } from './channels/adapter.js';
 
 // Mock container runner to prevent actual Docker spawning
@@ -92,6 +93,11 @@ async function registerAckAdapters(channelTypes: string[], supportsDeliveryAck =
 }
 
 const TEST_DIR = '/tmp/nanoclaw-test-host';
+
+// inbound_delivery_ledger is a fork migration registered outside the core array
+// (see db/migrations/fork.ts). The router writes it in ACK mode, so register it
+// once before migrations run — mirroring src/index.ts startup.
+registerForkMigrations();
 
 beforeEach(() => {
   // Clean test directory
