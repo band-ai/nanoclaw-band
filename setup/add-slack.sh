@@ -2,7 +2,7 @@
 #
 # Install the Slack adapter, persist SLACK_BOT_TOKEN plus the mode-specific
 # secret (SLACK_APP_TOKEN for Socket Mode, SLACK_SIGNING_SECRET for webhook) to
-# .env + data/env/env, and restart the service. Non-interactive — the
+# .env, and restart the service. Non-interactive — the
 # operator-facing app creation walkthrough + credential paste live in
 # setup/channels/slack.ts. Credentials come in via env vars:
 # SLACK_BOT_TOKEN, and SLACK_APP_TOKEN and/or SLACK_SIGNING_SECRET.
@@ -51,6 +51,7 @@ fi
 
 need_install() {
   [ ! -f src/channels/slack.ts ] && return 0
+  [ ! -f container/skills/slack-formatting/SKILL.md ] && return 0
   ! grep -q "^import './slack.js';" src/channels/index.ts 2>/dev/null && return 0
   return 1
 }
@@ -66,6 +67,10 @@ if need_install; then
 
   log "Copying adapter from ${CHANNELS_BRANCH}…"
   git show "${CHANNELS_BRANCH}:src/channels/slack.ts" > src/channels/slack.ts
+
+  # Slack formatting container skill — reaches agents via ~/.claude/skills.
+  mkdir -p container/skills/slack-formatting
+  git show "${CHANNELS_BRANCH}:container/skills/slack-formatting/SKILL.md" > container/skills/slack-formatting/SKILL.md
 
   # Append self-registration import if missing.
   if ! grep -q "^import './slack.js';" src/channels/index.ts; then
@@ -107,10 +112,6 @@ fi
 if [ -n "${SLACK_SIGNING_SECRET:-}" ]; then
   upsert_env SLACK_SIGNING_SECRET "$SLACK_SIGNING_SECRET"
 fi
-
-# Container reads from data/env/env (the host mounts it).
-mkdir -p data/env
-cp .env data/env/env
 
 log "Restarting service so the new adapter picks up the credentials…"
 # shellcheck source=setup/lib/install-slug.sh
