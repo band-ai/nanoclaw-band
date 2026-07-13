@@ -1,12 +1,16 @@
 name: Sync main with upstream NanoClaw
 
-# Keep this fork's main current with upstream nanocoai/nanoclaw. On a daily
-# schedule (or manual dispatch), merge upstream main into main and push.
+# Keep this fork's main current with upstream nanocoai/nanoclaw. Every 4 hours
+# (or manual dispatch), merge upstream main into main and push.
 #
 # Unlike band/adapter — a purely additive overlay that never conflicts and so is
 # pushed directly by sync-band-adapter.yml — main carries the fork's own changes
-# to core (the Band seams), so an upstream merge CAN conflict. On ANY conflict the
-# job aborts and fails loudly, leaving main untouched for a human to merge by hand.
+# to core (the Band seams), so an upstream merge CAN conflict. Two-tier policy:
+#   - trivially-safe paths auto-resolve via .gitattributes (union / take-upstream)
+#   - a real conflict in a core seam is NEVER auto-resolved: the job opens (or
+#     refreshes) a PR of upstream -> main, requests review from the integrations
+#     team, assigns the owner, leaves main untouched, and FAILS RED so the
+#     conflict is noticed. Resolve by hand, then push main.
 #
 # ci.yml runs only on PRs, so a direct push to main gets no CI. To avoid landing a
 # clean-but-broken merge, this job build+tests the merged result (the same checks
@@ -45,6 +49,9 @@ jobs:
       UPSTREAM_REPO: nanocoai/nanoclaw
       UPSTREAM_REF: ${{ github.event.inputs.upstream_ref || 'main' }}
       DRY_RUN: ${{ github.event.inputs.dry_run || 'false' }}
+      # Where a conflict PR routes for manual resolution.
+      REVIEW_TEAM: band-ai/integrations
+      CONFLICT_ASSIGNEE: nir-singher-band
     steps:
       - name: Check out fork main
         uses: actions/checkout@v4
@@ -119,12 +126,21 @@ jobs:
           existing=$(gh pr list --head "$SYNC_BRANCH" --base main --state open --json number -q '.[0].number' || true)
           if [ -z "$existing" ]; then
             gh pr create --head "$SYNC_BRANCH" --base main \
-              --title "⚠️ Upstream sync needs manual resolution" --body "$body" || true
+              --title "⚠️ Upstream sync needs manual resolution" --body "$body" \
+              --reviewer "$REVIEW_TEAM" --assignee "$CONFLICT_ASSIGNEE" || true
           else
+            # Keep the routing sticky on the already-open PR, then ping it.
+            gh pr edit "$existing" --add-reviewer "$REVIEW_TEAM" --add-assignee "$CONFLICT_ASSIGNEE" || true
             gh pr comment "$existing" --body "$body" || true
           fi
-          echo "::warning::Upstream merge conflicts — opened/updated PR ${SYNC_BRANCH} → main for manual resolution; main untouched."
           echo "synced=0" >> "$GITHUB_OUTPUT"
+
+          # Fail the run on purpose: a red job is the notification that a conflict
+          # happened. The PR (assigned to ${CONFLICT_ASSIGNEE}, review requested
+          # from ${REVIEW_TEAM}) is the actionable artifact; main is untouched
+          # either way.
+          echo "::error::Upstream merge conflicts — opened/updated PR ${SYNC_BRANCH} → main (assignee ${CONFLICT_ASSIGNEE}, review ${REVIEW_TEAM}); main left untouched."
+          exit 1
 
       - name: Set up pnpm
         if: steps.merge.outputs.synced == '1'
