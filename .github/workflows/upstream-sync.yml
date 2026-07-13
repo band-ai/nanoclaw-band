@@ -26,7 +26,7 @@ on:
         type: boolean
         default: false
   schedule:
-    - cron: '17 6 * * *'
+    - cron: '17 */4 * * *'
 
 # Never let two syncs race on pushing main.
 concurrency:
@@ -35,6 +35,7 @@ concurrency:
 
 permissions:
   contents: write
+  pull-requests: write
 
 jobs:
   sync-main:
@@ -58,9 +59,11 @@ jobs:
           git config user.name  "upstream-sync[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-      - name: Merge upstream into main (abort on any conflict)
+      - name: Merge upstream into main (auto-adopt safe paths; PR on real conflict)
         id: merge
         shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           git remote add upstream "https://github.com/${UPSTREAM_REPO}.git" 2>/dev/null \
@@ -77,14 +80,51 @@ jobs:
           fi
           echo "main is ${behind} commit(s) behind ${BASE} — merging it in."
 
-          # Merge upstream in. Abort on ANY conflict — never auto-resolve core.
-          if ! git merge --no-edit "$BASE"; then
-            git merge --abort || true
-            echo "::error::Merging ${BASE} into main hit a conflict. Resolve by hand; main left untouched."
-            exit 1
+          # Register the custom driver referenced by .gitattributes: `theirs`
+          # unconditionally takes the upstream side for generated artifacts the
+          # fork never hand-edits (%A=ours/output, %B=theirs). Append-only docs
+          # use the built-in `union`. Everything else conflicts as usual — the
+          # fork's core seams (Band adapter, router, migrations) are NEVER
+          # auto-resolved; those need human judgment.
+          git config merge.theirs.driver 'cp -f %B %A'
+
+          # Auto-adopt the safe paths; a real conflict is anything left over.
+          if git merge --no-edit "$BASE"; then
+            echo "synced=1" >> "$GITHUB_OUTPUT"
+            echo "base_sha=$(git rev-parse --short "$BASE")" >> "$GITHUB_OUTPUT"
+            exit 0
           fi
-          echo "synced=1" >> "$GITHUB_OUTPUT"
-          echo "base_sha=$(git rev-parse --short "$BASE")" >> "$GITHUB_OUTPUT"
+
+          # Real conflict in a fork seam. Leave main untouched, but surface an
+          # actionable PR instead of a silent failure. Idempotent across the
+          # schedule: one branch (auto/upstream-sync = upstream's tip), one open
+          # PR reused (commented) until a human resolves and pushes main.
+          conflicts=$(git diff --name-only --diff-filter=U | sed 's/^/- /')
+          git merge --abort || true
+          SYNC_BRANCH="auto/upstream-sync"
+          git push -f origin "${BASE}:refs/heads/${SYNC_BRANCH}"
+          short=$(git rev-parse --short "$BASE")
+          body=$(printf '%s\n' \
+            "Automatic upstream sync of \`${UPSTREAM_REPO}@${UPSTREAM_REF}\` (\`${short}\`) hit conflicts and left \`main\` untouched." \
+            "" \
+            "**Conflicting files:**" \
+            "${conflicts}" \
+            "" \
+            "Resolve locally, then this PR auto-closes when main catches up:" \
+            '```' \
+            "git fetch origin upstream && git checkout main && git pull" \
+            "git merge upstream/${UPSTREAM_REF}   # resolve, run the CI gate, commit" \
+            "git push origin main" \
+            '```')
+          existing=$(gh pr list --head "$SYNC_BRANCH" --base main --state open --json number -q '.[0].number' || true)
+          if [ -z "$existing" ]; then
+            gh pr create --head "$SYNC_BRANCH" --base main \
+              --title "⚠️ Upstream sync needs manual resolution" --body "$body" || true
+          else
+            gh pr comment "$existing" --body "$body" || true
+          fi
+          echo "::warning::Upstream merge conflicts — opened/updated PR ${SYNC_BRANCH} → main for manual resolution; main untouched."
+          echo "synced=0" >> "$GITHUB_OUTPUT"
 
       - name: Set up pnpm
         if: steps.merge.outputs.synced == '1'

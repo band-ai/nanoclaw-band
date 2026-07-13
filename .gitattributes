@@ -1,0 +1,14 @@
+# Upstream-sync merge policy. Consumed by .github/workflows/upstream-sync.yml
+# when it merges nanocoai/nanoclaw main into this fork's main.
+#
+# These rules ONLY make merges auto-resolve for paths where taking a blanket
+# side is always safe. Fork core seams (Band adapter, router, migrations,
+# container-runner, providers) are deliberately NOT listed — they must always
+# conflict and get human judgment.
+
+# Append-only docs: keep BOTH sides' added lines, never conflict on additions.
+CHANGELOG.md       merge=union
+
+# Generated artifacts the fork never hand-edits: always take upstream's version.
+# `theirs` is a custom driver the sync workflow registers before merging.
+repo-tokens/badge.svg   merge=theirs
