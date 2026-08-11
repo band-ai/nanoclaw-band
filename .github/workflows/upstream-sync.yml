@@ -1,12 +1,16 @@
 name: Sync main with upstream NanoClaw
 
-# Keep this fork's main current with upstream nanocoai/nanoclaw. On a daily
-# schedule (or manual dispatch), merge upstream main into main and push.
+# Keep this fork's main current with upstream nanocoai/nanoclaw. Every 4 hours
+# (or manual dispatch), merge upstream main into main and push.
 #
 # Unlike band/adapter — a purely additive overlay that never conflicts and so is
 # pushed directly by sync-band-adapter.yml — main carries the fork's own changes
-# to core (the Band seams), so an upstream merge CAN conflict. On ANY conflict the
-# job aborts and fails loudly, leaving main untouched for a human to merge by hand.
+# to core (the Band seams), so an upstream merge CAN conflict. Two-tier policy:
+#   - trivially-safe paths auto-resolve via .gitattributes (union / take-upstream)
+#   - a real conflict in a core seam is NEVER auto-resolved: the job opens (or
+#     refreshes) a PR of upstream -> main, requests review from the integrations
+#     team, assigns the owner, leaves main untouched, and FAILS RED so the
+#     conflict is noticed. Resolve by hand, then push main.
 #
 # ci.yml runs only on PRs, so a direct push to main gets no CI. To avoid landing a
 # clean-but-broken merge, this job build+tests the merged result (the same checks
@@ -26,7 +30,7 @@ on:
         type: boolean
         default: false
   schedule:
-    - cron: '17 6 * * *'
+    - cron: '17 */4 * * *'
 
 # Never let two syncs race on pushing main.
 concurrency:
@@ -35,6 +39,7 @@ concurrency:
 
 permissions:
   contents: write
+  pull-requests: write
 
 jobs:
   sync-main:
@@ -44,6 +49,9 @@ jobs:
       UPSTREAM_REPO: nanocoai/nanoclaw
       UPSTREAM_REF: ${{ github.event.inputs.upstream_ref || 'main' }}
       DRY_RUN: ${{ github.event.inputs.dry_run || 'false' }}
+      # Where a conflict PR routes for manual resolution.
+      REVIEW_TEAM: band-ai/integrations
+      CONFLICT_ASSIGNEE: nir-singher-band
     steps:
       - name: Check out fork main
         uses: actions/checkout@v4
@@ -58,9 +66,11 @@ jobs:
           git config user.name  "upstream-sync[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-      - name: Merge upstream into main (abort on any conflict)
+      - name: Merge upstream into main (auto-adopt safe paths; PR on real conflict)
         id: merge
         shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           git remote add upstream "https://github.com/${UPSTREAM_REPO}.git" 2>/dev/null \
@@ -72,39 +82,90 @@ jobs:
           behind=$(git rev-list --count "HEAD..${BASE}")
           if [ "$behind" -eq 0 ]; then
             echo "main already contains ${UPSTREAM_REPO}@${UPSTREAM_REF} — nothing to sync."
-            echo "synced=0" >> "$GITHUB_OUTPUT"
+            echo "status=uptodate" >> "$GITHUB_OUTPUT"
             exit 0
           fi
           echo "main is ${behind} commit(s) behind ${BASE} — merging it in."
 
-          # Merge upstream in. Abort on ANY conflict — never auto-resolve core.
-          if ! git merge --no-edit "$BASE"; then
-            git merge --abort || true
-            echo "::error::Merging ${BASE} into main hit a conflict. Resolve by hand; main left untouched."
-            exit 1
+          # Register the custom driver referenced by .gitattributes: `theirs`
+          # unconditionally takes the upstream side for generated artifacts the
+          # fork never hand-edits (%A=ours/output, %B=theirs). Append-only docs
+          # use the built-in `union`. Everything else conflicts as usual — the
+          # fork's core seams (Band adapter, router, migrations) are NEVER
+          # auto-resolved; those need human judgment.
+          git config merge.theirs.driver 'cp -f %B %A'
+
+          # Auto-adopt the safe paths; a real conflict is anything left over.
+          if git merge --no-edit "$BASE"; then
+            echo "status=merged" >> "$GITHUB_OUTPUT"
+            echo "base_sha=$(git rev-parse --short "$BASE")" >> "$GITHUB_OUTPUT"
+            exit 0
           fi
-          echo "synced=1" >> "$GITHUB_OUTPUT"
-          echo "base_sha=$(git rev-parse --short "$BASE")" >> "$GITHUB_OUTPUT"
+
+          # Real conflict in a fork seam. Leave main untouched, but surface an
+          # actionable PR instead of a silent failure. Idempotent across the
+          # schedule: one branch (auto/upstream-sync = upstream's tip), one open
+          # PR reused (commented) until a human resolves and pushes main.
+          conflicts=$(git diff --name-only --diff-filter=U | sed 's/^/- /')
+          git merge --abort || true
+          # Record the conflict state before any routing step can fail — the
+          # always-run Summary keys off this, and a red exit must never read as
+          # "up to date".
+          echo "status=conflict" >> "$GITHUB_OUTPUT"
+          SYNC_BRANCH="auto/upstream-sync"
+          git push -f origin "${BASE}:refs/heads/${SYNC_BRANCH}"
+          short=$(git rev-parse --short "$BASE")
+          body=$(printf '%s\n' \
+            "Automatic upstream sync of \`${UPSTREAM_REPO}@${UPSTREAM_REF}\` (\`${short}\`) hit conflicts and left \`main\` untouched." \
+            "" \
+            "**Conflicting files:**" \
+            "${conflicts}" \
+            "" \
+            "Resolve locally, then this PR auto-closes when main catches up:" \
+            '```' \
+            "git fetch origin upstream && git checkout main && git pull" \
+            "git merge upstream/${UPSTREAM_REF}   # resolve, run the CI gate, commit" \
+            "git push origin main" \
+            '```')
+          existing=$(gh pr list --head "$SYNC_BRANCH" --base main --state open --json number -q '.[0].number' || true)
+          if [ -z "$existing" ]; then
+            gh pr create --head "$SYNC_BRANCH" --base main \
+              --title "⚠️ Upstream sync needs manual resolution" --body "$body" \
+              --reviewer "$REVIEW_TEAM" --assignee "$CONFLICT_ASSIGNEE" || true
+            existing=$(gh pr list --head "$SYNC_BRANCH" --base main --state open --json number -q '.[0].number' || true)
+          else
+            # Keep the routing sticky on the already-open PR, then ping it.
+            gh pr edit "$existing" --add-reviewer "$REVIEW_TEAM" --add-assignee "$CONFLICT_ASSIGNEE" || true
+            gh pr comment "$existing" --body "$body" || true
+          fi
+          echo "conflict_pr=${existing}" >> "$GITHUB_OUTPUT"
+
+          # Fail the run on purpose: a red job is the notification that a conflict
+          # happened. The PR (assigned to ${CONFLICT_ASSIGNEE}, review requested
+          # from ${REVIEW_TEAM}) is the actionable artifact; main is untouched
+          # either way.
+          echo "::error::Upstream merge conflicts — opened/updated PR ${SYNC_BRANCH} → main (assignee ${CONFLICT_ASSIGNEE}, review ${REVIEW_TEAM}); main left untouched."
+          exit 1
 
       - name: Set up pnpm
-        if: steps.merge.outputs.synced == '1'
+        if: steps.merge.outputs.status == 'merged'
         uses: pnpm/action-setup@v4
 
       - name: Set up Node
-        if: steps.merge.outputs.synced == '1'
+        if: steps.merge.outputs.status == 'merged'
         uses: actions/setup-node@v4
         with:
           node-version: 20
           cache: pnpm
 
       - name: Set up Bun
-        if: steps.merge.outputs.synced == '1'
+        if: steps.merge.outputs.status == 'merged'
         uses: oven-sh/setup-bun@v2
         with:
           bun-version: 1.3.12
 
       - name: Validate merged main (same checks as ci.yml)
-        if: steps.merge.outputs.synced == '1'
+        if: steps.merge.outputs.status == 'merged'
         shell: bash
         run: |
           set -euo pipefail
@@ -117,7 +178,7 @@ jobs:
           ( cd container/agent-runner && bun test )
 
       - name: Push main
-        if: steps.merge.outputs.synced == '1' && env.DRY_RUN != 'true'
+        if: steps.merge.outputs.status == 'merged' && env.DRY_RUN != 'true'
         shell: bash
         run: |
           set -euo pipefail
@@ -134,14 +195,24 @@ jobs:
             echo "## Sync main with upstream"
             echo
             echo "- Upstream: \`${UPSTREAM_REPO}@${UPSTREAM_REF}\`"
-            if [ "${{ steps.merge.outputs.synced }}" = "1" ]; then
-              echo "- Merged upstream \`${{ steps.merge.outputs.base_sha }}\` into main"
-              if [ "${DRY_RUN}" = "true" ]; then
-                echo "- Dry run: validated, **not** pushed"
-              else
-                echo "- Pushed to \`main\`"
-              fi
-            else
-              echo "- main already up to date — nothing to sync"
-            fi
+            case "${{ steps.merge.outputs.status }}" in
+              merged)
+                echo "- Merged upstream \`${{ steps.merge.outputs.base_sha }}\` into main"
+                if [ "${DRY_RUN}" = "true" ]; then
+                  echo "- Dry run: validated, **not** pushed"
+                else
+                  echo "- Pushed to \`main\`"
+                fi
+                ;;
+              conflict)
+                echo "- ⚠️ Upstream merge hit conflicts — **main left untouched**"
+                echo "- Resolve via PR #${{ steps.merge.outputs.conflict_pr }} (assignee \`${CONFLICT_ASSIGNEE}\`, review \`${REVIEW_TEAM}\`)"
+                ;;
+              uptodate)
+                echo "- main already up to date — nothing to sync"
+                ;;
+              *)
+                echo "- ⚠️ Sync step did not complete — see job logs"
+                ;;
+            esac
           } >> "$GITHUB_STEP_SUMMARY"

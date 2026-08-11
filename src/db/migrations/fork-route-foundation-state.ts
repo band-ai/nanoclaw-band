@@ -1,8 +1,14 @@
 import type Database from 'better-sqlite3';
 import type { Migration } from './index.js';
 
-export const migration020: Migration = {
-  version: 20,
+// Fork-owned migration. Registered via registerForkMigrations() (fork.ts),
+// NOT added to the core `migrations` array in index.ts — that array is the
+// upstream seam that caused the sync conflict. Version uses the reserved 900+
+// fork range purely as a visual marker; uniqueness is by `name`, so the number
+// is cosmetic and the `name` must stay 'route-foundation-state' forever (installs
+// key idempotency on it).
+export const routeFoundationState: Migration = {
+  version: 900,
   name: 'route-foundation-state',
   up: (db: Database.Database) => {
     db.exec(`

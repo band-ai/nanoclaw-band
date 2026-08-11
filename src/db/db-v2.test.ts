@@ -43,10 +43,15 @@ import {
   setModuleState,
 } from './index.js';
 import { registerChannelMigrations } from './migrations/index.js';
+import { registerForkMigrations } from './migrations/fork.js';
 
 function now() {
   return new Date().toISOString();
 }
+
+// The inbound_delivery_ledger tests below rely on the fork's route-foundation
+// migration, which registers via the fork registry (not the core array).
+registerForkMigrations();
 
 // module_state is not in core schema — it's created by a channel migration
 // (Band, in production). Register a local one so the generic module-state.ts
