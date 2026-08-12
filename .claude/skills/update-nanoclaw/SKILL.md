@@ -33,7 +33,7 @@ Run `/update-nanoclaw` in Claude Code.
 
 **Validation**: runs `pnpm run build` and `pnpm test`. If container files changed, also runs the container typecheck and `./container/build.sh`.
 
-**Breaking changes check**: after validation, reads CHANGELOG.md for any `[BREAKING]` entries introduced by the update. If found, shows each breaking change and offers to run the recommended skill to migrate.
+**Breaking changes check**: after validation, reads CHANGELOG.md for any `[BREAKING]` entries introduced by the update. If found, shows each breaking change, reads its migration skill or guide, and offers the recommended migration.
 
 ## Rollback
 
@@ -63,17 +63,16 @@ Help a user with a customized NanoClaw install safely incorporate upstream chang
 # Step 0a: Refresh this skill first
 The update process itself evolves, so run its newest version before doing anything else:
 - Ensure the `upstream` remote exists (default `https://github.com/nanocoai/nanoclaw.git`) and fetch: `git fetch upstream --prune`. Detect the upstream branch (`main` or `master`).
-- Refresh this skill from upstream: `git checkout upstream/<branch> -- .claude/skills/update-nanoclaw/`
-- Re-read `.claude/skills/update-nanoclaw/SKILL.md`. If it changed, **follow the updated version from the top** instead of this one.
-
-This is the only working-tree change expected before the preflight check; the full update commits it along with everything else.
+- Read the upstream skill without changing the working tree:
+  `git show upstream/<branch>:.claude/skills/update-nanoclaw/SKILL.md`.
+- If it differs from the local copy, **follow the upstream version from the top**
+  instead of this one. The merge will bring that version into the checkout.
 
 # Step 0: Preflight (stop early if unsafe)
 Run:
 - `git status --porcelain`
 If output is non-empty:
 - Tell the user to commit or stash first, then stop.
-- Exception: changes limited to `.claude/skills/update-nanoclaw/` are the Step 0a self-refresh — ignore those and proceed.
 
 Confirm remotes:
 - `git remote -v`
@@ -207,8 +206,18 @@ Check which areas changed to determine what to validate:
 - Check: `pnpm exec tsc -p container/agent-runner/tsconfig.json --noEmit`
 - If this fails because bun types are missing (`Cannot find type definition file for 'bun'`), skip with a note — type errors will surface at container runtime instead
 
-**Container image rebuild** (only if any `container/` files are in CHANGED_FILES):
-- `./container/build.sh`
+**Container image** (only if any `container/` files are in CHANGED_FILES, or the `agent-image` pin moved):
+
+Which command depends on where this install gets its image — check `.env` for `NANOCLAW_HARDENED_IMAGE=true`.
+
+- **Builds locally** (the default; flag absent or not `true`): `./container/build.sh`
+- **Pulls a pinned image** (flag is `true`): `./container/build.sh pull`. Never the bare form — it exits `3` on a pinned install rather than silently replacing the pulled bytes with a local build.
+
+A pinned install needs `pull` in either of two cases, so run it if either holds:
+- `git diff <backup-tag-from-step-1>..HEAD -- versions.json` shows the `agent-image` value changed. A new image was published; nothing re-pulls on its own.
+- Any `container/` file changed, `container/agent-runner/bun.lock` included.
+
+If `pull` refuses with a lockfile mismatch, that is the guard working, not a bug: the update moved `container/agent-runner/bun.lock` and no image has been published for the new lockfile yet. `/app/src` is bind-mounted from this checkout at spawn, so pairing the old image with the new source dies as a missing module inside a `--rm` container whose logs are discarded. Tell the user and offer the two real options — wait for a published image matching this checkout, or switch this install to local builds with `./container/build.sh build`.
 
 If build fails:
 - Show the error.
@@ -227,24 +236,36 @@ After validation succeeds, check if the update introduced any breaking changes.
 Determine which CHANGELOG entries are new by diffing against the backup tag:
 - `git diff <backup-tag-from-step-1>..HEAD -- CHANGELOG.md`
 
-Parse the diff output for lines that contain `[BREAKING]` anywhere in the line. Each such line is one breaking change entry. The format is:
+Parse the diff output for lines that contain `[BREAKING]` anywhere in the line.
+Each such line is one breaking change entry and references either a migration
+skill or a local guide:
 ```
 [BREAKING] <description>. Run `/<skill-name>` to <action>.
+[BREAKING] <description>. Follow [the migration guide](docs/<guide>.md).
 ```
 
 If no `[BREAKING]` lines are found:
-- Skip this step silently. Proceed to Step 7 (skill updates check).
+- Skip this step silently. Proceed to Step 7.
 
 If one or more `[BREAKING]` lines are found:
 - Display a warning header to the user: "This update includes breaking changes that may require action:"
 - For each breaking change, display the full description.
-- Collect all skill names referenced in the breaking change entries (the `/<skill-name>` part).
-- Use AskUserQuestion to ask the user which migration skills they want to run now. Options:
-  - One option per referenced skill (e.g., "Run /add-whatsapp to re-add WhatsApp channel")
+- Collect every referenced skill (the `/<skill-name>` part) and local
+  `docs/*.md` migration guide.
+- Read every referenced guide before presenting its migration. Summarize its
+  detect, why, fix, verify, and rollback sections.
+- Initialize an unresolved-migrations list with every referenced skill and
+  guide. Remove an item only after its migration and verification complete
+  successfully.
+- Use AskUserQuestion to ask which migrations the user wants to run now. Options:
+  - One recommended option per referenced skill (e.g., "Run /add-whatsapp (Recommended)")
+  - One recommended option per guide, named for its documented fix
   - "Skip — I'll handle these manually"
-- Set `multiSelect: true` so the user can pick multiple skills if there are several breaking changes.
-- For each skill the user selects, invoke it using the Skill tool.
-- After all selected skills complete (or if user chose Skip), proceed to Step 7 (skill updates check).
+- Set `multiSelect: true` so the user can pick multiple migrations if there are several.
+- Invoke selected skills with the Skill tool. For a selected guide, follow its
+  fix steps and then its verification steps.
+- Keep every skipped, failed, or incomplete migration in the unresolved list, then
+  proceed to Step 7.
 
 # Step 7: Skill updates (part of updating NanoClaw)
 
@@ -327,8 +348,23 @@ Show:
 - New HEAD: `git rev-parse --short HEAD`
 - Upstream HEAD: `git rev-parse --short upstream/$UPSTREAM_BRANCH`
 - Conflicts resolved (list files, if any)
-- Breaking changes applied (list skills run, if any)
+- Breaking changes applied (list migrations completed, if any)
+- Unresolved breaking migrations (list skipped, failed, or incomplete migrations)
 - Remaining local diff vs upstream: `git diff --name-only upstream/$UPSTREAM_BRANCH..HEAD`
+
+If unresolved migrations remain, explain plainly that the code update succeeded
+but affected features may ignore old state until those migrations run. Use
+AskUserQuestion before showing restart commands:
+
+- **Run unresolved migrations (Recommended):** invoke each unresolved skill or
+  follow each unresolved guide, removing it from the list only after successful
+  completion and verification.
+- **Restart anyway:** continue only with explicit confirmation and repeat the
+  unresolved migration names in the final warning.
+
+If a retried migration remains unresolved, ask again. Do not show restart
+commands until the unresolved list is empty or the user explicitly chooses
+Restart anyway.
 
 Tell the user:
 - To rollback: `git reset --hard <backup-tag-from-step-1>`

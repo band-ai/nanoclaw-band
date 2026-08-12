@@ -1,4 +1,5 @@
 import { registerProvider } from './provider-registry.js';
+import type { MemorySessionHookRegistration } from '../memory/session-hook.js';
 import type { AgentProvider, AgentQuery, ProviderEvent, ProviderOptions, QueryInput } from './types.js';
 
 function defaultMockResponse(prompt: string): string {
@@ -19,6 +20,8 @@ export class MockProvider implements AgentProvider {
   constructor(_options: ProviderOptions = {}, responseFactory?: (prompt: string) => string) {
     this.responseFactory = responseFactory ?? defaultMockResponse;
   }
+
+  registerMemorySessionHook(_hook: MemorySessionHookRegistration): void {}
 
   isSessionInvalid(_err: unknown): boolean {
     return false;

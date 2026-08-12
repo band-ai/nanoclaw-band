@@ -98,11 +98,10 @@ export interface RoutingContext {
   channelType: string | null;
   threadId: string | null;
   inReplyTo: string | null;
-  /** Batch is a task fire — explicit `<message to>` sends must NOT inherit
-   *  inReplyTo (the series id), or the host's task-fire suppression drops
-   *  them as turn-final echoes: zero delivery. Deliberate sends are
-   *  in_reply_to-null, same as the out-of-process MCP send_message path. */
-  taskFire: boolean;
+  /** Batch is a task run. One-door delivery: only an explicitly addressed tool
+   *  delivers from a task session; final-text `<message to>` blocks are inert
+   *  and the final text auto-appends to the series run log. */
+  taskRun: boolean;
 }
 
 /**
@@ -116,7 +115,7 @@ export function extractRouting(messages: MessageInRow[]): RoutingContext {
     channelType: first?.channel_type ?? null,
     threadId: first?.thread_id ?? null,
     inReplyTo: first?.id ?? null,
-    taskFire: messages.length > 0 && messages.every((m) => m.kind === 'task'),
+    taskRun: messages.length > 0 && messages.every((m) => m.kind === 'task'),
   };
 }
 
@@ -204,13 +203,39 @@ function originAttr(msg: MessageInRow): string {
 function formatTaskMessage(msg: MessageInRow): string {
   const content = parseContent(msg.content);
   const from = originAttr(msg);
-  const time = formatLocalTime(msg.timestamp, TIMEZONE);
+  const time = formatLocalTime(msg.process_after ?? msg.timestamp, TIMEZONE);
+  const currentTime = new Date().toLocaleString('en-US', {
+    timeZone: TIMEZONE,
+    dateStyle: 'full',
+    timeStyle: 'short',
+  });
   const parts: string[] = [];
   if (content.scriptOutput) {
     parts.push('Script output:', JSON.stringify(content.scriptOutput, null, 2), '');
   }
-  parts.push('Instructions:', content.prompt || '');
-  return `<task${from} time="${escapeXml(time)}">${parts.join('\n')}</task>`;
+  parts.push('Instructions:', stripLegacyTaskContract(content.prompt || ''));
+  return `<task${from} time="${escapeXml(time)}" current_time="${escapeXml(currentTime)}">${parts.join('\n')}</task>`;
+}
+
+const LEGACY_TASK_CONTRACT_MARKERS = [
+  '\n\n[A task serves the user two separate ways —',
+  '\n\n[Task delivery contract:',
+];
+
+/**
+ * PR #2981 persisted its generated delivery contract inside each task prompt.
+ * New sessions receive the contract from their runtime system prompt instead.
+ * Strip only a known generated suffix, at read time, so existing task rows stay
+ * compatible without a session-DB migration or contradictory model guidance.
+ */
+export function stripLegacyTaskContract(prompt: string): string {
+  if (!prompt.trimEnd().endsWith(']')) return prompt;
+
+  let contractStart = -1;
+  for (const marker of LEGACY_TASK_CONTRACT_MARKERS) {
+    contractStart = Math.max(contractStart, prompt.lastIndexOf(marker));
+  }
+  return contractStart >= 0 ? prompt.slice(0, contractStart).trimEnd() : prompt;
 }
 
 function formatWebhookMessage(msg: MessageInRow): string {

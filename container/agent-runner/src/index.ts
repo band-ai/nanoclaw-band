@@ -27,7 +27,9 @@ import { fileURLToPath } from 'url';
 
 import { loadConfig } from './config.js';
 import { buildSystemPromptAddendum } from './destinations.js';
-import { ensureMemoryScaffold } from './memory-scaffold.js';
+import { getTaskSeriesId } from './db/session-routing.js';
+import { ensureMemoryScaffold } from './memory/scaffold.js';
+import { MEMORY_SESSION_HOOK } from './memory/session-hook.js';
 // Providers barrel — each enabled provider self-registers on import.
 // Provider skills append imports to providers/index.ts.
 import './providers/index.js';
@@ -38,6 +40,7 @@ import './providers/index.js';
 import { createProvider, type ProviderName } from './providers/factory.js';
 import { buildMcpServers } from './mcp-servers.js';
 import { runStartHooks, runStopHooks } from './lifecycle.js';
+import type { McpServerConfig } from './providers/types.js';
 import { runPollLoop } from './poll-loop.js';
 import { getContinuation } from './db/session-state.js';
 
@@ -53,17 +56,26 @@ async function main(): Promise<void> {
 
   log(`Starting v2 agent-runner (provider: ${providerName})`);
 
+  // Every provider shares one persistent memory tree. Legacy imports are an
+  // operator-run migration and never happen in this normal startup path.
+  ensureMemoryScaffold();
+
   // Runtime-generated system-prompt addendum: agent identity (name) plus
   // the live destinations map. Everything else (capabilities, per-module
   // instructions, per-channel formatting) is loaded by Claude Code from
   // /workspace/agent/CLAUDE.md — the composed entry imports the shared
   // base (/app/CLAUDE.md) and each enabled module's fragment. Per-group
-  // memory lives in /workspace/agent/CLAUDE.local.md (auto-loaded).
-  let instructions = buildSystemPromptAddendum(config.assistantName || undefined);
+  // memory lives in /workspace/agent/CLAUDE.local.md (auto-loaded); Band's
+  // pre-load arrives through the start hooks below.
+  const taskId = getTaskSeriesId();
+  let instructions = buildSystemPromptAddendum(
+    config.assistantName || undefined,
+    taskId ? { kind: 'task', taskId } : { kind: 'chat' },
+  );
 
-  // Start hooks: channel/provider callbacks that may return a system-prompt
-  // addendum (e.g. Band memory pre-load). Core ships no hooks; channels
-  // register them via band-lifecycle.ts (imported as a side effect).
+  // Band seam: start hooks — channel/provider callbacks that may return a
+  // system-prompt addendum (e.g. Band memory pre-load). Core ships no hooks;
+  // channels register them via band-lifecycle.ts (imported as a side effect).
   const startAddenda = await runStartHooks({ assistantName: config.assistantName || undefined, cwd: CWD });
   for (const addendum of startAddenda) {
     instructions = `${instructions}\n\n${addendum}`;
@@ -114,12 +126,7 @@ async function main(): Promise<void> {
     model: config.model,
     effort: config.effort,
   });
-
-  // Providers that lack native memory opt in via `usesMemoryScaffold`; for them
-  // the runner creates a persistent memory/ tree in its host-backed workspace at
-  // boot (idempotent). Default off — the trunk default (Claude) omits the flag
-  // and keeps its native memory untouched.
-  if (provider.usesMemoryScaffold) ensureMemoryScaffold();
+  provider.registerMemorySessionHook(MEMORY_SESSION_HOOK);
 
   // Graceful shutdown: when the host stops the container (SIGTERM from
   // `docker stop`), abort the poll loop so the in-flight query can wind

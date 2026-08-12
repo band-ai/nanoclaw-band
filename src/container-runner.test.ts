@@ -3,6 +3,7 @@ import path from 'path';
 import { describe, expect, it } from 'vitest';
 
 import {
+  hardeningArgs,
   mergeContainerContributions,
   resolveProviderName,
   rewriteOneCliProxyArgs,
@@ -172,5 +173,48 @@ describe('rewriteOneCliProxyArgs', () => {
     rewriteOneCliProxyArgs(args, undefined);
 
     expect(args).toEqual(['-e', 'HTTPS_PROXY=http://x:token@host.docker.internal:10255']);
+  });
+});
+
+describe('syncSkillSymlinks blocked-entry warning (structural)', () => {
+  // Real directories in .claude-shared/skills/ block the managed symlinks:
+  // the prune loop only removes symlinks and the create loop skips any
+  // existing entry. Template overlays depend on surviving that (see
+  // src/group-skills.ts); stale pre-refactor skill copies (#3001) get served
+  // forever with no trace. Driving syncSkillSymlinks needs a real group
+  // filesystem, and importing more of the module pulls the provider side
+  // effects, so guard the wiring structurally: the create loop must warn
+  // when a non-symlink entry occupies a desired skill path.
+  it('warns instead of silently skipping when a real entry blocks a desired skill', () => {
+    const src = fs.readFileSync(path.join(process.cwd(), 'src', 'container-runner.ts'), 'utf-8');
+    const createLoop = src.indexOf('// Create symlinks for desired skills');
+    expect(createLoop).toBeGreaterThan(-1);
+    const tail = src.slice(createLoop);
+    expect(tail).toMatch(/else if \(!entry\.isSymbolicLink\(\)\)/);
+    expect(tail).toMatch(/log\.warn\(\s*'Shared skill not symlinked/);
+  });
+});
+
+describe('hardeningArgs', () => {
+  it('always emits the three unconditional flags', () => {
+    const args = hardeningArgs('2048');
+    expect(args).toContain('--cap-drop=ALL');
+    expect(args.join(' ')).toContain('--security-opt no-new-privileges');
+    expect(args).toContain('--init');
+  });
+
+  it('emits the pids limit when positive', () => {
+    expect(hardeningArgs('2048').join(' ')).toContain('--pids-limit 2048');
+  });
+
+  // cgroups v2 rejects `--pids-limit 0` with EINVAL, killing the spawn.
+  it('omits the pids limit for 0, negatives, blank and garbage', () => {
+    for (const v of ['0', '-1', '', '   ', 'lots']) {
+      expect(hardeningArgs(v).join(' ')).not.toContain('--pids-limit');
+    }
+  });
+
+  it('floors fractional values', () => {
+    expect(hardeningArgs('2048.7').join(' ')).toContain('--pids-limit 2048');
   });
 });

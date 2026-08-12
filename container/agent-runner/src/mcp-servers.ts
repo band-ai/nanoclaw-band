@@ -1,3 +1,5 @@
+import type { McpServerConfig } from './providers/types.js';
+
 /**
  * MCP server map assembly.
  *
@@ -13,11 +15,10 @@
  * Pure and side-effect free apart from the optional `log` callback, so the
  * merge is unit-testable without standing up `main()`.
  */
-export interface McpServerSpec {
-  command: string;
-  args: string[];
-  env: Record<string, string>;
-}
+// The map speaks upstream's McpServerConfig, which since v2.1.x is a union of a
+// stdio entry and `{ type: 'http', url }`. Only stdio entries take an env merge;
+// http entries pass through untouched.
+export type McpServerSpec = McpServerConfig;
 
 export interface BuildMcpServersInput {
   /** The built-in nanoclaw server entry (already constructed by the caller). */
@@ -38,7 +39,11 @@ export function buildMcpServers(input: BuildMcpServersInput): Record<string, Mcp
 
   for (const [name, serverConfig] of Object.entries(configServers)) {
     mcpServers[name] = serverConfig;
-    log?.(`Additional MCP server: ${name} (${serverConfig.command})`);
+    log?.(
+      serverConfig.type === 'http'
+        ? `Additional MCP server: ${name} (HTTP)`
+        : `Additional MCP server: ${name} (${serverConfig.command})`,
+    );
   }
 
   const extra = ((): Record<string, { command: string; args: string[]; env?: Record<string, string> }> => {

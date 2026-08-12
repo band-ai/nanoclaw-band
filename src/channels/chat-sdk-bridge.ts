@@ -21,9 +21,9 @@ import {
 import { log } from '../log.js';
 import { SqliteStateAdapter } from '../state-sqlite.js';
 import { registerWebhookAdapter } from '../webhook-server.js';
-import { getAskQuestionRender } from '../db/sessions.js';
 import { normalizeOptions, type NormalizedOption } from './ask-question.js';
 import type { ChannelAdapter, ChannelDefaults, ChannelSetup, InboundMessage } from './adapter.js';
+import { resolveQuestionRender } from './question-render-registry.js';
 
 /** Adapter with optional gateway support (e.g., Discord). */
 interface GatewayAdapter extends Adapter {
@@ -101,7 +101,7 @@ export interface ChatSdkBridgeConfig {
 /**
  * Decode the actual option value from a button callback. Buttons are encoded
  * with an integer index (to keep under Telegram's 64-byte callback_data cap),
- * and the real value is looked up via `getAskQuestionRender(questionId)`.
+ * and the real value is looked up via `resolveQuestionRender(questionId)`.
  * Falls back to treating the tail as a literal value so old in-flight cards
  * (encoded before this shortening landed) still resolve.
  */
@@ -116,6 +116,31 @@ function resolveSelectedOption(
     if (render.options[idx]) return render.options[idx].value;
   }
   return candidate;
+}
+
+interface TerminalApprovalCard {
+  title: string;
+  question: string;
+  resolution: string;
+}
+
+/**
+ * Keep an approval's full context after it resolves. The muted resolution
+ * replaces the actions row, making the card visibly inactive without
+ * discarding the request an admin decided on.
+ */
+export function buildTerminalApprovalCard({ title, question, resolution }: TerminalApprovalCard) {
+  const children: CardChild[] = [];
+  if (question) children.push(CardText(question));
+  children.push(CardText(resolution, { style: 'muted' }));
+  return Card({ title, children });
+}
+
+function terminalApprovalMessage(spec: TerminalApprovalCard) {
+  return {
+    card: buildTerminalApprovalCard(spec),
+    fallbackText: [spec.title, spec.question, spec.resolution].filter(Boolean).join('\n\n'),
+  };
 }
 
 export function splitForLimit(text: string, limit: number): string[] {
@@ -313,7 +338,7 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
         const userId = event.user?.userId || '';
 
         // Resolve render metadata BEFORE dispatching onAction (which deletes the row).
-        const render = getAskQuestionRender(questionId);
+        const render = resolveQuestionRender(questionId);
         // New format: button id/value is an integer index into options (kept
         // short to fit Telegram's 64-byte callback_data cap). Old format:
         // the full value is embedded in actionId/value directly.
@@ -324,12 +349,16 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
 
         // Update the card to show the selected answer, who acted, and remove buttons
         const actorName = event.user?.userName || event.user?.fullName || '';
-        const byLine = actorName ? ` — ${actorName}` : '';
+        const resolution = actorName ? `${selectedLabel} by ${actorName}` : selectedLabel;
         try {
           const tid = event.threadId;
-          await adapter.editMessage(tid, event.messageId, {
-            markdown: `${title}\n\n${selectedLabel}${byLine}`,
-          });
+          await adapter.editMessage(
+            tid,
+            event.messageId,
+            render?.question
+              ? terminalApprovalMessage({ title, question: render.question, resolution })
+              : { markdown: `${title}\n\n${resolution}` },
+          );
         } catch (err) {
           log.warn('Failed to update card after action', { err });
         }
@@ -416,9 +445,23 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
       const content = message.content as Record<string, unknown>;
 
       if (content.operation === 'edit' && content.messageId) {
-        await adapter.editMessage(tid, content.messageId as string, {
-          markdown: transformText((content.text as string) || (content.markdown as string) || ''),
-        });
+        const terminalCard = content.terminalCard as Partial<TerminalApprovalCard> | undefined;
+        if (
+          terminalCard &&
+          typeof terminalCard.title === 'string' &&
+          typeof terminalCard.question === 'string' &&
+          typeof terminalCard.resolution === 'string'
+        ) {
+          await adapter.editMessage(
+            tid,
+            content.messageId as string,
+            terminalApprovalMessage(terminalCard as TerminalApprovalCard),
+          );
+        } else {
+          await adapter.editMessage(tid, content.messageId as string, {
+            markdown: transformText((content.text as string) || (content.markdown as string) || ''),
+          });
+        }
         return;
       }
 
@@ -446,7 +489,7 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
               // full value. Telegram caps callback_data at 64 bytes, and
               // long values (e.g. ISO datetimes, URLs) push the JSON payload
               // well past that. The onAction handlers resolve the index back
-              // to the real value via getAskQuestionRender(questionId).
+              // to the real value via resolveQuestionRender(questionId).
               options.map((opt, idx) =>
                 Button({ id: `ncq:${questionId}:${idx}`, label: opt.label, value: String(idx), style: opt.style }),
               ),
@@ -675,13 +718,15 @@ async function handleForwardedEvent(
       const originalEmbeds =
         ((interaction.message as Record<string, unknown>)?.embeds as Array<Record<string, unknown>>) || [];
       const originalDescription = (originalEmbeds[0]?.description as string) || '';
-      const render = questionId ? getAskQuestionRender(questionId) : undefined;
+      const render = questionId ? resolveQuestionRender(questionId) : undefined;
       // Discord custom_id mirrors the new index-based encoding (see Button
       // construction). Decode back to the real option value for downstream.
       const selectedOption = resolveSelectedOption(render, tail, tail);
       const cardTitle = render?.title ?? ((originalEmbeds[0]?.title as string) || '❓ Question');
       const matchedOpt = render?.options.find((o) => o.value === selectedOption);
       const selectedLabel = matchedOpt?.selectedLabel ?? selectedOption ?? customId;
+      const actorName = user?.global_name || user?.username || '';
+      const resolution = actorName ? `${selectedLabel} by ${actorName}` : selectedLabel;
       try {
         await fetch(`https://discord.com/api/v10/interactions/${interactionId}/${interactionToken}/callback`, {
           method: 'POST',
@@ -692,7 +737,8 @@ async function handleForwardedEvent(
               embeds: [
                 {
                   title: cardTitle,
-                  description: `${originalDescription}\n\n${selectedLabel}`,
+                  description: originalDescription || render?.question || '',
+                  footer: { text: resolution },
                 },
               ],
               components: [], // remove buttons

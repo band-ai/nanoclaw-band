@@ -12,7 +12,7 @@ afterEach(() => {
   closeDb();
   // The channel-migration registry is a module-level Map; clear it so each
   // test starts from an empty registry and re-registering a real migration
-  // (e.g. module-band-state) can't surface twice in allMigrations().
+  // (e.g. module-band-state) can't surface twice in getRegisteredMigrations().
   _resetChannelMigrationsForTesting();
 });
 

@@ -36,6 +36,8 @@ A skill carries everything it needs:
 
 Apply must be safe to re-run. Upgrades re-run skills, so a skill that half-applies twice is a bug.
 
+**Two readers, one document.** The trunk channel and provider installs that the setup wizard drives are written so the wizard can apply the same SKILL.md a coding agent would follow — anything the wizard can't do mechanically falls back to the agent. This is core tooling, not part of the model's contract: a plain-prose skill is a first-class skill. (Details: [skill-directives.md](skill-directives.md).)
+
 ## Two kinds of skills
 
 - **Capability skills** add something new: a channel, a provider, a tool, a dashboard.
@@ -61,6 +63,8 @@ These never really break.
 The one risky move is when a skill has to *reach into* existing code and wire something in at a specific spot. That's the only part that breaks when we change the code later. Keep these rare, and keep them to a line or two that just *calls* code living in the skill's own files, not big chunks of logic inline.
 
 Rule of thumb: aim for skills that are almost all "adds." Not 100%; some reach-ins are fine. But a skill full of reach-ins is a smell, and a sign that spot in the core should become a proper hook.
+
+The skill's name and description declare the capability. Runtime registration uses the registry that owns the behavior, with one explicit import where required.
 
 ## Where a skill's files live
 
