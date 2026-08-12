@@ -68,6 +68,7 @@ concurrency:
 permissions:
   contents: write
   pull-requests: write
+  issues: write
 
 jobs:
   sync-main:
@@ -227,11 +228,23 @@ jobs:
             echo "::warning::Pushing merged main was rejected — escalating to a PR instead."
           fi
 
-      # The always-available escalation. Head lives in the PARENT repo, so no ref
-      # is created here and nothing in this step can be permission-denied
-      # (constraint 2). Idempotent: one open PR per upstream head, refreshed with
-      # a comment instead of duplicated.
-      - name: Open or refresh the upstream-sync PR
+      # The escalation. It must reach a human without pushing a ref (constraint 2)
+      # and without depending on a credential we don't have. Two channels, tried in
+      # order, each unlocked by a different single admin toggle:
+      #
+      #   1. an Issue — needs Issues enabled on this fork (forks default to off).
+      #      Issue creation is NOT subject to the Actions pull-request policy, which
+      #      is why the prior art that actually stays green escalates this way.
+      #   2. a cross-repo PR with the head in the PARENT repo (head=<owner>:<ref>),
+      #      which creates no ref here — needs "Allow GitHub Actions to create and
+      #      approve pull requests" (Settings -> Actions -> General). Observed 403
+      #      "GitHub Actions is not permitted to create or approve pull requests"
+      #      on 2026-08-12, so this is currently the closed door.
+      #
+      # If neither is available the run says exactly which toggle to flip rather
+      # than failing anonymously. Both channels are idempotent: one open artifact,
+      # refreshed with a comment instead of duplicated.
+      - name: Escalate to a human (Issue, else cross-repo PR)
         id: escalate
         if: always() && steps.merge.outputs.status != 'uptodate' && steps.push.outputs.pushed != 'true'
         shell: bash
@@ -276,59 +289,97 @@ jobs:
             "**Conflicting files:**" \
             "${CONFLICTS:-- (none — see the reason above)}" \
             "" \
-            "This PR's head is upstream's branch, so it cannot take resolution commits. Resolve locally and push \`main\`:" \
+            "Resolve locally and push \`main\` (this artifact only reports — the merge cannot be landed from it):" \
             '```' \
             "git fetch upstream && git checkout main && git pull" \
             "git merge upstream/${UPSTREAM_REF}   # resolve, run the CI gate, commit" \
             "git push origin main" \
             '```' \
             "" \
-            "Once \`main\` contains upstream's tip this PR is closed automatically by the next run.")
+            "Once \`main\` contains upstream's tip the next run closes this automatically.")
 
-          existing=$(gh api "repos/${GITHUB_REPOSITORY}/pulls" -X GET \
-            -f state=open -f head="${HEAD_REF}" -f base=main --jq '.[0].number' 2>/dev/null || true)
+          TITLE="⚠️ Upstream sync needs manual resolution"
+          channel=none
+          ref=''
 
-          if [ -z "$existing" ] || [ "$existing" = "null" ]; then
-            existing=$(gh api "repos/${GITHUB_REPOSITORY}/pulls" -X POST \
-              -f title="⚠️ Upstream sync needs manual resolution" \
-              -f head="${HEAD_REF}" -f base=main -f body="$body" --jq '.number' 2>&1) || {
-                echo "::error::Could not open the upstream-sync PR: ${existing}"
-                echo "opened=false" >> "$GITHUB_OUTPUT"
-                exit 0
-              }
-            echo "Opened PR #${existing} (${HEAD_REF} -> main)."
+          # --- channel 1: Issue -------------------------------------------------
+          if [ "$(gh api "repos/${GITHUB_REPOSITORY}" --jq '.has_issues' 2>/dev/null)" = "true" ]; then
+            ref=$(gh issue list --state open --limit 100 --search "\"${TITLE}\" in:title" \
+              --json number --jq '.[0].number' 2>/dev/null || true)
+            if [ -z "$ref" ] || [ "$ref" = "null" ]; then
+              ref=$(gh issue create --title "$TITLE" --body "$body" \
+                --assignee "$CONFLICT_ASSIGNEE" 2>/dev/null | sed 's#.*/##') || ref=''
+              [ -n "$ref" ] && echo "Opened issue #${ref}."
+            else
+              gh issue comment "$ref" --body "$body" >/dev/null \
+                && echo "Refreshed issue #${ref}." || ref=''
+            fi
+            [ -n "$ref" ] && channel=issue
           else
-            gh pr comment "$existing" --body "$body" || echo "::warning::Could not comment on PR #${existing}."
-            echo "Refreshed PR #${existing}."
+            echo "Issues are disabled on ${GITHUB_REPOSITORY} — skipping the issue channel."
           fi
 
-          # Routing is advisory: never let a failed assignment hide the PR.
-          gh pr edit "$existing" --add-assignee "$CONFLICT_ASSIGNEE" \
-            || echo "::warning::Could not assign ${CONFLICT_ASSIGNEE} on PR #${existing}."
-          gh pr edit "$existing" --add-reviewer "$REVIEW_TEAM" \
-            || echo "::warning::Could not request review from ${REVIEW_TEAM} on PR #${existing}."
+          # --- channel 2: cross-repo PR ----------------------------------------
+          if [ "$channel" = "none" ]; then
+            ref=$(gh api "repos/${GITHUB_REPOSITORY}/pulls" -X GET \
+              -f state=open -f head="${HEAD_REF}" -f base=main --jq '.[0].number' 2>/dev/null || true)
+            if [ -z "$ref" ] || [ "$ref" = "null" ]; then
+              created=$(gh api "repos/${GITHUB_REPOSITORY}/pulls" -X POST \
+                -f title="$TITLE" -f head="${HEAD_REF}" -f base=main -f body="$body" \
+                --jq '.number' 2>&1) && { ref="$created"; echo "Opened PR #${ref} (${HEAD_REF} -> main)."; } || {
+                  echo "::warning::Could not open the upstream-sync PR: ${created}"
+                  ref=''
+                }
+            else
+              gh pr comment "$ref" --body "$body" >/dev/null \
+                && echo "Refreshed PR #${ref}." || ref=''
+            fi
+            if [ -n "$ref" ]; then
+              channel=pr
+              # Routing is advisory: never let a failed assignment hide the PR.
+              gh pr edit "$ref" --add-assignee "$CONFLICT_ASSIGNEE" \
+                || echo "::warning::Could not assign ${CONFLICT_ASSIGNEE} on PR #${ref}."
+              gh pr edit "$ref" --add-reviewer "$REVIEW_TEAM" \
+                || echo "::warning::Could not request review from ${REVIEW_TEAM} on PR #${ref}."
+            fi
+          fi
+
+          if [ "$channel" = "none" ]; then
+            echo "::error::No escalation channel available. Flip ONE of: enable Issues on ${GITHUB_REPOSITORY}, or allow GitHub Actions to create pull requests (Settings -> Actions -> General -> Workflow permissions)."
+          fi
 
           {
-            echo "opened=true"
-            echo "pr=${existing}"
+            echo "channel=${channel}"
+            echo "ref=${ref}"
           } >> "$GITHUB_OUTPUT"
 
       # Deterministic cleanup rather than relying on GitHub to notice: when main
-      # has caught up, close any open sync PR.
-      - name: Close the sync PR once main has caught up
+      # has caught up, close whichever escalation artifact is open.
+      - name: Close the escalation once main has caught up
         if: always() && (steps.merge.outputs.status == 'uptodate' || steps.push.outputs.pushed == 'true')
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -uo pipefail
+          TITLE="⚠️ Upstream sync needs manual resolution"
+          note="main now contains \`${UPSTREAM_REPO}@${UPSTREAM_REF}\` — closing."
           UPSTREAM_OWNER="${UPSTREAM_REPO%%/*}"
-          existing=$(gh api "repos/${GITHUB_REPOSITORY}/pulls" -X GET \
-            -f state=open -f head="${UPSTREAM_OWNER}:${UPSTREAM_REF}" -f base=main --jq '.[0].number' 2>/dev/null || true)
-          if [ -n "$existing" ] && [ "$existing" != "null" ]; then
-            gh pr close "$existing" --comment "main now contains \`${UPSTREAM_REPO}@${UPSTREAM_REF}\` — closing." \
-              || echo "::warning::Could not close PR #${existing}."
+
+          if [ "$(gh api "repos/${GITHUB_REPOSITORY}" --jq '.has_issues' 2>/dev/null)" = "true" ]; then
+            issue=$(gh issue list --state open --limit 100 --search "\"${TITLE}\" in:title" \
+              --json number --jq '.[0].number' 2>/dev/null || true)
+            if [ -n "$issue" ] && [ "$issue" != "null" ]; then
+              gh issue close "$issue" --comment "$note" || echo "::warning::Could not close issue #${issue}."
+            fi
           fi
+
+          pr=$(gh api "repos/${GITHUB_REPOSITORY}/pulls" -X GET \
+            -f state=open -f head="${UPSTREAM_OWNER}:${UPSTREAM_REF}" -f base=main --jq '.[0].number' 2>/dev/null || true)
+          if [ -n "$pr" ] && [ "$pr" != "null" ]; then
+            gh pr close "$pr" --comment "$note" || echo "::warning::Could not close PR #${pr}."
+          fi
+
 
       # Single place that decides red vs green, and names why. Runs last so every
       # escalation has already happened.
@@ -339,7 +390,8 @@ jobs:
           MERGE_STATUS: ${{ steps.merge.outputs.status }}
           GATE_OUTCOME: ${{ steps.gate.outcome }}
           PUSHED: ${{ steps.push.outputs.pushed }}
-          SYNC_PR: ${{ steps.escalate.outputs.pr }}
+          CHANNEL: ${{ steps.escalate.outputs.channel }}
+          ESCALATION_REF: ${{ steps.escalate.outputs.ref }}
           STALE: ${{ steps.drift.outputs.stale }}
           BASE_SHA: ${{ steps.drift.outputs.base_sha }}
           BEHIND: ${{ steps.drift.outputs.behind }}
@@ -351,7 +403,8 @@ jobs:
           status="${MERGE_STATUS:-}"
           gate="${GATE_OUTCOME:-}"
           pushed="${PUSHED:-}"
-          pr="${SYNC_PR:-}"
+          channel="${CHANNEL:-}"
+          ref="${ESCALATION_REF:-}"
           stale="${STALE:-}"
           fail=''
 
@@ -387,10 +440,13 @@ jobs:
               ;;
           esac
 
-          if [ -n "$pr" ]; then
-            echo "- Resolve via PR #${pr} (assignee \`${CONFLICT_ASSIGNEE}\`, review \`${REVIEW_TEAM}\`)" >> "$GITHUB_STEP_SUMMARY"
+          if [ -n "$ref" ] && [ "$channel" = "issue" ]; then
+            echo "- Tracked in issue #${ref} (assignee \`${CONFLICT_ASSIGNEE}\`)" >> "$GITHUB_STEP_SUMMARY"
+          elif [ -n "$ref" ] && [ "$channel" = "pr" ]; then
+            echo "- Tracked in PR #${ref} (assignee \`${CONFLICT_ASSIGNEE}\`, review \`${REVIEW_TEAM}\`)" >> "$GITHUB_STEP_SUMMARY"
           elif [ -n "$fail" ] && [ "$status" != "uptodate" ]; then
-            echo "- ❌ no escalation PR exists — the escalation step itself failed; see the job log" >> "$GITHUB_STEP_SUMMARY"
+            echo "- ❌ **no escalation channel available** — enable Issues on this repo, or allow GitHub Actions to create pull requests (Settings → Actions → General)" >> "$GITHUB_STEP_SUMMARY"
+            fail="${fail}; and it could not be escalated to a human"
           fi
 
           if [ "$stale" = "true" ]; then
@@ -399,6 +455,6 @@ jobs:
           fi
 
           if [ -n "$fail" ]; then
-            echo "::error::${fail}${pr:+ (PR #${pr})}"
+            echo "::error::${fail}${ref:+ (${channel} #${ref})}"
             exit 1
           fi
