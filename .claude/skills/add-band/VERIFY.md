@@ -100,10 +100,33 @@ grep -q "registerChannelMigrations" src/channels/band.ts && echo "migrations: se
 test -f src/db/migrations/module-band-state.ts && test -f src/db/migrations/020-band-rename.ts && echo "migration files: present"
 ```
 
-## 6. Adapter is credentialed
+## 6. Adapter is credentialed (host .env + container vault)
+
+Two independent credential paths must both be satisfied. The host adapter reads the
+key from `.env`; the in-container `band_*` tools reach Band through the OneCLI
+gateway, which injects the key **only when a vault secret's host pattern matches the
+egress host** (`BAND_BASE_URL`, default `app.band.ai`). A missing secret — or a
+legacy Thenvoi-era one on `app.thenvoi.com` — makes every `band_*` call silently
+401 while the host adapter still looks healthy.
 
 ```bash
-grep -qE '^(BAND|THENVOI)_AGENT_ID=' .env && echo "creds: present"
+grep -qE '^(BAND|THENVOI)_AGENT_ID=' .env && echo "host creds: present"
+
+HOST=$(printf '%s' "${BAND_BASE_URL:-${THENVOI_BASE_URL:-https://app.band.ai}}" | sed -E 's#^https?://##; s#/.*##')
+onecli secrets list | HOST="$HOST" python3 -c '
+import os, sys, json, re
+host = os.environ["HOST"]
+secrets = [s for s in json.load(sys.stdin).get("data", [])
+           if re.search(r"band|thenvoi", s.get("name") or "", re.I)
+           or re.search(r"app\.(band\.ai|thenvoi\.com)", s.get("hostPattern") or "")]
+if not secrets:
+    print("FAIL: no Band vault secret — band_* tools will 401 (see Step 1, OneCLI vault)")
+elif all((s.get("hostPattern") or "") != host for s in secrets):
+    have = ", ".join((s.get("hostPattern") or "<none>") for s in secrets)
+    print(f"FAIL: Band secret host pattern != {host} (have: {have}) — band_* tools will 401")
+else:
+    print(f"ok: Band vault secret targets {host}")
+'
 ```
 
 ## 7. A room is wired (not just discovered)
