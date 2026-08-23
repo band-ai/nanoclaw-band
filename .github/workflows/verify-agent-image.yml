@@ -54,10 +54,16 @@ jobs:
             # not auto-bumped: the entries must move together, and a bot that
             # bumps them independently can leave the architectures on bytes
             # from two different builds.
+            #
+            # `|| true` on the whole pipe: grep exits 1 when the key is absent
+            # (e.g. the base commit predates this field entirely), and under
+            # `pipefail`+`set -e` that failure would abort the step before it
+            # ever echoes an output — silently killing this check on exactly
+            # the PR that introduces the key for the first time.
             git show "$1:versions.json" 2>/dev/null \
               | tr -d '\n' \
               | grep -o '"agent-image"[[:space:]]*:[[:space:]]*"[^"]*"' \
-              | head -n1 | sed 's/.*:[[:space:]]*"//; s/"$//'
+              | head -n1 | sed 's/.*:[[:space:]]*"//; s/"$//' || true
           }
           NEW="$(read_pin "${{ github.event.pull_request.head.sha }}")"
           OLD="$(read_pin "${{ github.event.pull_request.base.sha }}")"
