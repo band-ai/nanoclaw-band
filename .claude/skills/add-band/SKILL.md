@@ -324,8 +324,7 @@ Optional vars, all defaulted (leave unset for hosted Band):
 ```
 
 Memory pre-load/consolidation and contact-event handling are off by default
-([reference/configuration.md](reference/configuration.md)). If this instance
-mirrors env, sync it: `[ -f data/env/env ] && cp .env data/env/env`.
+([reference/configuration.md](reference/configuration.md)).
 
 #### Re-register or rotate the key
 
@@ -347,7 +346,6 @@ The skip-on-existing-key gate assumes the key in `.env` is live. Two resets:
 
   ```bash
   sed -i.bak -E '/^(BAND|THENVOI)_(AGENT_ID|AGENT_API_KEY|API_KEY)=/d' .env && rm -f .env.bak
-  [ -f data/env/env ] && cp .env data/env/env
   onecli secrets delete --id <secret-id>   # id from `onecli secrets list`
   ```
 

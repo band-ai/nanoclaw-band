@@ -18,9 +18,13 @@ import { moduleApprovalsPendingApprovals } from './module-approvals-pending-appr
 import { moduleApprovalsTitleOptions } from './module-approvals-title-options.js';
 import { migration018 } from './018-approvals-approver-user-id.js';
 import { migration019 } from './019-wiring-threads.js';
+import { migration020 } from './020-container-config-timezone.js';
+import { migration021 } from './021-approval-question.js';
+import { migration022 } from './022-messaging-group-detached.js';
 
 export interface Migration {
   version: number;
+  /** Permanent applied identity. Never rename a migration after release. */
   name: string;
   up: (db: Database.Database) => void;
   /**
@@ -33,6 +37,13 @@ export interface Migration {
    */
   disableForeignKeys?: boolean;
 }
+
+/**
+ * Public module migrations use a core-reserved, owner-qualified identity so
+ * independent modules may reuse local migration names without colliding.
+ */
+export type ModuleMigrationName = `module:${string}:${string}`;
+export type ModuleMigration = Omit<Migration, 'name'> & { name: ModuleMigrationName };
 
 export const migrations: Migration[] = [
   migration001,
@@ -52,13 +63,39 @@ export const migrations: Migration[] = [
   migration015,
   migration016,
   migration019,
+  migration020,
+  migration021,
+  migration022,
 ];
 
+/**
+ * Migrations contributed by self-registering modules.
+ *
+ * When multiple migrations are pending, built-in migrations run first. Module
+ * migrations are not interleaved with built-ins by `version`; they follow the
+ * deterministic import order of their owning modules because the modules
+ * barrel uses explicit side-effect imports.
+ */
+const moduleMigrations: Migration[] = [];
+const MODULE_MIGRATION_NAME_RE = /^module:[a-z0-9][a-z0-9._-]*:[a-z0-9][a-z0-9._-]*$/;
+
+export function registerMigration(migration: ModuleMigration): void {
+  if (!MODULE_MIGRATION_NAME_RE.test(migration.name)) {
+    throw new Error(
+      `Module migration "${migration.name}" must use "module:<module-id>:<migration-id>" and remain stable after release`,
+    );
+  }
+  if ([...migrations, ...moduleMigrations].some((candidate) => candidate.name === migration.name)) {
+    throw new Error(`Migration "${migration.name}" already registered`);
+  }
+  moduleMigrations.push(migration);
+}
+
 // Channel-migration registry. Channels (Band, etc.) register their own
-// migrations here on import. runMigrations appends them after core,
-// keyed on `name` like core — so an already-applied channel migration is
-// skipped by name, and a base install that never registers a channel
-// never runs its migrations.
+// migrations here on import. runMigrations appends them after core and
+// module migrations, keyed on `name` like core — so an already-applied
+// channel migration is skipped by name, and a base install that never
+// registers a channel never runs its migrations.
 const channelMigrations = new Map<string, Migration[]>();
 
 export function registerChannelMigrations(channel: string, list: Migration[]): void {
@@ -71,14 +108,14 @@ export function registerChannelMigrations(channel: string, list: Migration[]): v
 /** Test-only: clears the channel-migration registry. The registry is a
  *  module-level Map, so without this it leaks across `it()` blocks in the
  *  same file — re-registering the same real migration (e.g. module-band-state)
- *  would surface it twice in allMigrations() and violate schema_version's
+ *  would surface it twice in getRegisteredMigrations() and violate schema_version's
  *  UNIQUE(name). Never call this in production code paths. */
 export function _resetChannelMigrationsForTesting(): void {
   channelMigrations.clear();
 }
 
-function allMigrations(): Migration[] {
-  return [...migrations, ...[...channelMigrations.values()].flat()];
+export function getRegisteredMigrations(): readonly Migration[] {
+  return [...migrations, ...moduleMigrations, ...[...channelMigrations.values()].flat()];
 }
 
 /** Row shape of PRAGMA foreign_key_check. Child rowids are stable across a
@@ -94,7 +131,7 @@ interface FkViolation {
 const fkIdentity = (v: FkViolation): string =>
   JSON.stringify({ table: v.table, rowid: v.rowid, parent: v.parent, fkid: v.fkid });
 
-export function runMigrations(db: Database.Database, list: Migration[] = allMigrations()): void {
+export function runMigrations(db: Database.Database, list: readonly Migration[] = getRegisteredMigrations()): void {
   db.exec(`
     CREATE TABLE IF NOT EXISTS schema_version (
       version INTEGER PRIMARY KEY,

@@ -44,11 +44,10 @@ cd container/agent-runner && bun remove @band-ai/sdk && cd -
 
 ## 4. Credentials, image, restart
 
-1. Remove `BAND_*` (and any legacy `THENVOI_*`) lines from `.env` (and
-   `data/env/env` if you mirror it there). If you had enabled the optional
-   outbound-origination Band MCP, also revert the Dockerfile edits from
-   `reference/configuration.md` and remove the `band` entry from the relevant
-   agent group's `container.json`.
+1. Remove `BAND_*` (and any legacy `THENVOI_*`) lines from `.env`. If you had
+   enabled the optional outbound-origination Band MCP, also revert the
+   Dockerfile edits from `reference/configuration.md` and remove the `band`
+   entry from the relevant agent group's `container.json`.
 2. Rebuild and restart:
    ```bash
    pnpm install --frozen-lockfile && pnpm run build
