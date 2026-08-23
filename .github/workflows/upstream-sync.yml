@@ -40,6 +40,11 @@ concurrency:
 permissions:
   contents: write
   pull-requests: write
+  # Upstream commits routinely touch its own .github/workflows/*. Pushing that
+  # tree to auto/upstream-sync (below) needs this scope or GitHub silently
+  # rejects the push — that rejection previously masked every conflict here,
+  # since it fired before the PR-routing step could run.
+  workflows: write
 
 jobs:
   sync-main:
@@ -113,7 +118,10 @@ jobs:
           # "up to date".
           echo "status=conflict" >> "$GITHUB_OUTPUT"
           SYNC_BRANCH="auto/upstream-sync"
-          git push -f origin "${BASE}:refs/heads/${SYNC_BRANCH}"
+          if ! git push -f origin "${BASE}:refs/heads/${SYNC_BRANCH}"; then
+            echo "::error::Could not publish ${BASE} to ${SYNC_BRANCH} — check the job's token permissions (needs contents+workflows write). No conflict PR was opened."
+            exit 1
+          fi
           short=$(git rev-parse --short "$BASE")
           body=$(printf '%s\n' \
             "Automatic upstream sync of \`${UPSTREAM_REPO}@${UPSTREAM_REF}\` (\`${short}\`) hit conflicts and left \`main\` untouched." \
