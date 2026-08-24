@@ -4,7 +4,7 @@
  *
  * Fixes: Root→system systemd, WSL nohup fallback, no `|| true` swallowing errors.
  */
-import { execSync } from 'child_process';
+import { execFileSync, execSync } from 'child_process';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
@@ -259,7 +259,13 @@ function setupLinux(
  */
 function killOrphanedProcesses(projectRoot: string): void {
   try {
-    execSync(`pkill -f '${projectRoot}/dist/index\\.js' || true`, {
+    // execFileSync, not a shell string: projectRoot comes from process.cwd()
+    // (config.ts), and a shell-interpolated `'${projectRoot}/...'` breaks out
+    // of its own quoting if the path ever contains a single quote. execFile
+    // passes it straight through to pkill's argv, never through a shell. The
+    // enclosing try/catch already covers "no matching process" (pkill exits
+    // non-zero) the same way the old `|| true` did.
+    execFileSync('pkill', ['-f', `${projectRoot}/dist/index\\.js`], {
       stdio: 'ignore',
     });
     log.info('Stopped any orphaned nanoclaw processes');

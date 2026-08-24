@@ -3,7 +3,7 @@
  * Spawns agent containers with session folder + agent group folder mounts.
  * The container runs the v2 agent-runner which polls the session DB.
  */
-import { ChildProcess, exec, execFileSync, spawn } from 'child_process';
+import { ChildProcess, execFile, execFileSync, spawn } from 'child_process';
 import fs from 'fs';
 import path from 'path';
 import { promisify } from 'util';
@@ -691,7 +691,12 @@ async function buildContainerArgs(
   return args;
 }
 
-const execAsync = promisify(exec);
+// execFile (not exec/promisify(exec)) — CONTAINER_IMAGE, CONTAINER_IMAGE_BASE,
+// and the built imageTag/Dockerfile path are all env-overridable (config.ts).
+// A shell-string exec would let a metacharacter in any of those inject a
+// second command; execFile passes each argument straight to the runtime
+// binary's argv, never through a shell.
+const execFileAsync = promisify(execFile);
 
 /** Build a per-agent-group Docker image with custom packages. */
 export async function buildAgentGroupImage(agentGroupId: string): Promise<void> {
@@ -712,7 +717,13 @@ export async function buildAgentGroupImage(agentGroupId: string): Promise<void> 
   // all and an id is unambiguous either way.
   let baseId = '';
   try {
-    const { stdout } = await execAsync(`${CONTAINER_RUNTIME_BIN} image inspect --format '{{.Id}}' ${CONTAINER_IMAGE}`);
+    const { stdout } = await execFileAsync(CONTAINER_RUNTIME_BIN, [
+      'image',
+      'inspect',
+      '--format',
+      '{{.Id}}',
+      CONTAINER_IMAGE,
+    ]);
     baseId = stdout.trim();
   } catch {
     // Non-fatal: the build below fails on its own if the base is really absent.
@@ -755,7 +766,7 @@ export async function buildAgentGroupImage(agentGroupId: string): Promise<void> 
     // the build (can take minutes) instead of blocking on execSync. exec buffers
     // stdout/stderr (matching the old stdio: 'pipe') and rejects on a non-zero
     // exit, so error propagation is unchanged.
-    await execAsync(`${CONTAINER_RUNTIME_BIN} build -t ${imageTag} -f ${tmpDockerfile} .`, {
+    await execFileAsync(CONTAINER_RUNTIME_BIN, ['build', '-t', imageTag, '-f', tmpDockerfile, '.'], {
       cwd: DATA_DIR,
       timeout: 900_000,
     });

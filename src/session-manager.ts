@@ -11,6 +11,7 @@
  *      the mount; concurrent writers corrupt the DB.
  */
 import type Database from 'better-sqlite3';
+import { randomUUID } from 'crypto';
 import fs from 'fs';
 import path from 'path';
 
@@ -67,7 +68,7 @@ export function heartbeatPath(agentGroupId: string, sessionId: string): string {
 }
 
 function generateId(): string {
-  return `sess-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  return `sess-${Date.now()}-${randomUUID().slice(0, 8)}`;
 }
 
 /**

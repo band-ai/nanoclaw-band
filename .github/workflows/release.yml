@@ -53,6 +53,30 @@ jobs:
       actions: read
       contents: read
     steps:
+      # Validate target_sha via the API BEFORE any checkout or cache-enabled
+      # setup step runs. workflow_dispatch inputs are attacker-influenceable
+      # (any collaborator with write access can supply an arbitrary SHA), and
+      # checking that content out ahead of pnpm/setup-node's cache restore
+      # would let a non-ancestor commit's dependency tree poison the shared
+      # default-branch cache for every later, trusted run. Resolving ancestry
+      # through the API instead of a local `git merge-base` means the gate
+      # never has to fetch or execute the untrusted ref's content to decide.
+      - name: Verify target_sha before touching anything cache-enabled
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TARGET_SHA: ${{ inputs.target_sha }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$TARGET_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::target_sha must be a full lowercase 40-character commit SHA"
+            exit 1
+          fi
+          STATUS=$(gh api "repos/${GITHUB_REPOSITORY}/compare/main...${TARGET_SHA}" --jq '.status')
+          if [ "$STATUS" != "identical" ] && [ "$STATUS" != "behind" ]; then
+            echo "::error::target_sha must already be an ancestor of main (compare status: $STATUS)"
+            exit 1
+          fi
+
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           fetch-depth: 0

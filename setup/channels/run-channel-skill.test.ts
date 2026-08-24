@@ -224,7 +224,7 @@ describe('runChannelSkill adapter (Option A)', () => {
         if (c.includes('status --json')) {
           return JSON.stringify({ loggedIn: true, username: 'dan@acme.example', tenantId: 'tenant-1', userObjectId: 'aad-owner-1' });
         }
-        if (c.includes('login.microsoftonline.com')) return 'eyJfake.bot.token';
+        if (c.includes('https://login.microsoftonline.com/') && c.includes('oauth2/v2.0/token')) return 'eyJfake.bot.token';
         // /members is a sub-path of /v3/conversations — match it FIRST
         if (c.includes('/members')) return JSON.stringify({ id: '29:owner-xyz', name: 'Dan Mill' });
         if (c.includes('/v3/conversations')) return 'a:1conv';
@@ -325,7 +325,7 @@ describe('runChannelSkill adapter (Option A)', () => {
         }
         // the rebind fence: printf its own substituted JSON back
         if (c.includes('"wire":"yes"')) return `{"aad":"${TARGET_AAD}","wire":"yes"}`;
-        if (c.includes('login.microsoftonline.com')) return 'eyJfake.bot.token';
+        if (c.includes('https://login.microsoftonline.com/') && c.includes('oauth2/v2.0/token')) return 'eyJfake.bot.token';
         if (c.includes('/members')) return JSON.stringify({ id: '29:target-xyz', name: 'Desired Person' });
         if (c.includes('/v3/conversations')) return 'a:2conv';
         if (c.includes('node -e')) return EXPECTED_PLATFORM_ID;
@@ -383,7 +383,7 @@ describe('runChannelSkill adapter (Option A)', () => {
         if (c.includes('status --json')) {
           return JSON.stringify({ loggedIn: true, username: 'dan@acme.example', userObjectId: 'aad-owner-1' });
         }
-        if (c.includes('login.microsoftonline.com')) return 'eyJfake.bot.token';
+        if (c.includes('https://login.microsoftonline.com/') && c.includes('oauth2/v2.0/token')) return 'eyJfake.bot.token';
         if (c.includes('/members')) return JSON.stringify({ id: '29:owner-xyz', name: 'Dan Mill' });
         if (c.includes('/v3/conversations')) return 'a:3conv';
         if (c.includes('node -e')) return 'teams:b64:b64';

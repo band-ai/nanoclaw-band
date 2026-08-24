@@ -18,6 +18,7 @@
  * for policy refusals.
  */
 import { getChannelAdapter, getChannelDefaults } from './channels/channel-registry.js';
+import { randomUUID } from 'crypto';
 import { resolveThreadPolicy, resolveUnknownSenderPolicy } from './channels/channel-defaults.js';
 import { gateCommand } from './command-gate.js';
 import { getAgentGroup } from './db/agent-groups.js';
@@ -44,7 +45,7 @@ import type { AgentGroup, MessagingGroup, MessagingGroupAgent, Session } from '.
 import type { InboundEvent, InboundRouteResult } from './channels/adapter.js';
 
 function generateId(): string {
-  return `msg-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  return `msg-${Date.now()}-${randomUUID().slice(0, 8)}`;
 }
 
 /**
@@ -318,7 +319,7 @@ export async function routeInbound(event: InboundEvent): Promise<InboundRouteRes
     // channels we merely sit in is now audited for ACK-aware adapters without
     // creating a messaging_group row.
     if (!isMention) return droppedResult(event, 'no_messaging_group', { retryable: true }, ackMode);
-    const mgId = `mg-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    const mgId = `mg-${Date.now()}-${randomUUID().slice(0, 8)}`;
     mg = {
       id: mgId,
       channel_type: event.channelType,
@@ -648,7 +649,7 @@ async function deliverToAgent(
     }
     if (gate.action === 'deny') {
       writeOutboundDirect(session.agent_group_id, session.id, {
-        id: `deny-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+        id: `deny-${Date.now()}-${randomUUID().slice(0, 8)}`,
         kind: 'chat',
         platformId: deliveryAddr.platformId,
         channelType: deliveryAddr.channelType,

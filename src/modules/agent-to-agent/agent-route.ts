@@ -19,6 +19,7 @@
  * core throws with a "module not installed" message so retry → mark failed.
  */
 import fs from 'fs';
+import { randomUUID } from 'crypto';
 import path from 'path';
 
 import { isSafeAttachmentName } from '../../attachment-safety.js';
@@ -327,7 +328,7 @@ async function performAgentRoute(
   targetAgentGroupId: string,
 ): Promise<void> {
   const targetSession = resolveTargetSession(msg, session, targetAgentGroupId);
-  const a2aMsgId = `a2a-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  const a2aMsgId = `a2a-${Date.now()}-${randomUUID().slice(0, 8)}`;
 
   // If the source message references files (via `send_file`), forward the
   // bytes from the source's outbox into the target's inbox so the target

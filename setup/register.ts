@@ -5,6 +5,7 @@
  * Creates: agent_group, messaging_group, messaging_group_agents.
  */
 import fs from 'fs';
+import { randomUUID } from 'crypto';
 import path from 'path';
 
 // Registration-only barrel import: each channel module calls
@@ -134,7 +135,7 @@ function parseArgs(args: string[]): RegisterArgs {
 }
 
 function generateId(prefix: string): string {
-  return `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  return `${prefix}-${Date.now()}-${randomUUID().slice(0, 8)}`;
 }
 
 export async function run(args: string[]): Promise<void> {

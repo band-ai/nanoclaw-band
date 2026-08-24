@@ -8,7 +8,7 @@
  * never touched.
  */
 const TRAILING_HARNESS_TAGS_RE =
-  /(?:\s*<\/?(?:parameter|invoke|function_calls|function_results|dispatch)(?:\s+[^<>]*?)?\s*>)+\s*$/i;
+  /(?:\s*<\/?(?:parameter|invoke|function_calls|function_results|dispatch)[^<>]*>)+\s*$/i;
 
 /**
  * Remove a trailing run of orphan opening or closing harness tags from text

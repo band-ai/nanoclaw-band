@@ -1042,23 +1042,26 @@ async function handleForwardedEvent(
       const actorName = user?.global_name || user?.username || '';
       const resolution = actorName ? `${selectedLabel} by ${actorName}` : selectedLabel;
       try {
-        await fetch(`https://discord.com/api/v10/interactions/${interactionId}/${interactionToken}/callback`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            type: 7, // UPDATE_MESSAGE — acknowledge + update in one call
-            data: {
-              embeds: [
-                {
-                  title: cardTitle,
-                  description: originalDescription || render?.question || '',
-                  footer: { text: resolution },
-                },
-              ],
-              components: [], // remove buttons
-            },
-          }),
-        });
+        await fetch(
+          `https://discord.com/api/v10/interactions/${encodeURIComponent(interactionId)}/${encodeURIComponent(interactionToken)}/callback`,
+          {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              type: 7, // UPDATE_MESSAGE — acknowledge + update in one call
+              data: {
+                embeds: [
+                  {
+                    title: cardTitle,
+                    description: originalDescription || render?.question || '',
+                    footer: { text: resolution },
+                  },
+                ],
+                components: [], // remove buttons
+              },
+            }),
+          },
+        );
       } catch (err) {
         log.error('Failed to update interaction', { err });
       }
