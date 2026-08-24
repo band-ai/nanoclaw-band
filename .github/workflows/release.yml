@@ -46,22 +46,20 @@ jobs:
             exit 1
           fi
 
-  verify:
+  # Runs before ANY checkout. A separate job (not just an earlier step) is
+  # load-bearing: `needs:` is a structural gate GitHub enforces regardless of
+  # what the job's steps do, so `verify` cannot start — and therefore its
+  # checkout of inputs.target_sha cannot reach pnpm/setup-node's cache-enabled
+  # restore/save — unless this job has already succeeded. An inline early
+  # step in the same job is not equivalent: it shares the job's cache scope
+  # regardless of step ordering.
+  validate-target:
     needs: dispatch
     runs-on: ubuntu-latest
     permissions:
-      actions: read
       contents: read
     steps:
-      # Validate target_sha via the API BEFORE any checkout or cache-enabled
-      # setup step runs. workflow_dispatch inputs are attacker-influenceable
-      # (any collaborator with write access can supply an arbitrary SHA), and
-      # checking that content out ahead of pnpm/setup-node's cache restore
-      # would let a non-ancestor commit's dependency tree poison the shared
-      # default-branch cache for every later, trusted run. Resolving ancestry
-      # through the API instead of a local `git merge-base` means the gate
-      # never has to fetch or execute the untrusted ref's content to decide.
-      - name: Verify target_sha before touching anything cache-enabled
+      - name: Verify target_sha is a real ancestor of main
         env:
           GH_TOKEN: ${{ github.token }}
           TARGET_SHA: ${{ inputs.target_sha }}
@@ -77,6 +75,13 @@ jobs:
             exit 1
           fi
 
+  verify:
+    needs: [dispatch, validate-target]
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+    steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           fetch-depth: 0

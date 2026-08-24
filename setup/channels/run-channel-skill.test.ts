@@ -23,6 +23,23 @@ vi.mock('../lib/bright-select.js', async (importActual) => {
 
 afterEach(() => delete process.env.NANOCLAW_TEMPLATE_AGENT_ID);
 
+// Matches the OAuth token-exchange call the add-teams skill fences
+// (see SKILL.md: curl ... https://login.microsoftonline.com/{tenant}/oauth2/v2.0/token).
+// Parses the URL embedded in the command line and checks hostname/pathname
+// exactly, rather than a bare `cmd.includes('login.microsoftonline.com')`
+// substring test that a coincidental match elsewhere in the command could
+// satisfy without actually being this call.
+function isMicrosoftTokenExchangeCall(cmd: string): boolean {
+  const match = cmd.match(/https:\/\/[^\s"']+/);
+  if (!match) return false;
+  try {
+    const url = new URL(match[0]);
+    return url.hostname === 'login.microsoftonline.com' && url.pathname.endsWith('/oauth2/v2.0/token');
+  } catch {
+    return false;
+  }
+}
+
 // Drives the real add-slack skill through the adapter with every side effect
 // injected (no real ncl/git/clack/init-first-agent): confirms it runs the skill
 // (install + creds + resolve), reads the resolved owner_handle + platform_id from
@@ -55,7 +72,12 @@ describe('runChannelSkill adapter (Option A)', () => {
       // the secrets + handle a human would supply; the skill resolves platform_id.
       // Values are valid-shaped for the prompts' validate: regexes — validate-at-bind
       // now enforces them on `inputs` too (they used to bypass validation).
-      inputs: { connection: 'webhook', bot_token: 'xoxb-x', signing_secret: '0123456789abcdef', owner_handle: 'U12345678' },
+      inputs: {
+        connection: 'webhook',
+        bot_token: 'xoxb-x',
+        signing_secret: '0123456789abcdef',
+        owner_handle: 'U12345678',
+      },
       wire: (a) => {
         wired.push(a);
         return true;
@@ -155,9 +177,7 @@ describe('runChannelSkill adapter (Option A)', () => {
   // from the document so the test can't drift from what ships.
   it('Teams have_creds probe: either credential key present answers yes', () => {
     const md = readFileSync(join(process.cwd(), '.claude/skills/add-teams/SKILL.md'), 'utf8');
-    const probe = parseDirectives(md).find(
-      (d) => d.kind === 'run' && d.attrs.capture === 'have_creds',
-    );
+    const probe = parseDirectives(md).find((d) => d.kind === 'run' && d.attrs.capture === 'have_creds');
     expect(probe).toBeDefined();
     const cmd = probe!.body.join('\n');
 
@@ -190,8 +210,7 @@ describe('runChannelSkill adapter (Option A)', () => {
     writeFileSync(join(root, '.env'), '');
     writeFileSync(join(root, 'package.json'), '{"name":"scratch"}');
 
-    const INSTALL_LINK =
-      'https://teams.microsoft.com/l/app/tapp-123?installAppPackage=true&appTenantId=tenant-1';
+    const INSTALL_LINK = 'https://teams.microsoft.com/l/app/tapp-123?installAppPackage=true&appTenantId=tenant-1';
     const log: string[] = [];
     const opened: string[] = [];
     const steps: string[] = [];
@@ -222,9 +241,14 @@ describe('runChannelSkill adapter (Option A)', () => {
         }
         // owner identity from the CLI session (status --json fence, plain exec)
         if (c.includes('status --json')) {
-          return JSON.stringify({ loggedIn: true, username: 'dan@acme.example', tenantId: 'tenant-1', userObjectId: 'aad-owner-1' });
+          return JSON.stringify({
+            loggedIn: true,
+            username: 'dan@acme.example',
+            tenantId: 'tenant-1',
+            userObjectId: 'aad-owner-1',
+          });
         }
-        if (c.includes('https://login.microsoftonline.com/') && c.includes('oauth2/v2.0/token')) return 'eyJfake.bot.token';
+        if (isMicrosoftTokenExchangeCall(c)) return 'eyJfake.bot.token';
         // /members is a sub-path of /v3/conversations — match it FIRST
         if (c.includes('/members')) return JSON.stringify({ id: '29:owner-xyz', name: 'Dan Mill' });
         if (c.includes('/v3/conversations')) return 'a:1conv';
@@ -325,7 +349,7 @@ describe('runChannelSkill adapter (Option A)', () => {
         }
         // the rebind fence: printf its own substituted JSON back
         if (c.includes('"wire":"yes"')) return `{"aad":"${TARGET_AAD}","wire":"yes"}`;
-        if (c.includes('https://login.microsoftonline.com/') && c.includes('oauth2/v2.0/token')) return 'eyJfake.bot.token';
+        if (isMicrosoftTokenExchangeCall(c)) return 'eyJfake.bot.token';
         if (c.includes('/members')) return JSON.stringify({ id: '29:target-xyz', name: 'Desired Person' });
         if (c.includes('/v3/conversations')) return 'a:2conv';
         if (c.includes('node -e')) return EXPECTED_PLATFORM_ID;
@@ -383,7 +407,7 @@ describe('runChannelSkill adapter (Option A)', () => {
         if (c.includes('status --json')) {
           return JSON.stringify({ loggedIn: true, username: 'dan@acme.example', userObjectId: 'aad-owner-1' });
         }
-        if (c.includes('https://login.microsoftonline.com/') && c.includes('oauth2/v2.0/token')) return 'eyJfake.bot.token';
+        if (isMicrosoftTokenExchangeCall(c)) return 'eyJfake.bot.token';
         if (c.includes('/members')) return JSON.stringify({ id: '29:owner-xyz', name: 'Dan Mill' });
         if (c.includes('/v3/conversations')) return 'a:3conv';
         if (c.includes('node -e')) return 'teams:b64:b64';
@@ -410,7 +434,6 @@ describe('runChannelSkill adapter (Option A)', () => {
     expect(res.agentTasks).toEqual([]);
     expect(fullyApplied(res)).toBe(true);
   });
-
 
   // The resolved leg of wireIfResolved, driven with a minimal fixture skill
   // (the real teams document needs a streaming exec runChannelSkill doesn't
@@ -564,7 +587,12 @@ describe('backGate (first-prompt back-to-channel-selection)', () => {
       resolveRemote: () => 'origin',
       agentName: 'Nano',
       role: 'owner',
-      inputs: { connection: 'webhook', bot_token: 'xoxb-x', signing_secret: '0123456789abcdef', owner_handle: 'U12345678' },
+      inputs: {
+        connection: 'webhook',
+        bot_token: 'xoxb-x',
+        signing_secret: '0123456789abcdef',
+        owner_handle: 'U12345678',
+      },
       wire: (a) => {
         wired.push(a);
         return true;

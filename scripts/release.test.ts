@@ -66,7 +66,8 @@ describe('release workflow safeguards', () => {
     expect(releaseWorkflow).toContain('name: Verify dispatch source');
     expect(releaseWorkflow).toContain('if [ "$DISPATCH_REPOSITORY" != "nanocoai/nanoclaw" ]');
     expect(releaseWorkflow).toContain('if [ "$DISPATCH_REF" != "refs/heads/main" ]');
-    expect(releaseWorkflow).toContain('verify:\n    needs: dispatch');
+    expect(releaseWorkflow).toContain('validate-target:\n    needs: dispatch');
+    expect(releaseWorkflow).toContain('verify:\n    needs: [dispatch, validate-target]');
     expect(releaseWorkflow).not.toContain(
       "if: github.repository == 'nanocoai/nanoclaw' && github.ref == 'refs/heads/main'",
     );
