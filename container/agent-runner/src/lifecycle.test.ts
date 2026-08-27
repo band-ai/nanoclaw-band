@@ -5,13 +5,7 @@
  */
 import { describe, it, expect } from 'bun:test';
 
-import {
-  registerStartHook,
-  registerStopHook,
-  runStartHooks,
-  runStopHooks,
-  type StopHookContext,
-} from './lifecycle.js';
+import { registerStartHook, registerStopHook, runStartHooks, runStopHooks, type StopHookContext } from './lifecycle.js';
 
 const stopCtx: StopHookContext = {
   providerName: 'mock',

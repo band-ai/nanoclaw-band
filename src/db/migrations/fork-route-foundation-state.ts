@@ -10,6 +10,7 @@ import type { Migration } from './index.js';
 export const routeFoundationState: Migration = {
   version: 900,
   name: 'route-foundation-state',
+  sqliteOnly: true,
   up: (db: Database.Database) => {
     db.exec(`
       CREATE TABLE IF NOT EXISTS inbound_delivery_ledger (

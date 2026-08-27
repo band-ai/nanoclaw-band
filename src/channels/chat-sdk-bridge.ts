@@ -25,6 +25,7 @@ import { SqliteStateAdapter } from '../state-sqlite.js';
 import { registerWebhookAdapter } from '../webhook-server.js';
 import { normalizeOptions, type NormalizedOption } from './ask-question.js';
 import type { ChannelAdapter, ChannelDefaults, ChannelSetup, InboundMessage } from './adapter.js';
+import { INSTANCE_KEY_RE } from './channel-registry.js';
 import { resolveQuestionRender } from './question-render-registry.js';
 
 /** Adapter with optional gateway support (e.g., Discord). */
@@ -287,7 +288,7 @@ function dispatchMembership(event: MembershipEvent): void {
  * captured in the returned closure is naturally per-instance (= per bot
  * identity when several bridges share one platform).
  */
-export type BridgeInboundPolicy = (setup: ChannelSetup, instanceKey: string) => ChannelSetup;
+export type BridgeInboundPolicy = (setup: ChannelSetup, instanceKey: string) => ChannelSetup | Promise<ChannelSetup>;
 
 const bridgeInboundPolicies = new Map<string, BridgeInboundPolicy>();
 
@@ -427,7 +428,7 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
   // whitespace-only names, which are config bugs — '' is falsy, so it
   // would skip a truthiness guard, dead-end the webhook route, and
   // collapse the state namespace into the default instance's keyspace.
-  if (config.instance !== undefined && !/^[A-Za-z0-9._-]+$/.test(config.instance)) {
+  if (config.instance !== undefined && !INSTANCE_KEY_RE.test(config.instance)) {
     throw new Error(
       `chat-sdk bridge instance ${JSON.stringify(config.instance)} must be URL-safe: ` +
         `non-empty, only letters, digits, '.', '_' or '-'`,
@@ -521,7 +522,7 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
       // through — means one policy covers onSubscribedMessage, onNewMention,
       // onDirectMessage and onNewMessage alike.
       const inboundPolicy = bridgeInboundPolicies.get(adapter.name);
-      setupConfig = inboundPolicy ? inboundPolicy(hostConfig, instanceKey) : hostConfig;
+      setupConfig = inboundPolicy ? await inboundPolicy(hostConfig, instanceKey) : hostConfig;
 
       // State namespace: ONLY for a named non-default instance. A skill
       // that explicitly names the primary instance after the platform
@@ -646,7 +647,7 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
         const userId = event.user?.userId || '';
 
         // Resolve render metadata BEFORE dispatching onAction (which deletes the row).
-        const render = resolveQuestionRender(questionId);
+        const render = await resolveQuestionRender(questionId);
         // New format: button id/value is an integer index into options (kept
         // short to fit Telegram's 64-byte callback_data cap). Old format:
         // the full value is embedded in actionId/value directly.
@@ -700,7 +701,7 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
           const startedAt = Date.now();
           // Capture the long-running listener promise via waitUntil
           let listenerPromise: Promise<unknown> | undefined;
-          gatewayAdapter.startGatewayListener!(
+          void gatewayAdapter.startGatewayListener!(
             {
               waitUntil: (p: Promise<unknown>) => {
                 listenerPromise = p;
@@ -735,11 +736,16 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
               }
               setTimeout(startGateway, delayMs);
             };
-            listenerPromise.then(() => reschedule()).catch(reschedule);
+            void listenerPromise.then(() => reschedule()).catch(reschedule);
           });
         };
         startGateway();
         log.info('Gateway listener started', { adapter: adapter.name });
+      } else if ('runtimeMode' in adapter && adapter.runtimeMode === 'polling') {
+        // Polling adapters (Telegram) pull updates themselves; a route here
+        // would only bind the shared webhook port for nothing. Read after
+        // initialize(): the adapter resolves mode 'auto' there.
+        log.info('Polling adapter: no webhook route registered', { adapter: adapter.name });
       } else {
         // Non-gateway adapters (Slack, Teams, GitHub, etc.) — register on the
         // shared webhook server. The handler key stays adapter.name (the
@@ -1032,7 +1038,7 @@ async function handleForwardedEvent(
       const originalEmbeds =
         ((interaction.message as Record<string, unknown>)?.embeds as Array<Record<string, unknown>>) || [];
       const originalDescription = (originalEmbeds[0]?.description as string) || '';
-      const render = questionId ? resolveQuestionRender(questionId) : undefined;
+      const render = questionId ? await resolveQuestionRender(questionId) : undefined;
       // Discord custom_id mirrors the new index-based encoding (see Button
       // construction). Decode back to the real option value for downstream.
       const selectedOption = resolveSelectedOption(render, tail, tail);

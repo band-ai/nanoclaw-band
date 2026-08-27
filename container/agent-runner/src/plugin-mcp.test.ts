@@ -63,5 +63,4 @@ describe('resolvePluginServer', () => {
       cwd: DATA,
     });
   });
-
 });

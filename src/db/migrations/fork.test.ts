@@ -9,8 +9,8 @@ import { initTestDb, closeDb, hasTable } from '../connection.js';
 import { runMigrations, migrations, _resetChannelMigrationsForTesting } from './index.js';
 import { registerForkMigrations, forkMigrations } from './fork.js';
 
-afterEach(() => {
-  closeDb();
+afterEach(async () => {
+  await closeDb();
   _resetChannelMigrationsForTesting();
 });
 
@@ -24,33 +24,31 @@ describe('fork migration registry', () => {
     }
   });
 
-  it('does not create the fork ledger on a base install (fork not registered)', () => {
-    const db = initTestDb();
-    runMigrations(db);
-    expect(hasTable(db, 'inbound_delivery_ledger')).toBe(false);
+  it('does not create the fork ledger on a base install (fork not registered)', async () => {
+    const db = await initTestDb();
+    await runMigrations(db);
+    expect(await hasTable(db, 'inbound_delivery_ledger')).toBe(false);
   });
 
-  it('creates inbound_delivery_ledger once fork migrations are registered', () => {
+  it('creates inbound_delivery_ledger once fork migrations are registered', async () => {
     registerForkMigrations();
-    const db = initTestDb();
-    runMigrations(db);
+    const db = await initTestDb();
+    await runMigrations(db);
 
-    expect(hasTable(db, 'inbound_delivery_ledger')).toBe(true);
-    const names = (db.prepare('SELECT name FROM schema_version').all() as { name: string }[]).map((r) => r.name);
+    expect(await hasTable(db, 'inbound_delivery_ledger')).toBe(true);
+    const names = (await db.all<{ name: string }>('SELECT name FROM schema_version')).map((r) => r.name);
     expect(names).toContain('route-foundation-state');
   });
 
-  it('is idempotent — a second run does not re-apply', () => {
+  it('is idempotent — a second run does not re-apply', async () => {
     registerForkMigrations();
-    const db = initTestDb();
-    runMigrations(db);
-    runMigrations(db); // already applied (keyed on name) — must be a no-op
-    const count = (
-      db.prepare("SELECT COUNT(*) AS c FROM schema_version WHERE name = 'route-foundation-state'").get() as {
-        c: number;
-      }
-    ).c;
-    expect(count).toBe(1);
+    const db = await initTestDb();
+    await runMigrations(db);
+    await runMigrations(db); // already applied (keyed on name) — must be a no-op
+    const row = await db.get<{ c: number }>(
+      "SELECT COUNT(*) AS c FROM schema_version WHERE name = 'route-foundation-state'",
+    );
+    expect(row!.c).toBe(1);
   });
 
   it('pins the migration name (installs key idempotency on it — never rename)', () => {

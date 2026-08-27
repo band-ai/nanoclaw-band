@@ -9,7 +9,7 @@
  */
 import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
 
-import { initTestSessionDb, closeSessionDb, getInboundDb } from './connection.js';
+import { initTestSessionDb, closeSessionDb, getInboundDb } from '../mailbox/sqlite/connection.js';
 import { getPendingMessages, markProcessing } from './messages-in.js';
 
 beforeEach(() => {
@@ -64,9 +64,17 @@ describe('trigger=1 rows never crowded out', () => {
     // Oldest-first: the task row (lowest seq) leads the batch.
     expect(batch[0].id).toBe('task-1');
     // Remaining slots hold the NEWEST 9 context rows (ctx-1..3 dropped).
-    expect(batch.slice(1).map((m) => m.id)).toEqual(
-      ['ctx-4', 'ctx-5', 'ctx-6', 'ctx-7', 'ctx-8', 'ctx-9', 'ctx-10', 'ctx-11', 'ctx-12'],
-    );
+    expect(batch.slice(1).map((m) => m.id)).toEqual([
+      'ctx-4',
+      'ctx-5',
+      'ctx-6',
+      'ctx-7',
+      'ctx-8',
+      'ctx-9',
+      'ctx-10',
+      'ctx-11',
+      'ctx-12',
+    ]);
   });
 
   it('trigger=1 rows are all included even when they interleave with newer context', () => {
@@ -153,9 +161,7 @@ describe('existing selection semantics preserved', () => {
     insertMessage('due-task', 2, 'task', { prompt: 'now' });
     insertMessage('later-task', 4, 'task', { prompt: 'later' }, { processAfter: future });
     insertContextRow('ctx-1', 6, 'ambient');
-    getInboundDb()
-      .prepare(`UPDATE messages_in SET process_after = ? WHERE id = 'ctx-1'`)
-      .run(future);
+    getInboundDb().prepare(`UPDATE messages_in SET process_after = ? WHERE id = 'ctx-1'`).run(future);
 
     const batch = getPendingMessages();
     expect(batch.map((m) => m.id)).toEqual(['due-task']);

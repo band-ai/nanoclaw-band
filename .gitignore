@@ -18,6 +18,9 @@ groups/global/*
 !groups/main/CLAUDE.md
 !groups/global/CLAUDE.md
 
+# Per-group memory (CLAUDE.local.md) must never be committed.
+**/CLAUDE.local.md
+
 # Secrets
 *.keys.json
 .env

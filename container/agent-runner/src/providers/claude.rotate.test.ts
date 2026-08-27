@@ -45,7 +45,8 @@ beforeEach(() => {
 });
 
 afterEach(() => {
-  const restore = (k: string, v: string | undefined) => (v === undefined ? delete process.env[k] : (process.env[k] = v));
+  const restore = (k: string, v: string | undefined) =>
+    v === undefined ? delete process.env[k] : (process.env[k] = v);
   restore('HOME', prevHome);
   restore('NANOCLAW_CONVERSATIONS_DIR', prevConv);
   restore('CLAUDE_TRANSCRIPT_ROTATE_BYTES', prevBytes);

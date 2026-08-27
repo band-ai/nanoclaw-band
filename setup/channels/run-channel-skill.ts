@@ -15,7 +15,9 @@
  * So the wire lives in exactly one place (init-first-agent) and is never
  * duplicated across channel skills.
  */
-import { writeFileSync } from 'node:fs';
+import { execSync } from 'node:child_process';
+import { existsSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
 
 import * as p from '@clack/prompts';
 
@@ -24,11 +26,60 @@ import * as setupLog from '../logs.js';
 import { BACK_TO_CHANNEL_SELECTION, backGate, type ChannelFlowResult } from '../lib/back-nav.js';
 import { askOperatorRole, type OperatorRole } from '../lib/role-prompt.js';
 import { ensureAnswer, fail, runQuietChild } from '../lib/runner.js';
-import { hostExec, runSkill, type RunSkillOptions } from '../lib/skill-driver.js';
+import { channelsRemote, hostExec, runSkill, type RunSkillOptions } from '../lib/skill-driver.js';
 import { clearTemplatePick } from '../templates.js';
 import { getChannelPreStep, getCompanionSkills } from './companions.js';
 
 const DEFAULT_AGENT_NAME = 'Nano';
+
+const CHANNELS_BRANCH = 'channels';
+
+/**
+ * Trunk ships no channel payloads, and that includes companion skill
+ * directories — a declared companion may exist only on the channels registry
+ * branch (e.g. the flag-gated Slack agents skills). Materialize an absent
+ * directory from there — the same remote resolution and fetch/show mechanics
+ * the skill engine uses for `from-branch` payload copies — so runSkill has a
+ * document to apply. A directory already in the checkout short-circuits with
+ * no git traffic. Returns false when the skill can't be produced; the caller
+ * warns and skips it.
+ */
+export function materializeCompanionSkill(
+  skill: string,
+  projectRoot: string,
+  deps: { exec?: (command: string) => string; resolveRemote?: () => string } = {},
+): boolean {
+  const dir = `.claude/skills/${skill}`;
+  // Key the short-circuit on SKILL.md, not the directory: a directory left by
+  // an interrupted materialization would otherwise read as installed, and a
+  // missing SKILL.md parses as zero directives — "fully applied" while the
+  // feature is absent.
+  if (existsSync(join(projectRoot, dir, 'SKILL.md'))) return true;
+  const exec =
+    deps.exec ??
+    ((command: string) =>
+      execSync(command, { cwd: projectRoot, stdio: ['ignore', 'pipe', 'pipe'] }).toString());
+  try {
+    const remote = (deps.resolveRemote ?? channelsRemote(projectRoot))();
+    exec(`git fetch ${remote} ${CHANNELS_BRANCH}`);
+    const files = exec(`git ls-tree -r --name-only '${remote}/${CHANNELS_BRANCH}' -- '${dir}'`)
+      .split('\n')
+      .map((s) => s.trim())
+      .filter(Boolean);
+    if (files.length === 0) return false;
+    for (const file of files) {
+      mkdirSync(dirname(join(projectRoot, file)), { recursive: true });
+      exec(`git show '${remote}/${CHANNELS_BRANCH}:${file}' > '${file}'`);
+    }
+    return true;
+  } catch {
+    // Leave no partial directory behind — the SKILL.md short-circuit above
+    // makes a leftover half-fetched dir permanent on the next run. Deleting
+    // is safe here: this path only runs when the skill was absent on entry.
+    rmSync(join(projectRoot, dir), { recursive: true, force: true });
+    return false;
+  }
+}
 
 /**
  * Apply a channel's declared companion skills (setup/channels/companions.ts)
@@ -56,7 +107,18 @@ async function applyCompanionSkills(
 ): Promise<void> {
   const companions = getCompanionSkills(channel);
   let applied = false;
+  let degraded = false;
   for (const skill of companions) {
+    if (!materializeCompanionSkill(skill, projectRoot)) {
+      degraded = true;
+      p.log.warn(
+        `Companion skill ${skill} is not in this checkout and could not be fetched from the ` +
+          `${CHANNELS_BRANCH} branch. The ${channel} channel works, but the capability that ` +
+          `skill adds is missing until you fetch and apply it: ` +
+          `pnpm exec tsx setup/lib/skill-driver.ts .claude/skills/${skill}`,
+      );
+      continue;
+    }
     const res = await runSkill(`.claude/skills/${skill}`, {
       projectRoot,
       exec: overrides.exec,
@@ -72,16 +134,28 @@ async function applyCompanionSkills(
       applied = true;
       continue;
     }
+    degraded = true;
     // Degraded, not fatal: the main channel install still works. Name the
     // skill and the exact re-apply command so the warning is actionable.
     p.log.warn(
       `Couldn't fully apply companion skill ${skill}. The ${channel} channel works, but the ` +
         `capability that skill adds stays degraded until you re-apply it: ` +
-        `pnpm exec tsx scripts/skill-apply.ts .claude/skills/${skill}`,
+        `pnpm exec tsx setup/lib/skill-driver.ts .claude/skills/${skill}`,
     );
   }
 
   if (!applied) return;
+  if (degraded) {
+    // A half-applied companion may have copied files and appended barrel
+    // imports before failing its build or tests — restarting could boot that
+    // state. The channel itself already works (its own restart ran before the
+    // companions), so hold the deferred restart until the operator repairs.
+    p.log.warn(
+      'Skipping the deferred service restart: a companion skill did not fully apply. ' +
+        'Re-apply it with the command above, then restart: bash setup/lib/restart.sh',
+    );
+    return;
+  }
   try {
     await (overrides.exec ?? hostExec(projectRoot))('bash setup/lib/restart.sh');
   } catch {
@@ -102,6 +176,8 @@ interface WireArgs {
   agentGroupId?: string;
   /** Explicit DM engage regex (e.g. WhatsApp shared-mode "@<name> only" self-chat). */
   engagePattern?: string;
+  /** Adapter instance registry key (e.g. telegram-mega) when the skill wired a named bot; unset = default instance. */
+  instance?: string;
 }
 
 export async function resolveAgentName(): Promise<string> {
@@ -123,15 +199,24 @@ async function initFirstAgent(args: WireArgs): Promise<boolean> {
     'init-first-agent',
     'pnpm',
     [
-      'exec', 'tsx', 'scripts/init-first-agent.ts',
-      '--channel', args.channel,
-      '--user-id', args.userId,
-      '--platform-id', args.platformId,
-      '--display-name', args.displayName,
-      '--agent-name', args.agentName,
-      '--role', args.role,
+      'exec',
+      'tsx',
+      'scripts/init-first-agent.ts',
+      '--channel',
+      args.channel,
+      '--user-id',
+      args.userId,
+      '--platform-id',
+      args.platformId,
+      '--display-name',
+      args.displayName,
+      '--agent-name',
+      args.agentName,
+      '--role',
+      args.role,
       ...(args.agentGroupId ? ['--agent-group-id', args.agentGroupId] : []),
       ...(args.engagePattern ? ['--engage-pattern', args.engagePattern] : []),
+      ...(args.instance ? ['--instance', args.instance] : []),
     ],
     { running: `Wiring ${args.agentName} to your ${args.channel} DMs…`, done: 'Agent wired.' },
     { extraFields: { CHANNEL: args.channel, AGENT_NAME: args.agentName, PLATFORM_ID: args.platformId } },
@@ -145,9 +230,9 @@ export interface ChannelSkillOverrides extends Partial<RunSkillOptions> {
   /** The shared wire; defaults to init-first-agent. Injectable for tests. */
   wire?: (args: WireArgs) => Promise<boolean> | boolean;
   /**
-   * Clears the persisted template pick once the wire consumed the stamped
-   * agent; defaults to the real .env writer (setup/templates.ts). Injectable
-   * so tests never touch the repo's .env.
+   * Clears any persisted template pick after a targeted wire. Modern setup
+   * clears it when the operator chooses an action; this remains idempotent for
+   * re-exec and direct-driver paths. Injectable so tests never touch .env.
    */
   clearTemplatePick?: () => void;
   /**
@@ -193,14 +278,15 @@ export async function runChannelSkill(
   // prompts past the skill run (only a fresh create resolves the wire inputs;
   // a drop-through re-run asks nothing).
   const askLater = overrides.wireIfResolved;
-  let agentName = askLater ? '' : overrides.agentName ?? (await resolveAgentName());
-  let role = askLater ? undefined : overrides.role ?? (await askOperatorRole(channel));
+  let agentName = askLater ? '' : (overrides.agentName ?? (await resolveAgentName()));
+  let role = askLater ? undefined : (overrides.role ?? (await askOperatorRole(channel)));
 
   // Channel-specific: install adapter, collect credentials, resolve the wire
   // inputs. The whole channel-specific procedure lives in the SKILL.md.
   const res = await runSkill(`.claude/skills/add-${channel}`, {
     projectRoot,
     exec: overrides.exec,
+    execStream: overrides.execStream,
     resolveInput: overrides.resolveInput,
     resolveRemote: overrides.resolveRemote,
     // The already-resolved agent name is pre-supplied so a skill that consumes
@@ -235,7 +321,10 @@ export async function runChannelSkill(
       writeFileSync(rawLog, res.agentTasks.map((t) => `## ${t.kind} (line ${t.line})\n${t.reason}\n`).join('\n'));
     }
     for (const t of res.agentTasks) {
-      const lines = t.reason.split('\n').map((l) => l.trim()).filter(Boolean);
+      const lines = t.reason
+        .split('\n')
+        .map((l) => l.trim())
+        .filter(Boolean);
       const more = lines.length > 1 ? ` (+${lines.length - 1} more lines in ${rawLog})` : '';
       p.log.warn(`Needs an agent (${t.kind}): ${lines[0] ?? t.reason}${more}`);
     }
@@ -296,15 +385,17 @@ export async function runChannelSkill(
     role: role!,
     agentGroupId: templateAgentGroupId,
     engagePattern: res.vars.engage_pattern || undefined,
+    instance: res.vars.instance || undefined,
   });
   if (!ok) {
-    await failWith('init-first-agent', `Couldn't finish connecting ${agentName}.`, 'You can retry later with `/init-first-agent`.');
+    await failWith(
+      'init-first-agent',
+      `Couldn't finish connecting ${agentName}.`,
+      'You can retry later with `/init-first-agent`.',
+    );
   }
-  // This wire is the seam that consumes the template pick: only now has the
-  // pick done its job. Clearing earlier (at stamp time) orphans the agent on
-  // a rerun after a failed channel step; never clearing makes every future
-  // setup run re-enter template setup. Pinned by run-channel-skill.test.ts
-  // ("clears the template pick…").
+  // Idempotently clear any legacy/re-exec template pick after the targeted
+  // wire succeeds. Pinned by run-channel-skill.test.ts.
   if (templateAgentGroupId) (overrides.clearTemplatePick ?? clearTemplatePick)();
 }
 

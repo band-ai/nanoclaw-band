@@ -39,8 +39,14 @@ export const createAgent: McpToolDefinition = {
     inputSchema: {
       type: 'object' as const,
       properties: {
-        name: { type: 'string', description: 'Human-readable name (also becomes your destination name for this agent)' },
-        instructions: { type: 'string', description: 'CLAUDE.md content for the new agent (personality, role, instructions)' },
+        name: {
+          type: 'string',
+          description: 'Human-readable name (also becomes your destination name for this agent)',
+        },
+        instructions: {
+          type: 'string',
+          description: 'CLAUDE.md content for the new agent (personality, role, instructions)',
+        },
       },
       required: ['name'],
     },
@@ -50,7 +56,7 @@ export const createAgent: McpToolDefinition = {
     if (!name) return err('name is required');
 
     const requestId = generateId();
-    writeMessageOut({
+    await writeMessageOut({
       id: requestId,
       kind: 'system',
       content: JSON.stringify({
