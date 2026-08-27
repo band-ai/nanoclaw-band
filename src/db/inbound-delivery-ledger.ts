@@ -45,22 +45,23 @@ function params(key: InboundDeliveryKey): Record<string, string> {
   };
 }
 
-export function getInboundDelivery(key: InboundDeliveryKey): InboundDeliveryRow | undefined {
-  return getDb()
-    .prepare(
-      `SELECT * FROM inbound_delivery_ledger
+export async function getInboundDelivery(key: InboundDeliveryKey): Promise<InboundDeliveryRow | undefined> {
+  return getDb().get<InboundDeliveryRow>(
+    `SELECT * FROM inbound_delivery_ledger
        WHERE channel_type = @channel_type
          AND platform_id = @platform_id
          AND platform_message_id = @platform_message_id`,
-    )
-    .get(params(key)) as InboundDeliveryRow | undefined;
+    params(key),
+  );
 }
 
-export function beginInboundDelivery(key: InboundDeliveryKey, threadId: string | null): InboundDeliveryRow {
+export async function beginInboundDelivery(
+  key: InboundDeliveryKey,
+  threadId: string | null,
+): Promise<InboundDeliveryRow> {
   const ts = now();
-  getDb()
-    .prepare(
-      `INSERT INTO inbound_delivery_ledger (
+  await getDb().run(
+    `INSERT INTO inbound_delivery_ledger (
          channel_type, platform_id, platform_message_id, thread_id, status,
          retryable, retry_count, first_seen, last_seen, updated_at
        ) VALUES (
@@ -76,20 +77,19 @@ export function beginInboundDelivery(key: InboundDeliveryKey, threadId: string |
            ELSE inbound_delivery_ledger.retry_count + 1
          END,
          updated_at = excluded.updated_at`,
-    )
-    .run({ ...params(key), thread_id: threadId, now: ts });
+    { ...params(key), thread_id: threadId, now: ts },
+  );
 
-  return getInboundDelivery(key)!;
+  return (await getInboundDelivery(key))!;
 }
 
-export function markInboundDeliveryPersisted(
+export async function markInboundDeliveryPersisted(
   key: InboundDeliveryKey,
   routed: { sessionIds: string[]; sessionMessageIds: string[] },
-): InboundDeliveryRow {
+): Promise<InboundDeliveryRow> {
   const ts = now();
-  getDb()
-    .prepare(
-      `UPDATE inbound_delivery_ledger SET
+  await getDb().run(
+    `UPDATE inbound_delivery_ledger SET
          status = 'persisted',
          reason = NULL,
          retryable = 0,
@@ -101,30 +101,29 @@ export function markInboundDeliveryPersisted(
        WHERE channel_type = @channel_type
          AND platform_id = @platform_id
          AND platform_message_id = @platform_message_id`,
-    )
-    .run({
+    {
       ...params(key),
       session_ids_json: JSON.stringify(routed.sessionIds),
       session_message_ids_json: JSON.stringify(routed.sessionMessageIds),
       now: ts,
-    });
+    },
+  );
 
-  return getInboundDelivery(key)!;
+  return (await getInboundDelivery(key))!;
 }
 
-export function markInboundDeliveryDropped(
+export async function markInboundDeliveryDropped(
   key: InboundDeliveryKey,
   drop: { reason: string; intentional: boolean; retryable?: boolean },
-): InboundDeliveryRow {
+): Promise<InboundDeliveryRow> {
   const ts = now();
   const status: InboundDeliveryStatus = drop.intentional
     ? 'intentionally_dropped'
     : drop.retryable
       ? 'retrying'
       : 'dead_lettered';
-  getDb()
-    .prepare(
-      `UPDATE inbound_delivery_ledger SET
+  await getDb().run(
+    `UPDATE inbound_delivery_ledger SET
          status = @status,
          reason = @reason,
          retryable = @retryable,
@@ -133,26 +132,25 @@ export function markInboundDeliveryDropped(
        WHERE channel_type = @channel_type
          AND platform_id = @platform_id
          AND platform_message_id = @platform_message_id`,
-    )
-    .run({
+    {
       ...params(key),
       status,
       reason: drop.reason,
       retryable: drop.retryable ? 1 : 0,
       now: ts,
-    });
+    },
+  );
 
-  return getInboundDelivery(key)!;
+  return (await getInboundDelivery(key))!;
 }
 
-export function markInboundDeliveryFailed(
+export async function markInboundDeliveryFailed(
   key: InboundDeliveryKey,
   failure: { reason: string; retryable: boolean; nextRetryAt?: string | null },
-): InboundDeliveryRow {
+): Promise<InboundDeliveryRow> {
   const ts = now();
-  getDb()
-    .prepare(
-      `UPDATE inbound_delivery_ledger SET
+  await getDb().run(
+    `UPDATE inbound_delivery_ledger SET
          status = @status,
          reason = @reason,
          retryable = @retryable,
@@ -162,24 +160,23 @@ export function markInboundDeliveryFailed(
        WHERE channel_type = @channel_type
          AND platform_id = @platform_id
          AND platform_message_id = @platform_message_id`,
-    )
-    .run({
+    {
       ...params(key),
       status: failure.retryable ? 'retrying' : 'terminal_failed',
       reason: failure.reason,
       retryable: failure.retryable ? 1 : 0,
       next_retry_at: failure.nextRetryAt ?? null,
       now: ts,
-    });
+    },
+  );
 
-  return getInboundDelivery(key)!;
+  return (await getInboundDelivery(key))!;
 }
 
-export function markInboundDeliveryProcessed(key: InboundDeliveryKey): InboundDeliveryRow {
+export async function markInboundDeliveryProcessed(key: InboundDeliveryKey): Promise<InboundDeliveryRow> {
   const ts = now();
-  getDb()
-    .prepare(
-      `UPDATE inbound_delivery_ledger SET
+  await getDb().run(
+    `UPDATE inbound_delivery_ledger SET
          status = 'processed',
          processed_at = @now,
          last_seen = @now,
@@ -187,10 +184,10 @@ export function markInboundDeliveryProcessed(key: InboundDeliveryKey): InboundDe
        WHERE channel_type = @channel_type
          AND platform_id = @platform_id
          AND platform_message_id = @platform_message_id`,
-    )
-    .run({ ...params(key), now: ts });
+    { ...params(key), now: ts },
+  );
 
-  return getInboundDelivery(key)!;
+  return (await getInboundDelivery(key))!;
 }
 
 export function canPlatformProcessFromLedger(row: InboundDeliveryRow | undefined): boolean {

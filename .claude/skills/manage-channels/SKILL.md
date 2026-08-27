@@ -110,25 +110,16 @@ The `register` step creates the agent group (reusing it if the folder already ex
 
 Omitted engage/policy fields default from the channel adapter's declaration (see "Channel Defaults" above). Optional overrides: `--trigger "<regex>"` (explicit engage pattern), `--engage-mode <pattern|mention|mention-sticky>`, `--is-group <true|false>`, `--unknown-sender-policy <strict|request_approval|public>`. Don't pick a mention mode on a channel whose declaration says `mentions: 'never'` — it can never engage there.
 
-When creating a NEW agent group on a non-default provider, append `--provider <name>` (e.g. `--provider codex`) — there is no install-wide default; existing groups switch via `ncl groups config update --provider` instead.
+New agent groups are created on the instance default provider (`DEFAULT_AGENT_PROVIDER` in `.env`, or `claude` when unset). To run a group on a different provider, switch it after creation with `ncl groups config update --provider <name>` (e.g. `codex`).
 
 For separate agents, also ask for a folder name and optionally a different assistant name.
 
 ## Add Channel Group
 
-When adding another group/chat on an already-configured platform (e.g. a second Telegram group):
-
-1. **Telegram:** ask the isolation question first to determine intent (`wire-to:<folder>` for an existing agent, `new-agent:<folder>` for a fresh one). Run `pnpm exec tsx setup/index.ts --step pair-telegram -- --intent <intent>`, show the `CODE` from the `PAIR_TELEGRAM_CODE` status block, and tell the user to post `@<botname> CODE` in the target group (or DM the bot for a private chat). Wait for the final `PAIR_TELEGRAM` block. The inbound interceptor has already created the `messaging_groups` row stamped with the Telegram adapter's declared policy (`request_approval` on current adapter copies; `strict` only on stale pre-declaration copies) and upserted the paired user — `register` only needs to add the wiring:
-
-   ```bash
-   pnpm exec tsx setup/index.ts --step register -- \
-     --platform-id "<PLATFORM_ID>" --name "<group-name>" \
-     --folder "<folder>" --channel "telegram" \
-     --session-mode "<shared|agent-shared|per-thread>" \
-     --assistant-name "<name>"
-   ```
-
-2. **Other channels:** read the channel's SKILL.md `## Channel Info` for terminology and how-to-find-id. Ask for the new group/chat ID, ask the isolation question, then register.
+When adding another group/chat on an already-configured platform, open
+`.claude/skills/add-<channel>/SKILL.md`, follow its current group-discovery
+instructions, ask the isolation question, then register. Channel-specific
+procedures belong in that channel's skill, not here.
 
 ## Change Wiring
 

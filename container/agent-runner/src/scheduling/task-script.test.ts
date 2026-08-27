@@ -7,13 +7,13 @@
  *   (gated → plain 'completed': the monitor working as designed).
  *
  * The host leg (ack → FAILED run → streak backoff) is pinned in
- * src/db/session-db.test.ts and src/modules/scheduling/recurrence.test.ts —
+ * the host SQLite driver tests and src/modules/scheduling/recurrence.test.ts —
  * both sides pin the literal 'script-skip:error'; if either renames it, its
  * own test goes red.
  */
 import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
 
-import { initTestSessionDb, closeSessionDb, getInboundDb, getOutboundDb } from '../db/connection.js';
+import { initTestSessionDb, closeSessionDb, getInboundDb, getOutboundDb } from '../mailbox/sqlite/connection.js';
 import { getPendingMessages, markScriptSkipped } from '../db/messages-in.js';
 import { applyPreTaskScripts } from './task-script.js';
 
@@ -35,8 +35,11 @@ function insertTask(id: string, script: string) {
 }
 
 const ackStatus = (id: string): string | undefined =>
-  (getOutboundDb().prepare('SELECT status FROM processing_ack WHERE message_id = ?').get(id) as { status: string } | undefined)
-    ?.status;
+  (
+    getOutboundDb().prepare('SELECT status FROM processing_ack WHERE message_id = ?').get(id) as
+      | { status: string }
+      | undefined
+  )?.status;
 
 describe('script-skip ack chain (container leg)', () => {
   it('an erroring script skips with reason "error" and acks script-skip:error', async () => {

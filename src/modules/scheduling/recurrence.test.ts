@@ -10,8 +10,9 @@ import fs from 'fs';
 import path from 'path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
-import { ensureSchema, openInboundDb } from '../../db/session-db.js';
-import { insertTaskRow } from './db.js';
+import { ensureSchema, openInboundDb } from '../../mailbox/sqlite/session-db.js';
+import { insertTaskRow } from '../../mailbox/sqlite/tasks.js';
+import { wrapSqliteInbound } from '../../mailbox/sqlite/index.js';
 import { handleRecurrence, scriptBackoffMinutes } from './recurrence.js';
 import type { Session } from '../../types.js';
 
@@ -19,8 +20,22 @@ import type { Session } from '../../types.js';
 // Asia/Tokyo is UTC+9 with no DST: "0 9 * * *" must land at 00:00:00Z sharp.
 vi.mock('../../config.js', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../../config.js')>();
-  return { ...actual, TIMEZONE: 'Asia/Tokyo' };
+  return { ...actual, TIMEZONE: 'Asia/Tokyo', GROUPS_DIR: '/tmp/nanoclaw-recurrence-test/groups' };
 });
+
+// The auto-pause note goes through the shared appendRunLog helper, which
+// resolves the group folder from the central DB — mock it to a fixed folder.
+vi.mock('../../db/agent-groups.js', () => ({
+  getAgentGroup: (id: string) => (id === 'ag-test' ? { id, folder: 'g-test' } : undefined),
+}));
+
+// resolveGroupTimezone reads the group's config row from the central DB
+// (not initialized here). Default: no override → falls back to the mocked
+// install TIMEZONE; individual tests set an override to test precedence.
+const containerConfigState = vi.hoisted(() => ({ timezone: null as string | null }));
+vi.mock('../../db/container-configs.js', () => ({
+  getContainerConfig: () => ({ timezone: containerConfigState.timezone }),
+}));
 
 const TEST_DIR = '/tmp/nanoclaw-recurrence-test';
 const DB_PATH = path.join(TEST_DIR, 'inbound.db');
@@ -46,6 +61,7 @@ function fakeSession(): Session {
 }
 
 afterEach(() => {
+  containerConfigState.timezone = null;
   if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
 });
 
@@ -61,7 +77,7 @@ describe('handleRecurrence', () => {
     });
     db.prepare(`UPDATE messages_in SET status='completed' WHERE id='task-1'`).run();
 
-    await handleRecurrence(db, fakeSession());
+    await handleRecurrence(wrapSqliteInbound(db), fakeSession());
 
     const rows = db
       .prepare(`SELECT id, status, process_after, recurrence, series_id FROM messages_in ORDER BY seq`)
@@ -93,14 +109,36 @@ describe('handleRecurrence', () => {
     });
     db.prepare(`UPDATE messages_in SET status='completed' WHERE id='task-tz'`).run();
 
-    await handleRecurrence(db, fakeSession());
+    await handleRecurrence(wrapSqliteInbound(db), fakeSession());
 
     const follow = db.prepare(`SELECT process_after FROM messages_in WHERE id != 'task-tz'`).get() as {
       process_after: string;
     };
-    // Drop the `{ tz: TIMEZONE }` option in recurrence.ts and this reads
+    // Drop the `{ tz }` option in recurrence.ts and this reads
     // T09:00:00 (09:00 UTC) instead — red, even on a UTC CI runner.
     expect(follow.process_after).toMatch(/T00:00:00/);
+  });
+
+  it('re-arms in the group timezone override, not the install TIMEZONE', async () => {
+    // Install tz is pinned to Asia/Tokyo above; the group override must win.
+    // Asia/Kolkata is UTC+5:30 with no DST: 09:00 local === 03:30 UTC, exactly.
+    containerConfigState.timezone = 'Asia/Kolkata';
+    const db = freshDb();
+    insertTaskRow(db, {
+      id: 'task-group-tz',
+      seriesId: 'task-group-tz',
+      processAfter: '2020-01-01T00:00:00.000Z',
+      recurrence: '0 9 * * *',
+      content: JSON.stringify({ prompt: 'daily digest' }),
+    });
+    db.prepare(`UPDATE messages_in SET status='completed' WHERE id='task-group-tz'`).run();
+
+    await handleRecurrence(wrapSqliteInbound(db), fakeSession());
+
+    const follow = db.prepare(`SELECT process_after FROM messages_in WHERE id != 'task-group-tz'`).get() as {
+      process_after: string;
+    };
+    expect(follow.process_after).toMatch(/T03:30:00/);
   });
 
   it('does not clone rows whose recurrence is already cleared', async () => {
@@ -114,7 +152,7 @@ describe('handleRecurrence', () => {
     });
     db.prepare(`UPDATE messages_in SET status='completed' WHERE id='task-1'`).run();
 
-    await handleRecurrence(db, fakeSession());
+    await handleRecurrence(wrapSqliteInbound(db), fakeSession());
 
     const count = (db.prepare(`SELECT COUNT(*) AS c FROM messages_in`).get() as { c: number }).c;
     expect(count).toBe(1);
@@ -158,7 +196,7 @@ describe('handleRecurrence — script-failure backoff (streak derived from faile
   it('pushes the clone past raw cron cadence while the script is failing', async () => {
     const db = freshDb();
     seedFailedStreak(db, 3); // streak 3 → backoff 8 min; cron next ≈ +1 min
-    await handleRecurrence(db, fakeSession());
+    await handleRecurrence(wrapSqliteInbound(db), fakeSession());
 
     const next = clone(db);
     expect(next.status).toBe('pending');
@@ -169,7 +207,7 @@ describe('handleRecurrence — script-failure backoff (streak derived from faile
   it('a healthy series (trailing run completed) re-arms on the raw cron grid', async () => {
     const db = freshDb();
     seedFailedStreak(db, 0);
-    await handleRecurrence(db, fakeSession());
+    await handleRecurrence(wrapSqliteInbound(db), fakeSession());
 
     const next = clone(db);
     expect(next.status).toBe('pending');
@@ -180,7 +218,7 @@ describe('handleRecurrence — script-failure backoff (streak derived from faile
   it('auto-pauses the series at the cap instead of re-arming', async () => {
     const db = freshDb();
     const liveId = seedFailedStreak(db, 8);
-    await handleRecurrence(db, fakeSession());
+    await handleRecurrence(wrapSqliteInbound(db), fakeSession());
 
     const next = clone(db);
     expect(next.status).toBe('paused'); // `ncl tasks resume` revives in place
@@ -189,5 +227,19 @@ describe('handleRecurrence — script-failure backoff (streak derived from faile
       recurrence: string | null;
     };
     expect(original.recurrence).toBeNull(); // not re-cloned next sweep
+  });
+
+  it('writes the auto-pause note into the series run log via the shared appendRunLog', async () => {
+    const db = freshDb();
+    seedFailedStreak(db, 8);
+    await handleRecurrence(wrapSqliteInbound(db), fakeSession());
+
+    // Same file + format appendRunLog owns: groups/<folder>/tasks/<series>.md
+    const logFile = path.join(TEST_DIR, 'groups', 'g-test', 'tasks', 'task-s-0.md');
+    expect(fs.existsSync(logFile)).toBe(true);
+    const content = fs.readFileSync(logFile, 'utf8');
+    expect(content).toContain('auto-paused after 8 consecutive script failures');
+    expect(content).toContain('ncl tasks resume task-s-0');
+    expect(content).toMatch(/^\d{4}-\d{2}-\d{2} \d{2}:\d{2} — /m); // appendRunLog's local-time stamp
   });
 });

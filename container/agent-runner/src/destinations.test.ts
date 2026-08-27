@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it } from 'bun:test';
 
-import { closeSessionDb, getInboundDb, initTestSessionDb } from './db/connection.js';
+import { closeSessionDb, getInboundDb, initTestSessionDb } from './mailbox/sqlite/connection.js';
 import { buildSystemPromptAddendum } from './destinations.js';
 
 beforeEach(() => {
@@ -59,5 +59,18 @@ describe('buildSystemPromptAddendum — multi-destination routing guidance', () 
     expect(prompt).toContain('<message to="name">');
     expect(prompt).toContain('default to addressing the destination it came `from`');
     expect(prompt).toContain('`casa`');
+  });
+
+  it('gives task sessions only explicit-tool delivery instructions', () => {
+    seedDestination('casa', 'Casa', 'whatsapp', 'group-1@g.us');
+
+    const prompt = buildSystemPromptAddendum('Casa', { kind: 'task', taskId: 'daily-briefing-a25c' });
+
+    expect(prompt).toContain('isolated task run');
+    expect(prompt).toContain('send_message({ to: "name"');
+    expect(prompt).toContain('tasks/daily-briefing-a25c.md');
+    expect(prompt).toContain('Only notify someone when the task asks');
+    expect(prompt).not.toContain('<message to=');
+    expect(prompt).not.toContain('default to addressing');
   });
 });

@@ -12,7 +12,7 @@ Last updated: 2026-07-10
 - Scheduling MCP tools emit system actions via messages_out; host applies them to inbound.db in `delivery.ts:handleSystemAction()`
 - Host sweep reads `processing_ack` table + heartbeat file mtime for stale detection
 - Container clears stale `processing_ack` entries on startup (crash recovery)
-- Files: `src/db/schema.ts` (INBOUND_SCHEMA + OUTBOUND_SCHEMA), `src/session-manager.ts`, `src/delivery.ts`, `src/host-sweep.ts`, `container/agent-runner/src/db/connection.ts`, `messages-in.ts`, `messages-out.ts`, `poll-loop.ts`, `mcp-tools/scheduling.ts`, `mcp-tools/interactive.ts`
+- Files: `src/mailbox/sqlite/schema.ts`, `src/session-manager.ts`, `src/delivery.ts`, `src/host-sweep.ts`, `container/agent-runner/src/mailbox/sqlite/connection.ts`, `db/messages-in.ts`, `db/messages-out.ts`, `poll-loop.ts`, `mcp-tools/scheduling.ts`, `mcp-tools/interactive.ts`
 - Container image rebuilt with tsconfig (`container/agent-runner/tsconfig.json`)
 - E2E verified: host → Docker container → agent responds → "E2E works!" ✓
 
@@ -42,7 +42,7 @@ Each adapter declares its own wiring-time defaults (`ChannelDefaults`, see [api-
 1. **Adapter declaration** — a static const in the adapter module (and its `ChannelRegistration`, so offline scripts resolve it without credentials). Adapters are skill-installed and user-owned; install-wide changes mean editing the adapter copy. No DB config table.
 2. **Per-wiring override** — the explicit value chosen at creation (`ncl` flag, wizard answer, card-flow value), stored on the row. Existing rows are never re-resolved; declarations are consulted only at creation, except threading, which stays live via `messaging_group_agents.threads` (`NULL` = inherit).
 
-All creation paths (`ncl wirings`/`messaging-groups`, `setup/register.ts`, the router's auto-create, the channel-approval card flow, bootstrap scripts) go through the shared helpers in `src/channels/channel-defaults.ts`, so a platform's defaults are declared once and apply everywhere.
+All creation paths (`ncl wirings`/`messaging-groups`, `setup/register.ts`, the router's auto-create, the channel-approval card flow, the bootstrap scripts `scripts/init-first-agent.ts` / `scripts/init-cli-agent.ts`) go through the shared helpers in `src/channels/channel-defaults.ts`, so a platform's defaults are declared once and apply everywhere.
 
 **Shared-identity pattern.** When the platform identity the adapter connects as belongs to a human (WhatsApp shared-number mode: `ASSISTANT_HAS_OWN_NUMBER` unset), the adapter itself suppresses mention signals — it never sets `isMention` and declares `mentions: 'never'`, group defaults of a name-pattern (`\b{name}\b`) and `strict` sender policy. With no mention signal, the router never auto-creates messaging groups or fires approval cards for the human's own conversations — the spam dies at the source, with zero core conditionals. The pattern is entirely channel-local and reusable by any adapter riding a personal identity (iMessage, Signal) with no core involvement.
 
@@ -110,5 +110,6 @@ Channel adapter → routeInbound() → resolve messaging_group → resolve agent
 | `src/host-sweep.ts` | Syncs processing_ack, stale detection, recurrence |
 | `src/container-runner.ts` | Spawns containers, OneCLI ensureAgent + applyContainerConfig |
 | `setup/register.ts` | Creates entities (agent_group, messaging_group, wiring) |
+| `setup/templates.ts` | Template discovery + first-agent stamping through `ncl groups create --template` |
 | `setup/verify.ts` | Checks central DB for registered groups |
-| `container/agent-runner/src/db/connection.ts` | Two-DB connection layer (inbound read-only, outbound read-write) |
+| `container/agent-runner/src/mailbox/sqlite/connection.ts` | SQLite driver's two-DB connection layer |

@@ -13,6 +13,9 @@ on:
     branches: [band/adapter]
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
   payload-is-additive:
     runs-on: ubuntu-latest
