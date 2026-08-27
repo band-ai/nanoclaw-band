@@ -1,16 +1,44 @@
 name: Sync main with upstream NanoClaw
 
 # Keep this fork's main current with upstream nanocoai/nanoclaw. Every 4 hours
-# (or manual dispatch), merge upstream main into main and push.
+# (or manual dispatch): measure drift, try the merge, validate it, push main —
+# and when any of that can't happen, hand a human an owned, reviewable PR.
+#
+# Three hard-won constraints shape this job; changing it without them in mind
+# will re-break it:
+#
+# 1. WE CANNOT PUSH ANY REF THAT CARRIES UPSTREAM WORKFLOW CHANGES. `workflows`
+#    is not a key in the Actions `permissions:` vocabulary, so GITHUB_TOKEN can
+#    never be granted it; upstream ships .github/workflows/*, so the moment an
+#    upstream merge touches those files EVERY push of it is rejected with
+#    "refusing to allow a GitHub App to create or update workflow ... without
+#    workflows permission" — sync branch AND main alike. (The Jul 1-4 auto-syncs
+#    only worked because those merges happened not to touch workflow files; the
+#    Jul 13 one that did had to be pushed by a human.) There is no REST detour:
+#    POST /git/refs, PATCH /git/refs/{ref} and PUT /contents/{path} all require
+#    the same permission. So the push is BEST-EFFORT, never load-bearing.
+#
+# 2. THE ESCALATION MUST NOT SHARE A FAILURE MODE WITH THE WORK. The previous
+#    version pushed a sync branch and then opened a PR from it, under
+#    `set -euo pipefail` — so the rejected push killed the step before
+#    `gh pr create`, and 40 consecutive runs produced no branch, no PR and no
+#    assignee. This version opens the PR with the head in the PARENT repo
+#    (head=<upstream owner>:<ref>), so no ref is ever created here and the
+#    escalation path touches nothing that can be permission-denied. It must be
+#    issued via `gh api` — `gh pr create --head org:branch` rejects an
+#    organization-owned head (cli/cli#10093).
+#
+# 3. GREEN != CURRENT. A job that no-ops silently is worse than one that fails
+#    loudly, so the verdict step fails on STALENESS (commits behind / age of the
+#    newest upstream commit we contain) independently of whether the merge step
+#    exited 0. Prior art: a comparable fork's monitor stayed green for five
+#    months while a full release behind.
 #
 # Unlike band/adapter — a purely additive overlay that never conflicts and so is
 # pushed directly by sync-band-adapter.yml — main carries the fork's own changes
 # to core (the Band seams), so an upstream merge CAN conflict. Two-tier policy:
 #   - trivially-safe paths auto-resolve via .gitattributes (union / take-upstream)
-#   - a real conflict in a core seam is NEVER auto-resolved: the job opens (or
-#     refreshes) a PR of upstream -> main, requests review from the integrations
-#     team, assigns the owner, leaves main untouched, and FAILS RED so the
-#     conflict is noticed. Resolve by hand, then push main.
+#   - a real conflict in a core seam is NEVER auto-resolved
 #
 # ci.yml runs only on PRs, so a direct push to main gets no CI. To avoid landing a
 # clean-but-broken merge, this job build+tests the merged result (the same checks
@@ -40,6 +68,7 @@ concurrency:
 permissions:
   contents: write
   pull-requests: write
+  issues: write
 
 jobs:
   sync-main:
@@ -49,9 +78,13 @@ jobs:
       UPSTREAM_REPO: nanocoai/nanoclaw
       UPSTREAM_REF: ${{ github.event.inputs.upstream_ref || 'main' }}
       DRY_RUN: ${{ github.event.inputs.dry_run || 'false' }}
-      # Where a conflict PR routes for manual resolution.
+      # Where an escalation PR routes for manual resolution.
       REVIEW_TEAM: band-ai/integrations
       CONFLICT_ASSIGNEE: nir-singher-band
+      # Staleness alarm. Exceeding either fails the run even if nothing errored,
+      # so a sync that quietly stops adopting upstream cannot read as healthy.
+      MAX_BEHIND_COMMITS: '200'
+      MAX_BASELINE_AGE_DAYS: '14'
     steps:
       - name: Check out fork main
         uses: actions/checkout@v4
@@ -66,11 +99,11 @@ jobs:
           git config user.name  "upstream-sync[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-      - name: Merge upstream into main (auto-adopt safe paths; PR on real conflict)
-        id: merge
+      # Read-only. Touches no refs, so it cannot fail for permission reasons and
+      # always produces the numbers the verdict step judges.
+      - name: Measure drift against upstream
+        id: drift
         shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           git remote add upstream "https://github.com/${UPSTREAM_REPO}.git" 2>/dev/null \
@@ -78,14 +111,44 @@ jobs:
           git fetch --no-tags upstream "${UPSTREAM_REF}"
           BASE="upstream/${UPSTREAM_REF}"
 
-          # Already current? nothing to do.
           behind=$(git rev-list --count "HEAD..${BASE}")
-          if [ "$behind" -eq 0 ]; then
+          ahead=$(git rev-list --count "${BASE}..HEAD")
+          # Newest upstream commit we already contain; its age is how stale our
+          # baseline is, independent of how many commits that represents.
+          baseline=$(git merge-base HEAD "$BASE")
+          baseline_ts=$(git log -1 --format=%ct "$baseline")
+          baseline_age_days=$(( ( $(date -u +%s) - baseline_ts ) / 86400 ))
+
+          stale=false
+          if [ "$behind" -gt "$MAX_BEHIND_COMMITS" ] || [ "$baseline_age_days" -gt "$MAX_BASELINE_AGE_DAYS" ]; then
+            stale=true
+          fi
+
+          {
+            echo "behind=${behind}"
+            echo "ahead=${ahead}"
+            echo "baseline=$(git rev-parse --short "$baseline")"
+            echo "baseline_age_days=${baseline_age_days}"
+            echo "base_sha=$(git rev-parse --short "$BASE")"
+            echo "stale=${stale}"
+          } >> "$GITHUB_OUTPUT"
+
+          echo "main is ${behind} behind / ${ahead} ahead of ${BASE}; baseline is ${baseline_age_days} day(s) old."
+
+      # Never fails the run: records an outcome the later steps branch on, so a
+      # conflict can no longer prevent its own escalation.
+      - name: Merge upstream into main (auto-adopt safe paths)
+        id: merge
+        shell: bash
+        env:
+          BEHIND: ${{ steps.drift.outputs.behind }}
+        run: |
+          set -uo pipefail
+          if [ "$BEHIND" -eq 0 ]; then
             echo "main already contains ${UPSTREAM_REPO}@${UPSTREAM_REF} — nothing to sync."
             echo "status=uptodate" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          echo "main is ${behind} commit(s) behind ${BASE} — merging it in."
 
           # Register the custom driver referenced by .gitattributes: `theirs`
           # unconditionally takes the upstream side for generated artifacts the
@@ -95,57 +158,19 @@ jobs:
           # auto-resolved; those need human judgment.
           git config merge.theirs.driver 'cp -f %B %A'
 
-          # Auto-adopt the safe paths; a real conflict is anything left over.
-          if git merge --no-edit "$BASE"; then
+          if git merge --no-edit "upstream/${UPSTREAM_REF}"; then
             echo "status=merged" >> "$GITHUB_OUTPUT"
-            echo "base_sha=$(git rev-parse --short "$BASE")" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
-          # Real conflict in a fork seam. Leave main untouched, but surface an
-          # actionable PR instead of a silent failure. Idempotent across the
-          # schedule: one branch (auto/upstream-sync = upstream's tip), one open
-          # PR reused (commented) until a human resolves and pushes main.
-          conflicts=$(git diff --name-only --diff-filter=U | sed 's/^/- /')
+          {
+            echo 'conflicts<<CONFLICTS_EOF'
+            git diff --name-only --diff-filter=U | sed 's/^/- /'
+            echo 'CONFLICTS_EOF'
+          } >> "$GITHUB_OUTPUT"
           git merge --abort || true
-          # Record the conflict state before any routing step can fail — the
-          # always-run Summary keys off this, and a red exit must never read as
-          # "up to date".
           echo "status=conflict" >> "$GITHUB_OUTPUT"
-          SYNC_BRANCH="auto/upstream-sync"
-          git push -f origin "${BASE}:refs/heads/${SYNC_BRANCH}"
-          short=$(git rev-parse --short "$BASE")
-          body=$(printf '%s\n' \
-            "Automatic upstream sync of \`${UPSTREAM_REPO}@${UPSTREAM_REF}\` (\`${short}\`) hit conflicts and left \`main\` untouched." \
-            "" \
-            "**Conflicting files:**" \
-            "${conflicts}" \
-            "" \
-            "Resolve locally, then this PR auto-closes when main catches up:" \
-            '```' \
-            "git fetch origin upstream && git checkout main && git pull" \
-            "git merge upstream/${UPSTREAM_REF}   # resolve, run the CI gate, commit" \
-            "git push origin main" \
-            '```')
-          existing=$(gh pr list --head "$SYNC_BRANCH" --base main --state open --json number -q '.[0].number' || true)
-          if [ -z "$existing" ]; then
-            gh pr create --head "$SYNC_BRANCH" --base main \
-              --title "⚠️ Upstream sync needs manual resolution" --body "$body" \
-              --reviewer "$REVIEW_TEAM" --assignee "$CONFLICT_ASSIGNEE" || true
-            existing=$(gh pr list --head "$SYNC_BRANCH" --base main --state open --json number -q '.[0].number' || true)
-          else
-            # Keep the routing sticky on the already-open PR, then ping it.
-            gh pr edit "$existing" --add-reviewer "$REVIEW_TEAM" --add-assignee "$CONFLICT_ASSIGNEE" || true
-            gh pr comment "$existing" --body "$body" || true
-          fi
-          echo "conflict_pr=${existing}" >> "$GITHUB_OUTPUT"
-
-          # Fail the run on purpose: a red job is the notification that a conflict
-          # happened. The PR (assigned to ${CONFLICT_ASSIGNEE}, review requested
-          # from ${REVIEW_TEAM}) is the actionable artifact; main is untouched
-          # either way.
-          echo "::error::Upstream merge conflicts — opened/updated PR ${SYNC_BRANCH} → main (assignee ${CONFLICT_ASSIGNEE}, review ${REVIEW_TEAM}); main left untouched."
-          exit 1
+          echo "::warning::Upstream merge conflicts in fork seams — main left untouched; escalating to a PR."
 
       - name: Set up pnpm
         if: steps.merge.outputs.status == 'merged'
@@ -164,8 +189,13 @@ jobs:
         with:
           bun-version: 1.3.12
 
+      # continue-on-error so a red gate still reaches the escalation below. The
+      # verdict step branches on `.outcome`, never `.conclusion` — a
+      # continue-on-error step reports conclusion=success even when it failed.
       - name: Validate merged main (same checks as ci.yml)
+        id: gate
         if: steps.merge.outputs.status == 'merged'
+        continue-on-error: true
         shell: bash
         run: |
           set -euo pipefail
@@ -177,42 +207,254 @@ jobs:
           pnpm exec vitest run
           ( cd container/agent-runner && bun test )
 
+      # Best-effort by design (constraint 1): rejected when the merge carries
+      # upstream workflow-file changes. A rejection is recorded, not fatal — the
+      # PR below then becomes the path a human uses to land it.
       - name: Push main
-        if: steps.merge.outputs.status == 'merged' && env.DRY_RUN != 'true'
+        id: push
+        if: steps.merge.outputs.status == 'merged' && steps.gate.outcome == 'success' && env.DRY_RUN != 'true'
         shell: bash
+        env:
+          BASE_SHA: ${{ steps.drift.outputs.base_sha }}
         run: |
-          set -euo pipefail
+          set -uo pipefail
           # Fast-forward of main (we started at main and added a merge commit).
           # If main moved meanwhile the non-FF push is rejected; the next run retries.
-          git push origin HEAD:main
-          echo "main synced to ${UPSTREAM_REPO}@${UPSTREAM_REF} (${{ steps.merge.outputs.base_sha }})."
+          if git push origin HEAD:main; then
+            echo "pushed=true" >> "$GITHUB_OUTPUT"
+            echo "main synced to ${UPSTREAM_REPO}@${UPSTREAM_REF} (${BASE_SHA})."
+          else
+            echo "pushed=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::Pushing merged main was rejected — escalating to a PR instead."
+          fi
 
-      - name: Summary
+      # The escalation. It must reach a human without pushing a ref (constraint 2)
+      # and without depending on a credential we don't have. Two channels, tried in
+      # order, each unlocked by a different single admin toggle:
+      #
+      #   1. an Issue — needs Issues enabled on this fork (forks default to off).
+      #      Issue creation is NOT subject to the Actions pull-request policy, which
+      #      is why the prior art that actually stays green escalates this way.
+      #   2. a cross-repo PR with the head in the PARENT repo (head=<owner>:<ref>),
+      #      which creates no ref here — needs "Allow GitHub Actions to create and
+      #      approve pull requests" (Settings -> Actions -> General). Observed 403
+      #      "GitHub Actions is not permitted to create or approve pull requests"
+      #      on 2026-08-12, so this is currently the closed door.
+      #
+      # If neither is available the run says exactly which toggle to flip rather
+      # than failing anonymously. Both channels are idempotent: one open artifact,
+      # refreshed with a comment instead of duplicated.
+      - name: Escalate to a human (Issue, else cross-repo PR)
+        id: escalate
+        if: always() && steps.merge.outputs.status != 'uptodate' && steps.push.outputs.pushed != 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          # Step outputs arrive as env vars, never interpolated into the script:
+          # `conflicts` is multiline, and inline ${{ }} would splice raw text into
+          # the shell source.
+          MERGE_STATUS: ${{ steps.merge.outputs.status }}
+          GATE_OUTCOME: ${{ steps.gate.outcome }}
+          CONFLICTS: ${{ steps.merge.outputs.conflicts }}
+          BASE_SHA: ${{ steps.drift.outputs.base_sha }}
+          BEHIND: ${{ steps.drift.outputs.behind }}
+          AHEAD: ${{ steps.drift.outputs.ahead }}
+          BASELINE: ${{ steps.drift.outputs.baseline }}
+          BASELINE_AGE_DAYS: ${{ steps.drift.outputs.baseline_age_days }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -uo pipefail
+          UPSTREAM_OWNER="${UPSTREAM_REPO%%/*}"
+          HEAD_REF="${UPSTREAM_OWNER}:${UPSTREAM_REF}"
+
+          case "$MERGE_STATUS" in
+            conflict) reason="hit conflicts in fork seams, so \`main\` was left untouched" ;;
+            merged)
+              if [ "$GATE_OUTCOME" != "success" ]; then
+                reason="merged cleanly but FAILED the pre-push gate (build/format/typecheck/tests)"
+              else
+                reason="merged cleanly and passed the gate, but pushing \`main\` was rejected (a merge carrying upstream workflow-file changes cannot be pushed by this job — see the header of upstream-sync.yml)"
+              fi
+              ;;
+            *) reason="did not complete — see the job log" ;;
+          esac
+
+          body=$(printf '%s\n' \
+            "Automatic sync of \`${UPSTREAM_REPO}@${UPSTREAM_REF}\` (\`${BASE_SHA}\`) ${reason}." \
+            "" \
+            "- \`main\` is **${BEHIND} behind / ${AHEAD} ahead** of upstream" \
+            "- newest upstream commit we contain: \`${BASELINE}\` (**${BASELINE_AGE_DAYS} day(s)** old)" \
+            "- run: ${RUN_URL}" \
+            "" \
+            "**Conflicting files:**" \
+            "${CONFLICTS:-- (none — see the reason above)}" \
+            "" \
+            "Resolve locally and push \`main\` (this artifact only reports — the merge cannot be landed from it):" \
+            '```' \
+            "git fetch upstream && git checkout main && git pull" \
+            "git merge upstream/${UPSTREAM_REF}   # resolve, run the CI gate, commit" \
+            "git push origin main" \
+            '```' \
+            "" \
+            "Once \`main\` contains upstream's tip the next run closes this automatically.")
+
+          TITLE="⚠️ Upstream sync needs manual resolution"
+          channel=none
+          ref=''
+
+          # --- channel 1: Issue -------------------------------------------------
+          if [ "$(gh api "repos/${GITHUB_REPOSITORY}" --jq '.has_issues' 2>/dev/null)" = "true" ]; then
+            ref=$(gh issue list --state open --limit 100 --search "\"${TITLE}\" in:title" \
+              --json number --jq '.[0].number' 2>/dev/null || true)
+            if [ -z "$ref" ] || [ "$ref" = "null" ]; then
+              ref=$(gh issue create --title "$TITLE" --body "$body" \
+                --assignee "$CONFLICT_ASSIGNEE" 2>/dev/null | sed 's#.*/##') || ref=''
+              [ -n "$ref" ] && echo "Opened issue #${ref}."
+            else
+              gh issue comment "$ref" --body "$body" >/dev/null \
+                && echo "Refreshed issue #${ref}." || ref=''
+            fi
+            [ -n "$ref" ] && channel=issue
+          else
+            echo "Issues are disabled on ${GITHUB_REPOSITORY} — skipping the issue channel."
+          fi
+
+          # --- channel 2: cross-repo PR ----------------------------------------
+          if [ "$channel" = "none" ]; then
+            ref=$(gh api "repos/${GITHUB_REPOSITORY}/pulls" -X GET \
+              -f state=open -f head="${HEAD_REF}" -f base=main --jq '.[0].number' 2>/dev/null || true)
+            if [ -z "$ref" ] || [ "$ref" = "null" ]; then
+              created=$(gh api "repos/${GITHUB_REPOSITORY}/pulls" -X POST \
+                -f title="$TITLE" -f head="${HEAD_REF}" -f base=main -f body="$body" \
+                --jq '.number' 2>&1) && { ref="$created"; echo "Opened PR #${ref} (${HEAD_REF} -> main)."; } || {
+                  echo "::warning::Could not open the upstream-sync PR: ${created}"
+                  ref=''
+                }
+            else
+              gh pr comment "$ref" --body "$body" >/dev/null \
+                && echo "Refreshed PR #${ref}." || ref=''
+            fi
+            if [ -n "$ref" ]; then
+              channel=pr
+              # Routing is advisory: never let a failed assignment hide the PR.
+              gh pr edit "$ref" --add-assignee "$CONFLICT_ASSIGNEE" \
+                || echo "::warning::Could not assign ${CONFLICT_ASSIGNEE} on PR #${ref}."
+              gh pr edit "$ref" --add-reviewer "$REVIEW_TEAM" \
+                || echo "::warning::Could not request review from ${REVIEW_TEAM} on PR #${ref}."
+            fi
+          fi
+
+          if [ "$channel" = "none" ]; then
+            echo "::error::No escalation channel available. Flip ONE of: enable Issues on ${GITHUB_REPOSITORY}, or allow GitHub Actions to create pull requests (Settings -> Actions -> General -> Workflow permissions)."
+          fi
+
+          {
+            echo "channel=${channel}"
+            echo "ref=${ref}"
+          } >> "$GITHUB_OUTPUT"
+
+      # Deterministic cleanup rather than relying on GitHub to notice: when main
+      # has caught up, close whichever escalation artifact is open.
+      - name: Close the escalation once main has caught up
+        if: always() && (steps.merge.outputs.status == 'uptodate' || steps.push.outputs.pushed == 'true')
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -uo pipefail
+          TITLE="⚠️ Upstream sync needs manual resolution"
+          note="main now contains \`${UPSTREAM_REPO}@${UPSTREAM_REF}\` — closing."
+          UPSTREAM_OWNER="${UPSTREAM_REPO%%/*}"
+
+          if [ "$(gh api "repos/${GITHUB_REPOSITORY}" --jq '.has_issues' 2>/dev/null)" = "true" ]; then
+            issue=$(gh issue list --state open --limit 100 --search "\"${TITLE}\" in:title" \
+              --json number --jq '.[0].number' 2>/dev/null || true)
+            if [ -n "$issue" ] && [ "$issue" != "null" ]; then
+              gh issue close "$issue" --comment "$note" || echo "::warning::Could not close issue #${issue}."
+            fi
+          fi
+
+          pr=$(gh api "repos/${GITHUB_REPOSITORY}/pulls" -X GET \
+            -f state=open -f head="${UPSTREAM_OWNER}:${UPSTREAM_REF}" -f base=main --jq '.[0].number' 2>/dev/null || true)
+          if [ -n "$pr" ] && [ "$pr" != "null" ]; then
+            gh pr close "$pr" --comment "$note" || echo "::warning::Could not close PR #${pr}."
+          fi
+
+
+      # Single place that decides red vs green, and names why. Runs last so every
+      # escalation has already happened.
+      - name: Verdict
         if: always()
         shell: bash
+        env:
+          MERGE_STATUS: ${{ steps.merge.outputs.status }}
+          GATE_OUTCOME: ${{ steps.gate.outcome }}
+          PUSHED: ${{ steps.push.outputs.pushed }}
+          CHANNEL: ${{ steps.escalate.outputs.channel }}
+          ESCALATION_REF: ${{ steps.escalate.outputs.ref }}
+          STALE: ${{ steps.drift.outputs.stale }}
+          BASE_SHA: ${{ steps.drift.outputs.base_sha }}
+          BEHIND: ${{ steps.drift.outputs.behind }}
+          AHEAD: ${{ steps.drift.outputs.ahead }}
+          BASELINE: ${{ steps.drift.outputs.baseline }}
+          BASELINE_AGE_DAYS: ${{ steps.drift.outputs.baseline_age_days }}
         run: |
+          set -uo pipefail
+          status="${MERGE_STATUS:-}"
+          gate="${GATE_OUTCOME:-}"
+          pushed="${PUSHED:-}"
+          channel="${CHANNEL:-}"
+          ref="${ESCALATION_REF:-}"
+          stale="${STALE:-}"
+          fail=''
+
           {
             echo "## Sync main with upstream"
             echo
-            echo "- Upstream: \`${UPSTREAM_REPO}@${UPSTREAM_REF}\`"
-            case "${{ steps.merge.outputs.status }}" in
-              merged)
-                echo "- Merged upstream \`${{ steps.merge.outputs.base_sha }}\` into main"
-                if [ "${DRY_RUN}" = "true" ]; then
-                  echo "- Dry run: validated, **not** pushed"
-                else
-                  echo "- Pushed to \`main\`"
-                fi
-                ;;
-              conflict)
-                echo "- ⚠️ Upstream merge hit conflicts — **main left untouched**"
-                echo "- Resolve via PR #${{ steps.merge.outputs.conflict_pr }} (assignee \`${CONFLICT_ASSIGNEE}\`, review \`${REVIEW_TEAM}\`)"
-                ;;
-              uptodate)
-                echo "- main already up to date — nothing to sync"
-                ;;
-              *)
-                echo "- ⚠️ Sync step did not complete — see job logs"
-                ;;
-            esac
+            echo "- Upstream: \`${UPSTREAM_REPO}@${UPSTREAM_REF}\` (\`${BASE_SHA}\`)"
+            echo "- Drift: **${BEHIND} behind / ${AHEAD} ahead**; baseline \`${BASELINE}\` is **${BASELINE_AGE_DAYS} day(s)** old"
           } >> "$GITHUB_STEP_SUMMARY"
+
+          case "$status" in
+            uptodate) echo "- main already up to date — nothing to sync" >> "$GITHUB_STEP_SUMMARY" ;;
+            merged)
+              if [ "$gate" != "success" ]; then
+                echo "- ❌ merged cleanly but the pre-push gate FAILED — main left untouched" >> "$GITHUB_STEP_SUMMARY"
+                fail="the merged tree fails the pre-push gate"
+              elif [ "$pushed" = "true" ]; then
+                echo "- ✅ merged, validated and pushed to \`main\`" >> "$GITHUB_STEP_SUMMARY"
+              elif [ "${DRY_RUN}" = "true" ]; then
+                echo "- merged and validated; dry run, **not** pushed" >> "$GITHUB_STEP_SUMMARY"
+              else
+                echo "- ⚠️ merged and validated, but the push to \`main\` was rejected" >> "$GITHUB_STEP_SUMMARY"
+                fail="the validated merge could not be pushed (needs a human, or a credential with the Workflows permission)"
+              fi
+              ;;
+            conflict)
+              echo "- ⚠️ conflicts in fork seams — **main left untouched**" >> "$GITHUB_STEP_SUMMARY"
+              fail="upstream merge conflicts need manual resolution"
+              ;;
+            *)
+              echo "- ⚠️ the merge step did not complete — see the job log" >> "$GITHUB_STEP_SUMMARY"
+              fail="the merge step did not complete"
+              ;;
+          esac
+
+          if [ -n "$ref" ] && [ "$channel" = "issue" ]; then
+            echo "- Tracked in issue #${ref} (assignee \`${CONFLICT_ASSIGNEE}\`)" >> "$GITHUB_STEP_SUMMARY"
+          elif [ -n "$ref" ] && [ "$channel" = "pr" ]; then
+            echo "- Tracked in PR #${ref} (assignee \`${CONFLICT_ASSIGNEE}\`, review \`${REVIEW_TEAM}\`)" >> "$GITHUB_STEP_SUMMARY"
+          elif [ -n "$fail" ] && [ "$status" != "uptodate" ]; then
+            echo "- ❌ **no escalation channel available** — enable Issues on this repo, or allow GitHub Actions to create pull requests (Settings → Actions → General)" >> "$GITHUB_STEP_SUMMARY"
+            fail="${fail}; and it could not be escalated to a human"
+          fi
+
+          if [ "$stale" = "true" ]; then
+            echo "- ❌ **stale**: over ${MAX_BEHIND_COMMITS} commits behind or a baseline older than ${MAX_BASELINE_AGE_DAYS} days" >> "$GITHUB_STEP_SUMMARY"
+            fail="${fail:+${fail}; }fork is stale beyond the alarm thresholds"
+          fi
+
+          if [ -n "$fail" ]; then
+            echo "::error::${fail}${ref:+ (${channel} #${ref})}"
+            exit 1
+          fi
