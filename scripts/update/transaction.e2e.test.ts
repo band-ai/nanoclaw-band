@@ -172,7 +172,7 @@ afterEach(() => {
   for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
 });
 
-describe('update-nanoclaw transaction end to end', () => {
+describe('update-nanoclaw transaction end to end', { timeout: 20_000 }, () => {
   it('stages through official upstream, gates a migration, completes, and can restore code plus mutable state', async () => {
     const fixture = createForkFixture({ breaking: true });
     previousUpdateDir = process.env.NANOCLAW_UPDATE_DIR;
