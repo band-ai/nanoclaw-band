@@ -92,6 +92,35 @@ function sessionCreationKey(
   return `route\0${agentGroupId}\0${messagingGroupId ?? ''}\0${sessionMode === 'shared' ? '' : (threadId ?? '')}`;
 }
 
+const sessionCreationLocks = new Map<string, Promise<void>>();
+
+async function withSessionCreationLock<T>(key: string, fn: () => Promise<T>): Promise<T> {
+  const previous = sessionCreationLocks.get(key) ?? Promise.resolve();
+  let release!: () => void;
+  const current = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const tail = previous.then(() => current);
+  sessionCreationLocks.set(key, tail);
+  await previous;
+  try {
+    return await fn();
+  } finally {
+    release();
+    if (sessionCreationLocks.get(key) === tail) sessionCreationLocks.delete(key);
+  }
+}
+
+function sessionCreationKey(
+  agentGroupId: string,
+  messagingGroupId: string | null,
+  threadId: string | null,
+  sessionMode: 'shared' | 'per-thread' | 'agent-shared',
+): string {
+  if (sessionMode === 'agent-shared') return `agent\0${agentGroupId}`;
+  return `route\0${agentGroupId}\0${messagingGroupId ?? ''}\0${sessionMode === 'shared' ? '' : (threadId ?? '')}`;
+}
+
 /**
  * Find or create a session for a messaging group + thread.
  *

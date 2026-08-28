@@ -138,7 +138,6 @@ export async function closeActiveSessionsForMessagingGroup(messagingGroupId: str
 export async function getRunningSessions(): Promise<Session[]> {
   return getDb().all<Session>("SELECT * FROM sessions WHERE container_status IN ('running', 'idle')");
 }
-
 export async function updateSession(
   id: string,
   updates: Partial<Pick<Session, 'status' | 'container_status' | 'last_active' | 'agent_provider'>>,

@@ -97,7 +97,6 @@ const TEST_DIR = '/tmp/nanoclaw-test-host';
 // (see db/migrations/fork.ts). The router writes it in ACK mode, so register it
 // once before migrations run — mirroring src/index.ts startup.
 registerForkMigrations();
-
 beforeEach(async () => {
   // Clean test directory
   if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });

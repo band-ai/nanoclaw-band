@@ -128,7 +128,6 @@ export function rewriteOneCliProxyEnv(
   }
   return rewritten;
 }
-
 /** Active sessions tracked by session ID. */
 interface ActiveSessionRuntime {
   /**
@@ -258,9 +257,9 @@ async function spawnContainer(session: Session): Promise<void> {
   // mounts, env passthrough, MCP servers, user-visible tools). Computed once
   // and threaded through buildMounts and composeSessionSpec so side effects
   // (mkdir, etc.) fire once.
-  const contribution = await resolveContainerContribution(session, agentGroup, containerConfig);
+  const { provider, contribution } = await resolveContainerContribution(session, agentGroup, containerConfig);
 
-  const mounts = await buildMounts(agentGroup, session, containerConfig, providerName, contribution);
+  const mounts = await buildMounts(agentGroup, session, containerConfig, provider, contribution);
   const containerName = `nanoclaw-v2-${agentGroup.folder}-${Date.now()}`;
   const mailboxEnvironment = await mailbox.runnerEnvironment(mailboxKey);
 
@@ -339,7 +338,7 @@ async function spawnContainer(session: Session): Promise<void> {
  *
  * Terminal handling is armed before the session starts, so a failure that lands
  * during startup finds a runtime that already knows how to finalize. If
- * `start()` throws, `deps.afterStart` never runs — there is no container
+ * `start()` throws, the post-start bookkeeping never runs — there is nothing
  * running for it to record.
  */
 export async function armSessionLifecycle(deps: {
@@ -517,7 +516,7 @@ async function resolveContainerContribution(
   session: Session,
   agentGroup: AgentGroup,
   containerConfig: ContainerConfig,
-): Promise<ProviderContainerContribution> {
+): Promise<{ provider: string; contribution: ProviderContainerContribution }> {
   const provider = resolveProviderName(session.agent_provider, containerConfig.provider);
   const providerFn = getProviderContainerConfig(provider);
   const providerContribution = providerFn
@@ -549,7 +548,10 @@ async function resolveContainerContribution(
     getAgentContainerConfigs().map((fn) => fn({ session, agentGroupId: agentGroup.id, hostEnv: process.env })),
   );
 
-  return mergeContainerContributions(providerContribution, channelContribution, ...agentContributions);
+  return {
+    provider,
+    contribution: mergeContainerContributions(providerContribution, channelContribution, ...agentContributions),
+  };
 }
 
 export function mergeContainerContributions(
@@ -562,7 +564,6 @@ export function mergeContainerContributions(
     userVisibleTools: contributions.flatMap((c) => c.userVisibleTools ?? []),
   };
 }
-
 export async function buildMounts(
   agentGroup: AgentGroup,
   session: Session,
@@ -620,7 +621,6 @@ export async function buildMounts(
   if (process.getuid?.() === 0) {
     execFileSync('chown', ['-R', '1000:1000', sessDir, groupDir]);
   }
-
   // container.json — nested RO mount on top of RW group dir so the agent can
   // read its config but cannot modify it. Composed per group, so 'group-state'
   // read-only rather than 'install-surface': the install-surface rule is an
@@ -916,6 +916,7 @@ export function parsePidsLimit(value: string): number | undefined {
   const pids = Number(value);
   return Number.isFinite(pids) && pids > 0 ? Math.floor(pids) : undefined;
 }
+
 
 /**
  * Sync skill symlinks in .claude-shared/skills/ to match the container.json

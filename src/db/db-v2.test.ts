@@ -74,7 +74,6 @@ registerChannelMigrations('db-v2-test', [
     },
   },
 ]);
-
 beforeEach(async () => {
   const db = await initSqliteTestDb();
   await runMigrations(db);

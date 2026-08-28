@@ -7,7 +7,8 @@
  */
 import Database from 'better-sqlite3';
 
-import { createInboundRecord, type InboundWrite, type InboundRecord } from '../model.js';
+import { createInboundRecord } from '../model.js';
+import type { InboundRecord, InboundWrite } from '../model.js';
 import { INBOUND_SCHEMA, OUTBOUND_SCHEMA } from './schema.js';
 
 /** Apply the inbound or outbound schema to a DB file. Idempotent. */
@@ -106,8 +107,10 @@ function existingMessageMatches(existing: Record<string, unknown>, record: Inbou
     existing.content === record.content &&
     normalizeDbValue(existing.process_after) === record.processAfter &&
     normalizeDbValue(existing.recurrence) === record.recurrence &&
+    normalizeDbValue(existing.series_id) === record.seriesId &&
     existing.trigger === (record.trigger ? 1 : 0) &&
-    normalizeDbValue(existing.source_session_id) === record.sourceSessionId
+    normalizeDbValue(existing.source_session_id) === record.sourceSessionId &&
+    existing.on_wake === (record.onWake ? 1 : 0)
   );
 }
 

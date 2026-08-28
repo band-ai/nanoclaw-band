@@ -143,7 +143,6 @@ async function main(): Promise<void> {
   };
   process.on('SIGTERM', () => onSignal('SIGTERM'));
   process.on('SIGINT', () => onSignal('SIGINT'));
-
   try {
     await runPollLoop({
       provider,

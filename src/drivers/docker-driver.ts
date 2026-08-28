@@ -21,6 +21,7 @@ import { createHash } from 'crypto';
 import fs from 'fs';
 
 import { log } from '../log.js';
+import { stopGraceForReason } from '../container-runtime.js';
 
 import { realCli, validateRuntimeName, type Cli, type SupervisedProcess } from './cli.js';
 import { JsonDocumentStream } from './json-stream.js';
@@ -524,7 +525,7 @@ class DockerHandle implements SessionHandle {
   async stop(reason: string): Promise<void> {
     this.#stopping = true;
     log.info('Stopping session container', { containerName: this.name, reason });
-    const grace = String(this.pendingSpec?.stopGraceSeconds ?? 1);
+    const grace = String(stopGraceForReason(reason));
     try {
       this.cli.run(['stop', '-t', grace, this.name]);
     } catch {
