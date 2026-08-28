@@ -917,7 +917,6 @@ export function parsePidsLimit(value: string): number | undefined {
   return Number.isFinite(pids) && pids > 0 ? Math.floor(pids) : undefined;
 }
 
-
 /**
  * Sync skill symlinks in .claude-shared/skills/ to match the container.json
  * selection. Each symlink points to a container path (/app/skills/<name>) so

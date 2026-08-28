@@ -353,13 +353,21 @@ describe('lifecycle', () => {
     expect(terminal).not.toHaveBeenCalled();
   });
 
-  it('stops with the spec grace and then force-removes', async () => {
+  it('uses the fast stop window for recovery kills', async () => {
     const handle = await driver().prepare(fixtureSpec());
     await handle.start();
     await handle.stop('sweep-kill');
 
-    expect(cli.joined()).toContain('stop -t 1 ncl-spike-s1');
+    expect(cli.joined()).toContain('stop -t 10 ncl-spike-s1');
     expect(cli.joined()).toContain('rm --force ncl-spike-s1');
+  });
+
+  it('uses the graceful stop window for channel teardown hooks', async () => {
+    const handle = await driver().prepare(fixtureSpec());
+    await handle.start();
+    await handle.stop('absolute-ceiling graceful');
+
+    expect(cli.joined()).toContain('stop -t 1800 ncl-spike-s1');
   });
 
   it('kills the attach process when docker stop fails, so supervision cannot hang', async () => {

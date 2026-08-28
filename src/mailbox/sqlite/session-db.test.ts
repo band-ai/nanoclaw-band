@@ -157,6 +157,31 @@ describe('insertMessage', () => {
     );
     db.close();
   });
+  it('rejects replay that changes on-wake delivery semantics', () => {
+    if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
+    fs.mkdirSync(TEST_DIR, { recursive: true });
+    ensureSchema(DB_PATH, 'inbound');
+
+    const db = new Database(DB_PATH);
+    const base = {
+      id: 'platform-msg:agent-1',
+      kind: 'chat' as const,
+      timestamp: nowForTest(),
+      platformId: 'band:room-1',
+      channelType: 'band',
+      threadId: null,
+      content: JSON.stringify({ text: 'hello' }),
+      processAfter: null,
+      recurrence: null,
+      trigger: true,
+      sourceSessionId: null,
+      onWake: false,
+    };
+
+    insertMessage(db, base);
+    expect(() => insertMessage(db, { ...base, onWake: true })).toThrow('Conflicting messages_in row');
+    db.close();
+  });
 });
 
 describe('syncProcessingAcks — script-skip counter', () => {
