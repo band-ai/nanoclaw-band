@@ -1025,10 +1025,10 @@ export async function buildMounts(
     mounts.push(...validated.map((m) => ({ ...m, mountClass: 'allowlisted-extra' as const, scope })));
   }
 
-  // Provider/channel/agent-contributed mounts (e.g. opencode-xdg). Vetted
-  // upstream by the in-tree provider/channel registration, which is exactly
-  // the 'allowlisted-extra' contract — classing them group-state would deny
-  // any contributor whose state root sits outside the group subtree.
+  // Provider-contributed mounts (e.g. opencode-xdg). Vetted upstream by the
+  // in-tree provider registration, which is exactly the 'allowlisted-extra'
+  // contract — classing them group-state would deny any provider whose state
+  // root sits outside the group subtree.
   if (providerContribution.mounts) {
     mounts.push(...providerContribution.mounts.map((m) => ({ ...m, mountClass: 'allowlisted-extra' as const, scope })));
   }

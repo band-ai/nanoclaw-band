@@ -23,15 +23,7 @@ export function isSessionEcho(msg: MessageInRow): boolean {
  */
 export type CommandCategory = 'admin' | 'filtered' | 'passthrough' | 'none';
 
-const ADMIN_COMMANDS = new Set([
-  '/remote-control',
-  '/clear',
-  '/compact',
-  '/context',
-  '/cost',
-  '/files',
-  '/upload-trace',
-]);
+const ADMIN_COMMANDS = new Set(['/remote-control', '/clear', '/compact', '/context', '/cost', '/files', '/upload-trace']);
 const FILTERED_COMMANDS = new Set(['/help', '/login', '/logout', '/doctor', '/config', '/start']);
 
 export interface CommandInfo {
@@ -144,7 +136,9 @@ export function extractRouting(messages: MessageInRow[]): RoutingContext {
     inReplyTo: first?.id ?? null,
     // Echo rows riding along with a task must not disable one-door delivery:
     // taskRun as long as at least one task row and no non-task/non-echo row.
-    taskRun: messages.some((m) => m.kind === 'task') && messages.every((m) => m.kind === 'task' || isSessionEcho(m)),
+    taskRun:
+      messages.some((m) => m.kind === 'task') &&
+      messages.every((m) => m.kind === 'task' || isSessionEcho(m)),
   };
 }
 
