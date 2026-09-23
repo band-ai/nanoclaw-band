@@ -34,14 +34,16 @@ import { getAgentMailbox, readMailboxContext } from './mailbox/index.js';
 // Providers barrel — each enabled provider self-registers on import.
 // Provider skills append imports to providers/index.ts.
 import './providers/index.js';
+import { createProvider, type ProviderName } from './providers/factory.js';
+import { resolvePluginServer } from './plugin-mcp.js';
+import type { McpServerConfig } from './providers/types.js';
+import { runPollLoop } from './poll-loop.js';
 // Channel lifecycle-hook modules self-register on import (start/stop hooks).
 // Such an import must follow the providers barrel (so providers register
 // first) and precede the runStartHooks call below; channel install skills
 // append their `import './<channel>-lifecycle.js';` here.
-import { createProvider, type ProviderName } from './providers/factory.js';
-import { buildMcpServers } from './mcp-servers.js';
+import { extendMcpServers } from './mcp-servers.js';
 import { runStartHooks, runStopHooks } from './lifecycle.js';
-import { runPollLoop } from './poll-loop.js';
 import { getContinuation } from './db/session-state.js';
 
 function log(msg: string): void {
@@ -101,23 +103,26 @@ async function main(): Promise<void> {
   const __dirname = path.dirname(fileURLToPath(import.meta.url));
   const mcpServerPath = path.join(__dirname, 'mcp-tools', 'index.ts');
 
-  const mcpEnv = Object.fromEntries(
-    Object.entries(process.env).filter((entry): entry is [string, string] => typeof entry[1] === 'string'),
-  );
-
-  const mcpServers = buildMcpServers({
-    builtin: {
-      nanoclaw: {
-        command: 'bun',
-        args: ['run', mcpServerPath],
-        env: mcpEnv,
-      },
+  // Build MCP servers config: nanoclaw built-in + any from container.json
+  const mcpServers: Record<string, McpServerConfig> = {
+    nanoclaw: {
+      command: 'bun',
+      args: ['run', mcpServerPath],
+      env: {},
     },
-    configServers: config.mcpServers,
-    mcpEnv,
-    extraMcpJson: process.env.NANOCLAW_EXTRA_MCP_SERVERS,
-    log,
-  });
+  };
+
+  for (const [name, serverConfig] of Object.entries(config.mcpServers)) {
+    // Plugin-shipped servers get ${PLUGIN_ROOT}/${PLUGIN_DATA} expansion and
+    // the two injected env vars; everything else passes through untouched.
+    mcpServers[name] = resolvePluginServer(serverConfig);
+    log(
+      serverConfig.type === 'http'
+        ? `Additional MCP server: ${name} (HTTP)`
+        : `Additional MCP server: ${name} (${serverConfig.command})`,
+    );
+  }
+  extendMcpServers(mcpServers, { configServers: config.mcpServers, env: process.env, log });
 
   const provider = createProvider(providerName, {
     assistantName: config.assistantName || undefined,

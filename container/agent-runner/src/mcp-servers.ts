@@ -1,59 +1,49 @@
 /**
- * MCP server map assembly.
+ * Fork additions to the MCP server map that upstream's main() builds inline.
  *
- * Combines three sources, later sources overriding earlier on name collision:
- *   1. the built-in `nanoclaw` server (passed in by the caller),
- *   2. servers declared in container.json (`config.mcpServers`) — each passed
- *      through `resolvePluginServer` so a plugin-shipped server's
- *      ${PLUGIN_ROOT}/${PLUGIN_DATA} placeholders resolve before any provider
- *      sees it; http-type and provenance-less servers pass through untouched,
- *   3. channel/provider servers delivered per-spawn via the
+ * main() first assembles upstream's map verbatim: the built-in `nanoclaw`
+ * server (empty env) plus the container.json servers (`config.mcpServers`,
+ * each passed through `resolvePluginServer`). It then calls
+ * `extendMcpServers`, which applies the fork's two additions in place:
+ *
+ *   1. the built-in `nanoclaw` server receives the runner's full container
+ *      env — unless container.json replaced it with its own `nanoclaw`
+ *      server, which then stays exactly as configured;
+ *   2. channel/provider servers delivered per-spawn via the
  *      NANOCLAW_EXTRA_MCP_SERVERS env var (Step 3 seam — no container.json
- *      mutation). Each gets the runner's full container env merged underneath
- *      its own env, mirroring what the built-in `nanoclaw` server receives, so
- *      OneCLI proxy vars + channel vars (BAND_*, etc.) reach the subprocess.
+ *      mutation) are added, overriding any same-named server. Each gets the
+ *      runner's full container env merged underneath its own env, so OneCLI
+ *      proxy vars + channel vars (BAND_*, etc.) reach the subprocess.
+ *      Malformed JSON adds nothing.
  *
- * Pure and side-effect free apart from the optional `log` callback, so the
- * merge is unit-testable without standing up `main()`.
+ * Keeping these additions out of upstream's block leaves upstream's lines
+ * untouched in index.ts, so upstream merges don't conflict here.
  */
-import { resolvePluginServer } from './plugin-mcp.js';
 import type { McpServerConfig } from './providers/types.js';
 
-export interface McpServerSpec {
-  command: string;
-  args: string[];
-  env: Record<string, string>;
-}
-
-export interface BuildMcpServersInput {
-  /** The built-in nanoclaw server entry (already constructed by the caller). */
-  builtin: Record<string, McpServerSpec>;
-  /** Servers from container.json (config.mcpServers). May carry a plugin's stamped `pluginRoot`, or be http-type. */
+export interface ExtendMcpServersInput {
+  /** The container.json servers upstream's block already merged (config.mcpServers). */
   configServers: Record<string, McpServerConfig>;
-  /** Full container env to merge under each extra server's own env. */
-  mcpEnv: Record<string, string>;
-  /** Raw NANOCLAW_EXTRA_MCP_SERVERS value (JSON object), or undefined. */
-  extraMcpJson: string | undefined;
+  /** The runner's container env (process.env); NANOCLAW_EXTRA_MCP_SERVERS is read from it. */
+  env: Record<string, string | undefined>;
   log?: (msg: string) => void;
 }
 
-export function buildMcpServers(input: BuildMcpServersInput): Record<string, McpServerConfig> {
-  const { builtin, configServers, mcpEnv, extraMcpJson, log } = input;
+export function extendMcpServers(mcpServers: Record<string, McpServerConfig>, input: ExtendMcpServersInput): void {
+  const { configServers, env, log } = input;
 
-  const mcpServers: Record<string, McpServerConfig> = { ...builtin };
+  const mcpEnv = Object.fromEntries(
+    Object.entries(env).filter((entry): entry is [string, string] => typeof entry[1] === 'string'),
+  );
 
-  for (const [name, serverConfig] of Object.entries(configServers)) {
-    mcpServers[name] = resolvePluginServer(serverConfig);
-    log?.(
-      serverConfig.type === 'http'
-        ? `Additional MCP server: ${name} (HTTP)`
-        : `Additional MCP server: ${name} (${serverConfig.command})`,
-    );
+  const builtin = mcpServers.nanoclaw;
+  if (!Object.keys(configServers).includes('nanoclaw') && builtin && builtin.type !== 'http') {
+    builtin.env = mcpEnv;
   }
 
   const extra = ((): Record<string, { command: string; args: string[]; env?: Record<string, string> }> => {
     try {
-      return JSON.parse(extraMcpJson ?? '{}') as Record<
+      return JSON.parse(env.NANOCLAW_EXTRA_MCP_SERVERS ?? '{}') as Record<
         string,
         { command: string; args: string[]; env?: Record<string, string> }
       >;
@@ -70,6 +60,4 @@ export function buildMcpServers(input: BuildMcpServersInput): Record<string, Mcp
     };
     log?.(`Channel MCP server: ${name} (${serverConfig.command})`);
   }
-
-  return mcpServers;
 }

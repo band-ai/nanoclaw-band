@@ -84,7 +84,7 @@ grep -q 'supportsDeliveryAck'        src/channels/adapter.ts                    
 grep -q 'needsGracefulStop'          src/channels/adapter.ts                      || { echo "MISSING: graceful-stop capability"; missing=1; }
 grep -q 'userVisibleTools'           src/providers/provider-container-registry.ts || { echo "MISSING: userVisibleTools contribution"; missing=1; }
 test -f container/agent-runner/src/lifecycle.ts                                   || { echo "MISSING: container lifecycle hooks"; missing=1; }
-test -f container/agent-runner/src/mcp-servers.ts                                 || { echo "MISSING: buildMcpServers"; missing=1; }
+grep -q 'extendMcpServers'           container/agent-runner/src/mcp-servers.ts    || { echo "MISSING: extendMcpServers"; missing=1; }
 [ "$missing" = 0 ] && echo "seams: present — base is ready" || echo "seams: STOP — base lacks the channel seams"
 
 echo "=== Band already installed? ==="
@@ -214,9 +214,12 @@ import './band.js';
 ```
 
 `container/agent-runner/src/index.ts` — start/stop lifecycle hooks. Place it
-**immediately after** the `import './providers/index.js';` line (so providers
-register first) and **before** the `import { createProvider ... }` line that
-follows the placement-comment block:
+**directly after** the fork's lifecycle-hook placement comment (the block
+ending ``// append their `import './<channel>-lifecycle.js';` here.``), which
+follows `import { runPollLoop } from './poll-loop.js';`. There it still loads
+after the `import './providers/index.js';` barrel (so providers register first)
+and before `runStartHooks` runs, and it stays out of upstream's import run so
+installs don't reintroduce merge conflicts:
 
 ```typescript
 import './band-lifecycle.js';

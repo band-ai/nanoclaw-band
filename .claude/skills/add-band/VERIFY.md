@@ -82,13 +82,14 @@ grep -E '"@band-ai/sdk"' container/agent-runner/package.json        # container:
 ```bash
 grep -q "import './band.js';" src/channels/index.ts && echo "host channel: registered"
 grep -q "import './band.js';" container/agent-runner/src/mcp-tools/index.ts && echo "container tools: registered"
-grep -q "import './band-lifecycle.js';" container/agent-runner/src/index.ts && echo "container lifecycle: registered"
+grep -A1 -F '<channel>-lifecycle.js' container/agent-runner/src/index.ts | grep -qx "import './band-lifecycle.js';" && echo "container lifecycle: registered"
 ```
 
 The lifecycle import in `container/agent-runner/src/index.ts` must sit
-**immediately after** `import './providers/index.js';` and **before** the
-`import { createProvider ... }` line that follows the placement-comment block —
-confirm by eye if any of these moved.
+**directly after** the fork's lifecycle-hook placement comment, which follows
+`import { runPollLoop } from './poll-loop.js';` — the check above fails if it
+sits anywhere else. That keeps it after the providers barrel and before
+`runStartHooks`, and out of upstream's import run (no merge conflicts).
 
 ## 5. The Band channel migrations register themselves
 
