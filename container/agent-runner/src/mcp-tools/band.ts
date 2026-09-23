@@ -10,6 +10,7 @@ import type { AgentToolsProtocol, ThenvoiLink } from '@band-ai/sdk';
 import { registerTools } from './server.js';
 import type { McpToolDefinition } from './types.js';
 import { writeMessageOut } from '../db/messages-out.js';
+import { memoryConsolidationActive } from '../band-memory-consolidate.js';
 
 const BAND_TOOL_REGISTRY = [
   { sdkName: 'thenvoi_send_message', bandName: 'band_send_message' },
@@ -90,10 +91,6 @@ function mainControlRoom(): boolean {
 
 function memoryToolsEnabled(): boolean {
   return bandEnv('MEMORY_TOOLS') === 'true' && !memoryDisabledForRun;
-}
-
-function consolidationMode(): boolean {
-  return env('NANOCLAW_MEMORY_CONSOLIDATION_ACTIVE') === 'true';
 }
 
 function isMemoryTool(sdkToolName: SdkToolName): boolean {
@@ -212,7 +209,7 @@ function memoryDisabledResult(toolName: SdkToolName): CallToolResult {
 }
 
 function blockedDuringConsolidation(sdkToolName: SdkToolName): CallToolResult | null {
-  if (!consolidationMode() || isMemoryTool(sdkToolName)) return null;
+  if (!memoryConsolidationActive() || isMemoryTool(sdkToolName)) return null;
   return {
     content: [
       {

@@ -9,7 +9,33 @@
  *
  * Failure is non-fatal — the container exits regardless.
  */
+import { existsSync, rmSync, writeFileSync } from 'fs';
+
 import type { AgentProvider } from './providers/types.js';
+
+/**
+ * Marker file whose presence tells the Band MCP tools (`mcp-tools/band.ts`,
+ * which runs as a separate process in the same container) that a
+ * consolidation pass is in progress, so they block every non-memory tool.
+ * Container-local `/tmp` dies with the `--rm` container, so a marker left by a
+ * crash cannot leak into a later session.
+ */
+export const CONSOLIDATION_MARKER_PATH = '/tmp/nanoclaw-memory-consolidation-active';
+
+let consolidationMarkerPath: string = CONSOLIDATION_MARKER_PATH;
+
+/** Whether a consolidation pass is running (the marker file exists). */
+export function memoryConsolidationActive(): boolean {
+  return existsSync(consolidationMarkerPath);
+}
+
+/**
+ * Test-only: redirect the marker (in this process) so tests never touch the
+ * real `/tmp` path. Call with no argument to restore the default.
+ */
+export function setConsolidationMarkerForTest(path: string = CONSOLIDATION_MARKER_PATH): void {
+  consolidationMarkerPath = path;
+}
 
 function log(msg: string): void {
   console.error(`[band-memory-consolidate] ${msg}`);
@@ -118,30 +144,37 @@ export async function runMemoryConsolidation(args: {
   const subjectMap = await loadSubjectMap();
   const prompt = CONSOLIDATION_PROMPT.replace('__TODAY__', today).replace('__SUBJECT_MAP__', subjectMap);
 
-  const query = args.provider.query({
-    prompt,
-    continuation: args.continuation,
-    cwd: args.cwd,
-    env: { NANOCLAW_MEMORY_CONSOLIDATION_ACTIVE: 'true' },
-    // No systemContext — the agent's existing system prompt has the destination
-    // map and Band tool guidance baked in via CLAUDE.md. We override behavior
-    // through the prompt itself ("do NOT send messages, do NOT emit <message>").
-  });
-
+  // Read by the separate MCP server process: marks the pass so it blocks every
+  // non-memory Band tool. Removed in `finally`, even if the query throws.
+  const marker = consolidationMarkerPath;
+  writeFileSync(marker, '');
   try {
-    for await (const event of query.events) {
-      if (event.type === 'error') {
-        log(`Provider error during consolidation: ${event.message}`);
-      } else if (event.type === 'result') {
-        log(`Consolidation result: ${event.text ? event.text.slice(0, 200) : '(empty)'}`);
+    const query = args.provider.query({
+      prompt,
+      continuation: args.continuation,
+      cwd: args.cwd,
+      // No systemContext — the agent's existing system prompt has the destination
+      // map and Band tool guidance baked in via CLAUDE.md. We override behavior
+      // through the prompt itself ("do NOT send messages, do NOT emit <message>").
+    });
+
+    try {
+      for await (const event of query.events) {
+        if (event.type === 'error') {
+          log(`Provider error during consolidation: ${event.message}`);
+        } else if (event.type === 'result') {
+          log(`Consolidation result: ${event.text ? event.text.slice(0, 200) : '(empty)'}`);
+        }
+        // Intentionally drain everything else without dispatch — no writes to
+        // outbound.db. Tool-side memory writes happen inside the SDK MCP server
+        // and persist via Band's REST API regardless of whether we route the
+        // result text anywhere.
       }
-      // Intentionally drain everything else without dispatch — no writes to
-      // outbound.db. Tool-side memory writes happen inside the SDK MCP server
-      // and persist via Band's REST API regardless of whether we route the
-      // result text anywhere.
+      log('Consolidation complete');
+    } catch (err) {
+      log(`Consolidation failed (non-fatal): ${err instanceof Error ? err.message : String(err)}`);
     }
-    log('Consolidation complete');
-  } catch (err) {
-    log(`Consolidation failed (non-fatal): ${err instanceof Error ? err.message : String(err)}`);
+  } finally {
+    rmSync(marker, { force: true });
   }
 }

@@ -1,4 +1,12 @@
 import { afterEach, beforeEach, describe, expect, it } from 'bun:test';
+import { mkdtempSync, rmSync, writeFileSync } from 'fs';
+import { tmpdir } from 'os';
+import path from 'path';
+
+import { setConsolidationMarkerForTest } from '../band-memory-consolidate.js';
+
+let markerDir: string;
+let marker: string;
 
 function clearEnv(): void {
   delete process.env.THENVOI_ROOM_ID;
@@ -7,15 +15,19 @@ function clearEnv(): void {
   delete process.env.THENVOI_API_KEY;
   delete process.env.THENVOI_IS_MAIN_CONTROL_ROOM;
   delete process.env.THENVOI_MEMORY_TOOLS;
-  delete process.env.NANOCLAW_MEMORY_CONSOLIDATION_ACTIVE;
 }
 
 beforeEach(() => {
   clearEnv();
+  markerDir = mkdtempSync(path.join(tmpdir(), 'band-tools-'));
+  marker = path.join(markerDir, 'marker');
+  setConsolidationMarkerForTest(marker);
 });
 
 afterEach(() => {
   clearEnv();
+  setConsolidationMarkerForTest();
+  rmSync(markerDir, { recursive: true, force: true });
 });
 
 describe('Band.ai MCP tools', () => {
@@ -54,12 +66,12 @@ describe('Band.ai MCP tools', () => {
     expect(result.content[0].text).toContain('blocked in the Band.ai main control room');
   });
 
-  it('blocks non-memory Band tools during memory consolidation', async () => {
+  it('blocks non-memory Band tools while the consolidation marker exists', async () => {
     process.env.THENVOI_ROOM_ID = 'room-1';
     process.env.THENVOI_AGENT_ID = 'agent-1';
     process.env.THENVOI_REST_URL = 'https://band.example.test';
     process.env.THENVOI_MEMORY_TOOLS = 'true';
-    process.env.NANOCLAW_MEMORY_CONSOLIDATION_ACTIVE = 'true';
+    writeFileSync(marker, '');
 
     await import('./band.js');
     const { getRegisteredTool } = await import('./server.js');
@@ -70,6 +82,22 @@ describe('Band.ai MCP tools', () => {
     expect(result.isError).toBe(true);
     expect(result.content[0].type).toBe('text');
     expect(result.content[0].text).toContain('blocked during Band.ai memory consolidation');
+  });
+
+  it('does not apply the consolidation block when the marker is absent', async () => {
+    // Agent-scoped session with no room: without the consolidation block the
+    // handler proceeds to its room check, which fails locally without calling Band.
+    process.env.THENVOI_AGENT_ID = 'agent-1';
+    process.env.THENVOI_REST_URL = 'https://band.example.test';
+
+    await import('./band.js');
+    const { getRegisteredTool } = await import('./server.js');
+    const tool = getRegisteredTool('band_send_message');
+
+    const result = await tool!.handler({ content: 'hi there', mentions: [{ id: 'peer-1' }] });
+
+    expect(result.content[0].text).not.toContain('blocked during Band.ai memory consolidation');
+    expect(result.content[0].text).toContain('needs a chat_room_id');
   });
 
   it('exposes chat_room_id on room-scoped tools so they can target any room', async () => {
