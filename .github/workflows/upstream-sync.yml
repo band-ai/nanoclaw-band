@@ -85,6 +85,11 @@ jobs:
       # so a sync that quietly stops adopting upstream cannot read as healthy.
       MAX_BEHIND_COMMITS: '200'
       MAX_BASELINE_AGE_DAYS: '14'
+      # Pin every repo-inferring `gh` call (pr comment/edit/close, issue *) to
+      # this fork. The drift step adds a remote named `upstream`, and `gh`
+      # prefers `upstream` over `origin`, so without this `gh pr comment 30`
+      # targeted nanocoai/nanoclaw#30 and the escalation silently failed.
+      GH_REPO: ${{ github.repository }}
     steps:
       - name: Check out fork main
         uses: actions/checkout@v4
