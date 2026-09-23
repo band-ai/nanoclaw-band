@@ -39,16 +39,6 @@ function log(msg: string): void {
   }
 })();
 
-export function mergeEnv(...sources: Array<Record<string, string | undefined>>): Record<string, string> {
-  const merged: Record<string, string> = {};
-  for (const source of sources) {
-    for (const [key, value] of Object.entries(source)) {
-      if (value !== undefined) merged[key] = value;
-    }
-  }
-  return merged;
-}
-
 export interface SdkRateLimitInfo {
   status?: string;
   resetsAt?: number;
@@ -599,13 +589,6 @@ export class ClaudeProvider implements AgentProvider {
     stream.push(input.prompt);
 
     const instructions = input.systemContext?.instructions;
-    const queryEnv = mergeEnv(this.env, input.env ?? {});
-    const mcpServers = Object.fromEntries(
-      Object.entries(this.mcpServers).map(([name, server]) => [
-        name,
-        server.type === 'http' ? server : { ...server, env: mergeEnv(input.env ?? {}, server.env ?? {}) },
-      ]),
-    );
 
     const sdkResult = sdkQuery({
       prompt: stream,
@@ -619,7 +602,7 @@ export class ClaudeProvider implements AgentProvider {
           : undefined,
         allowedTools: [...TOOL_ALLOWLIST, ...Object.keys(this.mcpServers).map(mcpAllowPattern)],
         disallowedTools: SDK_DISALLOWED_TOOLS,
-        env: queryEnv,
+        env: this.env,
         model: this.model,
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
         effort: this.effort as any,
@@ -630,9 +613,7 @@ export class ClaudeProvider implements AgentProvider {
         // exactly the options it always did. `fastMode` is a Settings member
         // rather than a query option, which is why it rides `settings`.
         ...(this.fastMode ? { settings: { fastMode: true } } : {}),
-        // Fork: `mcpServers` is the locally-built map that folds `input.env`
-        // into each stdio server's env — not the raw `this.mcpServers`.
-        mcpServers,
+        mcpServers: this.mcpServers,
         hooks: {
           PreToolUse: [{ hooks: [preToolUseHook] }],
           PostToolUse: [{ hooks: [postToolUseHook] }],

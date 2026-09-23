@@ -120,9 +120,6 @@ export interface QueryInput {
   systemContext?: {
     instructions?: string;
   };
-
-  /** Per-query environment overrides, also forwarded to MCP server subprocesses. */
-  env?: Record<string, string>;
 }
 
 export type McpServerConfig =
