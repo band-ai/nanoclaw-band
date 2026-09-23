@@ -67,9 +67,9 @@ export interface ProviderContainerContribution {
   /**
    * Extra MCP servers to pass into the container via NANOCLAW_EXTRA_MCP_SERVERS.
    * Later contributions override earlier on name collision. Merge order in
-   * resolveContainerContribution is provider → channel → agent-scoped, so on a
-   * name clash agent-scoped wins over channel, and channel wins over provider
-   * (same precedence as `env`).
+   * mergeContainerContributions (src/channels/channel-container-registry.ts) is
+   * provider → channel → agent-scoped, so on a name clash agent-scoped wins over
+   * channel, and channel wins over provider (same precedence as `env`).
    */
   mcpServers?: Record<string, McpServerContribution>;
   /**

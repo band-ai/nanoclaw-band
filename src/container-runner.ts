@@ -29,7 +29,10 @@ import type { ContainerConfig } from './container-config.js';
 import { getContainerConfig } from './db/container-configs.js';
 import { updateContainerConfigScalars } from './db/container-configs.js';
 import { CONTAINER_RUNTIME_BIN, FAST_STOP_GRACE_SEC } from './container-runtime.js';
-import { getChannelContainerConfig, getAgentContainerConfigs } from './channels/channel-container-registry.js';
+import {
+  mergeContainerContributions,
+  resolveForkContainerContribution,
+} from './channels/channel-container-registry.js';
 import { composeGroupProjectDoc, DEFAULT_PROJECT_DOC } from './project-doc-compose.js';
 import { getAgentGroup } from './db/agent-groups.js';
 import {
@@ -44,7 +47,6 @@ import {
 } from './db/coordination.js';
 import { getHostInstanceId } from './host-instance.js';
 import { getDb, hasTable } from './db/connection.js';
-import { getMessagingGroup } from './db/messaging-groups.js';
 import { getSession } from './db/sessions.js';
 import { getSessionDriver, isSessionEventsDriver } from './drivers/index.js';
 import type { SupervisedHandle, SupervisedSnapshot } from './drivers/session-events.js';
@@ -380,13 +382,14 @@ async function spawnContainer(session: Session): Promise<void> {
   const providerName = resolveProviderName(session.agent_provider, containerConfig.provider);
   await initGroupFilesystem(agentGroup, { provider: providerName });
 
-  // Resolve the effective provider/channel/agent-scoped contributions (extra
-  // mounts, env passthrough, MCP servers, user-visible tools). Computed once
-  // and threaded through buildMounts and composeSessionSpec so side effects
-  // (mkdir, etc.) fire once.
-  const contribution = await resolveContainerContribution(session, agentGroup, containerConfig);
+  const forkContribution = await resolveForkContainerContribution(session, agentGroup);
 
-  const mounts = await buildMounts(agentGroup, session, containerConfig, providerName, contribution);
+  // Resolve the effective provider + any host-side contribution it declares
+  // (extra mounts, env passthrough). Computed once and threaded through both
+  // buildMounts and buildContainerArgs so side effects (mkdir, etc.) fire once.
+  const { provider, contribution } = await resolveProviderContribution(session, agentGroup, containerConfig);
+
+  const mounts = await buildMounts(agentGroup, session, containerConfig, provider, contribution);
   const containerName = `nanoclaw-v2-${agentGroup.folder}-${Date.now()}`;
   const mailboxEnvironment = await mailbox.runnerEnvironment(mailboxKey);
 
@@ -421,7 +424,7 @@ async function spawnContainer(session: Session): Promise<void> {
     containerName,
     mounts,
     containerConfig,
-    contribution,
+    contribution: mergeContainerContributions(contribution, forkContribution),
     gateway,
     mailboxEnvironment,
   });
@@ -830,15 +833,15 @@ export function resolveProviderName(
   return (sessionProvider || containerConfigProvider || 'claude').toLowerCase();
 }
 
-async function resolveContainerContribution(
+async function resolveProviderContribution(
   session: Session,
   agentGroup: AgentGroup,
-  containerConfig: ContainerConfig,
-): Promise<ProviderContainerContribution> {
+  containerConfig: import('./container-config.js').ContainerConfig,
+): Promise<{ provider: string; contribution: ProviderContainerContribution }> {
   const provider = resolveProviderName(session.agent_provider, containerConfig.provider);
-  const providerFn = getProviderContainerConfig(provider);
-  const providerContribution = providerFn
-    ? await providerFn({
+  const fn = getProviderContainerConfig(provider);
+  const contribution = fn
+    ? await fn({
         sessionDir: sessionDir(agentGroup.id, session.id),
         agentGroupId: agentGroup.id,
         groupDir: path.resolve(GROUPS_DIR, agentGroup.folder),
@@ -846,38 +849,7 @@ async function resolveContainerContribution(
         hostEnv: process.env,
       })
     : {};
-
-  const messagingGroup = session.messaging_group_id
-    ? ((await getMessagingGroup(session.messaging_group_id)) ?? null)
-    : null;
-  const channelFn = messagingGroup ? getChannelContainerConfig(messagingGroup.channel_type) : undefined;
-  const channelContribution = channelFn
-    ? await channelFn({
-        session,
-        messagingGroup,
-        agentGroupId: agentGroup.id,
-        hostEnv: process.env,
-      })
-    : {};
-
-  // Agent-scoped contributions apply to every session of the group regardless
-  // of the session's channel (e.g. Band grants cross-channel control tools).
-  const agentContributions = await Promise.all(
-    getAgentContainerConfigs().map((fn) => fn({ session, agentGroupId: agentGroup.id, hostEnv: process.env })),
-  );
-
-  return mergeContainerContributions(providerContribution, channelContribution, ...agentContributions);
-}
-
-export function mergeContainerContributions(
-  ...contributions: ProviderContainerContribution[]
-): ProviderContainerContribution {
-  return {
-    mounts: contributions.flatMap((c) => c.mounts ?? []),
-    env: Object.assign({}, ...contributions.map((c) => c.env ?? {})),
-    mcpServers: Object.assign({}, ...contributions.map((c) => c.mcpServers ?? {})),
-    userVisibleTools: contributions.flatMap((c) => c.userVisibleTools ?? []),
-  };
+  return { provider, contribution };
 }
 
 export async function buildMounts(
@@ -1104,7 +1076,7 @@ export function composeSessionSpec(input: ComposeSessionSpecInput): SessionSpec 
     ...(gateway.env ?? {}),
   };
   // Channel-contributed MCP servers — serialized as JSON and picked up by
-  // buildMcpServers() in the container's main(). Empty stays absent so the
+  // extendMcpServers() in the container's main(). Empty stays absent so the
   // container sees no extra servers rather than an empty map.
   if (contribution.mcpServers && Object.keys(contribution.mcpServers).length > 0) {
     contributedEnv.NANOCLAW_EXTRA_MCP_SERVERS = JSON.stringify(contribution.mcpServers);

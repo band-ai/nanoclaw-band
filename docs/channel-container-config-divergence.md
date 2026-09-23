@@ -13,20 +13,20 @@ production. This document specifies both contracts, why they differ, and what co
 
 |  | Upstream | Fork |
 |---|---|---|
-| Module | `src/channels/channel-registry.ts:259` | `src/channels/channel-container-registry.ts:24` |
+| Module | `src/channels/channel-registry.ts:259` | `src/channels/channel-container-registry.ts:32` |
 | Export | `getChannelContainerConfig(name)` | `getChannelContainerConfig(channelType)` |
 | Returns | `ChannelRegistration['containerConfig']` — static data | `ChannelContainerConfigFn \| undefined` — a function |
-| Declared in | `src/channels/adapter.ts:348` | `src/channels/channel-container-registry.ts:11` |
+| Declared in | `src/channels/adapter.ts:361` | `src/channels/channel-container-registry.ts:19` |
 | Registered via | `registerChannelAdapter(name, { containerConfig })` | `registerChannelContainerConfig(channelType, fn)` |
-| Production callers | **none** | `src/container-runner.ts:31, 536` |
-| Test-only callers | `src/channels/channel-registry.test.ts:87, 98` | `src/channels/channel-container-registry.test.ts:4, 47` |
+| Production callers | **none** | `src/channels/channel-container-registry.ts:79` (inside `resolveForkContainerContribution`, called from `src/container-runner.ts:385`) |
+| Test-only callers | `src/channels/channel-registry.test.ts:87, 98` | `src/channels/channel-container-registry.test.ts:4, 53` |
 
 The name clash is currently harmless only because no module imports both. Any file that needs
 both seams cannot `import { getChannelContainerConfig }` twice without aliasing.
 
 ## Upstream contract
 
-Static declaration hung off the registry entry (`src/channels/adapter.ts:338-352`):
+Static declaration hung off the registry entry (`src/channels/adapter.ts:351-365`):
 
 ```ts
 export interface ChannelRegistration {
@@ -52,10 +52,13 @@ Properties:
 
 ## Fork contract
 
-Two registries — channel-scoped and agent-scoped — both returning the richer
-`ProviderContainerContribution` (`src/channels/channel-container-registry.ts`):
+Two registries — channel-scoped and agent-scoped — both returning `ForkContainerContribution`, a
+mount-free subset of the provider seam's `ProviderContainerContribution`
+(`src/channels/channel-container-registry.ts`):
 
 ```ts
+export type ForkContainerContribution = Pick<ProviderContainerContribution, 'env' | 'mcpServers' | 'userVisibleTools'>;
+
 export interface ChannelContainerContext {
   session: Session;
   messagingGroup: MessagingGroup | null;
@@ -65,7 +68,7 @@ export interface ChannelContainerContext {
 
 export type ChannelContainerConfigFn = (
   ctx: ChannelContainerContext,
-) => ProviderContainerContribution | Promise<ProviderContainerContribution>;
+) => ForkContainerContribution | Promise<ForkContainerContribution>;
 
 export interface AgentContainerContext {
   session: Session;
@@ -75,11 +78,11 @@ export interface AgentContainerContext {
 
 export type AgentContainerConfigFn = (
   ctx: AgentContainerContext,
-) => ProviderContainerContribution | Promise<ProviderContainerContribution>;
+) => ForkContainerContribution | Promise<ForkContainerContribution>;
 ```
 
-The contribution type (`src/providers/provider-container-registry.ts`) is shared with the
-provider seam:
+The full contribution type (`src/providers/provider-container-registry.ts`) belongs to the
+provider seam; only providers may contribute `mounts`:
 
 ```ts
 export interface ProviderContainerContribution {
@@ -99,37 +102,48 @@ from a Telegram session. The producer decides applicability per agent group and 
 otherwise.
 
 Note the asymmetry: the channel registry throws on duplicate registration
-(`src/channels/channel-container-registry.ts:18-20`); the agent registry accepts unbounded
+(`src/channels/channel-container-registry.ts:26-28`); the agent registry accepts unbounded
 registrants.
 
 ### Fan-in and precedence
 
-`resolveContainerContribution` (`src/container-runner.ts:516-553`) merges three tiers:
+The fan-in lives in `src/channels/channel-container-registry.ts`, not in `container-runner.ts`,
+so `spawnContainer` keeps upstream's `resolveProviderContribution` call site byte-identical and
+adds only two fork lines (`src/container-runner.ts:385` and `:427`).
+
+`resolveForkContainerContribution` (`src/channels/channel-container-registry.ts:72-101`) resolves
+the channel tier (via `session.messaging_group_id` → `getMessagingGroup` → `getChannelContainerConfig`)
+and the agent-scoped tier, and layers them channel → agent-scoped. `spawnContainer` then passes
+`mergeContainerContributions(contribution, forkContribution)`
+(`src/channels/channel-container-registry.ts:108-118`) to `composeSessionSpec`, so the effective
+order is:
 
 ```
 provider  →  channel  →  agent-scoped
 ```
 
-`mergeContainerContributions` (`src/container-runner.ts:555-564`) merges field-wise:
+Field-wise:
 
 | Field | Strategy | Collision winner |
 |---|---|---|
-| `mounts` | `flatMap` — concatenate | n/a, all kept |
+| `mounts` | provider only — fork tiers cannot contribute them | n/a |
 | `env` | `Object.assign` | later tier |
 | `mcpServers` | `Object.assign` | later tier |
-| `userVisibleTools` | `flatMap` — concatenate | n/a, all kept |
+| `userVisibleTools` | concatenate | n/a, all kept |
 
 So on an `env` or `mcpServers` name clash: agent-scoped beats channel, channel beats provider.
+Provider mounts reach `buildMounts` directly from `resolveProviderContribution`, as upstream.
 
 ### Downstream consumption
 
 Two contribution fields have no upstream equivalent and are consumed at spawn time
-(`src/container-runner.ts:789-798`):
+(`src/container-runner.ts:1078-1087`):
 
-- `mcpServers` → `NANOCLAW_EXTRA_MCP_SERVERS` (JSON) → read at
-  `container/agent-runner/src/index.ts:118` and passed as `extraMcpJson` to `buildMcpServers()`
-  (`container/agent-runner/src/mcp-servers.ts`), which folds `mcpEnv` under each extra server and
-  ignores malformed JSON without throwing
+- `mcpServers` → `NANOCLAW_EXTRA_MCP_SERVERS` (JSON) → read by `extendMcpServers(mcpServers,
+  { configServers, env, log })` (`container/agent-runner/src/mcp-servers.ts:32`), called once from
+  `main()` at `container/agent-runner/src/index.ts:125` after upstream's `mcpServers` block with
+  `env: process.env`; it adds each extra server with the container env folded under the server's
+  own `env`, and ignores malformed JSON without throwing
 - `userVisibleTools` → `NANOCLAW_USER_VISIBLE_TOOLS` (JSON) → read at
   `container/agent-runner/src/providers/claude.ts:30`, which seeds the tool registry in
   `container/agent-runner/src/mcp-tools/server.ts` via `markUserVisibleTool`
@@ -185,10 +199,10 @@ Ordered by how hard each blocks adoption:
 
 Rename `getChannelContainerConfig` → `getChannelContainerContribution` (and
 `registerChannelContainerConfig` → `registerChannelContainerContribution`) in
-`src/channels/channel-container-registry.ts`, its test, and the single import at
-`src/container-runner.ts:31`.
+`src/channels/channel-container-registry.ts` (declaration and its sole call in
+`resolveForkContainerContribution`) and its test.
 
-- Cost: three files, mechanical, zero behavior change.
+- Cost: two files, mechanical, zero behavior change.
 - Removes the name collision and makes each seam's role legible at the callsite.
 - Does not reduce the fork's diff surface against upstream.
 - Leaves upstream's field dead in-tree, which is upstream's business, not drift.
@@ -220,7 +234,7 @@ upstream's `containerConfig` when no function is registered for that channel.
 
 ## Recommendation
 
-Take **A** now — it is three files and retires the only concrete hazard, the duplicate export
+Take **A** now — it is two files and retires the only concrete hazard, the duplicate export
 name. Open **B** upstream and let the fork's `src/channels/channel-container-registry.ts` remain
 until upstream accepts a widened contract. Decline **C**.
 
@@ -233,8 +247,10 @@ it would create a real conflict on every future sync.
 - `userVisibleTools` must keep reaching `NANOCLAW_USER_VISIBLE_TOOLS`, or poll-loop
   double-delivery suppression silently dies — it fails as a behavior regression, not a build error.
 - Merge order must stay provider → channel → agent-scoped.
-  `src/container-runner.test.ts:502` (`describe('mergeContainerContributions')`) pins the
-  concatenate-vs-override split per field; `:535` pins `stopGraceForReason`, `:547` pins
+  `src/channels/channel-container-registry.test.ts:79` (`describe('mergeContainerContributions')`)
+  pins provider < fork precedence and the concatenate-vs-override split per field; `:120`
+  (`describe('resolveForkContainerContribution')`) pins channel < agent-scoped layering.
+  `src/container-runner.test.ts:501` pins `stopGraceForReason`, `:513` pins
   `rewriteOneCliProxyEnv`.
 - The channel registry's duplicate-registration throw is load-bearing for idempotent
   `/add-<channel>` re-runs.
