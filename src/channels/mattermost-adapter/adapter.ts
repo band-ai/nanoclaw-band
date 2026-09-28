@@ -90,12 +90,34 @@ const MATTERMOST_ID = /^[a-z0-9]{26}$/;
  */
 const WEBHOOK_PATH = '/webhook/mattermost';
 
+/** Compare UTF-8 bytes only after checking their lengths. */
+function secretMatches(presented: unknown, expected: string): boolean {
+  if (typeof presented !== 'string') return false;
+  const actual = Buffer.from(presented);
+  const configured = Buffer.from(expected);
+  return actual.length === configured.length && timingSafeEqual(actual, configured);
+}
+
+/** Domain label for the derived callback secret; distinct from the setup proofs' messages. */
+const DERIVED_CALLBACK_SECRET_LABEL = 'nanoclaw-mattermost-callback-secret:v1';
+
+/**
+ * An explicit secret wins. Otherwise derive one from the bot token, so every
+ * install authenticates clicks with no extra config. HMAC is one-way: the value
+ * Mattermost stores in card context never reveals the token. Rotating the token
+ * changes it, so cards posted before the rotation stop verifying.
+ */
+function resolveCallbackSecret(options: MattermostAdapterOptions): string | undefined {
+  if (options.callbackSecret?.trim()) return options.callbackSecret;
+  if (!options.token?.trim()) return undefined;
+  return createHmac('sha256', options.token).update(DERIVED_CALLBACK_SECRET_LABEL).digest('hex');
+}
+
 export interface MattermostAdapterOptions {
   /**
-   * Shared secret every interactive action carries back in its context.
-   * When set, `handleWebhook` rejects callbacks that do not present it —
-   * the only authentication Mattermost's action callbacks can have. Cards
-   * posted before the secret was configured stop being clickable.
+   * Shared secret every action carries back in its context. Optional: when
+   * absent or blank, one is derived from the bot token. Cards posted before
+   * the secret (or the token it derives from) changes stop being clickable.
    */
   callbackSecret?: string;
   /** Externally reachable base URL Mattermost POSTs button clicks to. */
@@ -267,7 +289,7 @@ export class MattermostAdapter implements Adapter<MattermostThreadId, Mattermost
   constructor(options: MattermostAdapterOptions) {
     this.options = { ...options, url: normalizeBaseUrl(options.url) };
     this.callbackUrl = options.callbackUrl;
-    this.callbackSecret = options.callbackSecret;
+    this.callbackSecret = resolveCallbackSecret(options);
     this.logger = new ConsoleLogger('info', 'mattermost');
     this.rest = new MattermostRestClient({
       baseUrl: this.options.url,
@@ -912,10 +934,10 @@ export class MattermostAdapter implements Adapter<MattermostThreadId, Mattermost
    * Socket Mode, this is a real inbound HTTP route, served by the host's
    * webhook server at `/webhook/mattermost`.
    *
-   * Mattermost signs nothing on this request. When a `callbackSecret` is
-   * configured, the click must present it in `context` (where
-   * `cardToAttachment` put it and where no client can read it); a callback
-   * without it is refused with 401 before anything is dispatched.
+   * Mattermost signs nothing on this request. Actions must present the
+   * callback secret (configured or derived from the bot token) in context,
+   * or receive 401 before dispatch. Setup proofs below use a separate
+   * credential and never dispatch actions.
    *
    * The dispatch is fire-and-forget, mirroring Slack's `handleBlockActions`:
    * `chat.processAction` is started and the 200 goes back immediately, because
@@ -942,6 +964,10 @@ export class MattermostAdapter implements Adapter<MattermostThreadId, Mattermost
       return new Response('Invalid JSON', { status: 400 });
     }
 
+    if (!payload || typeof payload !== 'object') {
+      return new Response('Invalid JSON', { status: 400 });
+    }
+
     // A setup action uses a one-purpose proof, not the long-lived callback
     // secret: a mistyped callback destination cannot receive that secret.
     const setupNonce = payload.context?.nanoclaw_setup_action;
@@ -960,22 +986,20 @@ export class MattermostAdapter implements Adapter<MattermostThreadId, Mattermost
       return Response.json({});
     }
 
-    if (this.callbackSecret !== undefined) {
-      const presented = payload.context?.[CALLBACK_SECRET_KEY];
-      if (presented !== this.callbackSecret) {
-        this.logger.warn('Mattermost action callback rejected: missing or wrong callback secret', {
-          postId: payload.post_id,
-          userId: payload.user_id,
-        });
-        return new Response('Unauthorized', { status: 401 });
-      }
+    // Undefined only when the bot token is blank; every action is then refused.
+    const presented = payload.context?.[CALLBACK_SECRET_KEY];
+    if (this.callbackSecret === undefined || !secretMatches(presented, this.callbackSecret)) {
+      this.logger.warn('Mattermost action callback rejected: missing or wrong callback secret', {
+        postId: payload.post_id,
+        userId: payload.user_id,
+      });
+      return new Response('Unauthorized', { status: 401 });
     }
 
     // A setup challenge checks this initialized adapter without delivering an
     // action or posting a message. Authenticate before exposing runtime values.
     const challenge = payload.context?.nanoclaw_setup_probe;
     if (typeof challenge === 'string' && /^[a-f0-9-]{36}$/.test(challenge)) {
-      if (!this.callbackSecret) return new Response('Unauthorized', { status: 401 });
       const runtime = {
         challenge,
         bot_id: this.botUserId,

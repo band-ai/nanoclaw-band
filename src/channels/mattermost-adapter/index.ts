@@ -75,7 +75,8 @@ export interface MattermostAdapterConfig extends Partial<Omit<MattermostAdapterO
  * Falls back to `MATTERMOST_URL`, `MATTERMOST_BOT_TOKEN`,
  * `MATTERMOST_CALLBACK_URL`, `MATTERMOST_CALLBACK_SECRET` and
  * `MATTERMOST_TEAM` (all but the first two optional) for anything `config`
- * leaves out.
+ * leaves out. Without a nonblank secret, the adapter derives one from the
+ * bot token.
  *
  * Returns `null` when the URL or the bot token is absent from both sources,
  * per the NanoClaw channel-registry contract (spec §7) — an unconfigured
@@ -93,7 +94,7 @@ export function createMattermostAdapter(config: MattermostAdapterConfig = {}): M
   }
 
   const resolvedCallbackUrl = callbackUrl || env.MATTERMOST_CALLBACK_URL;
-  const resolvedCallbackSecret = callbackSecret || env.MATTERMOST_CALLBACK_SECRET;
+  const resolvedCallbackSecret = callbackSecret?.trim() ? callbackSecret : env.MATTERMOST_CALLBACK_SECRET;
   const resolvedTeam = team || env.MATTERMOST_TEAM;
 
   return new MattermostAdapter({
