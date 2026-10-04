@@ -104,13 +104,19 @@ registrants.
 
 ### Fan-in and precedence
 
-`resolveContainerContribution` (`src/container-runner.ts:516-553`) merges three tiers:
+The spawn path in `src/container-runner.ts` keeps upstream's `resolveProviderContribution`
+untouched and layers the fork's tiers on top: `resolveSessionContribution` merges channel →
+agent-scoped, then `mergeContainerContributions` folds that over the provider contribution:
 
 ```
 provider  →  channel  →  agent-scoped
 ```
 
-`mergeContainerContributions` (`src/container-runner.ts:555-564`) merges field-wise:
+Channel/agent-scoped `mounts` reach `buildMounts` as a separate `sessionMounts` argument, so they
+are mounted even when the provider declares a host contract (upstream skips the legacy provider
+`mounts` in that case).
+
+`mergeContainerContributions` merges field-wise:
 
 | Field | Strategy | Collision winner |
 |---|---|---|

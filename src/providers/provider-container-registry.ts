@@ -50,6 +50,13 @@ export interface ProviderContainerContext {
   selectedSkills: string[];
   /** `process.env` at spawn time — pull passthrough values from here. */
   hostEnv: NodeJS.ProcessEnv;
+  /**
+   * Mixed-version handshake. Present only when this host loaded a declaration
+   * and will realize its surfaces. Updated legacy callbacks keep returning env
+   * but suppress their old filesystem/mount work when this is true. Old hosts
+   * omit the field, so refreshed payloads retain their old behavior.
+   */
+  coreOwnsProviderSurfaces?: true;
 }
 
 /** A single MCP server contributed by a channel or provider. */
@@ -66,9 +73,10 @@ export interface ProviderContainerContribution {
   env?: Record<string, string>;
   /**
    * Extra MCP servers to pass into the container via NANOCLAW_EXTRA_MCP_SERVERS.
-   * Later contributions override earlier on name collision. Merge order in
-   * resolveContainerContribution is provider → channel → agent-scoped, so on a
-   * name clash agent-scoped wins over channel, and channel wins over provider
+   * Later contributions override earlier on name collision. Spawn merges
+   * provider → channel → agent-scoped (container-runner.ts
+   * resolveSessionContribution + mergeContainerContributions), so on a name
+   * clash agent-scoped wins over channel, and channel wins over provider
    * (same precedence as `env`).
    */
   mcpServers?: Record<string, McpServerContribution>;

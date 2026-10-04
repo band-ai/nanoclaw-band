@@ -10,6 +10,11 @@ import type { ProviderExchange } from './providers/types.js';
 import { runPollLoop } from './poll-loop.js';
 import type { AgentProvider, AgentQuery, ProviderEvent, QueryInput } from './providers/types.js';
 
+const MOCK_PROVIDER_CONTRACT = {
+  textDelivery: 'mid-turn-complete',
+  commands: { formatting: 'xml' },
+} as const;
+
 beforeEach(() => {
   initTestSessionDb();
   // Seed a destination so output parsing can resolve "discord-test" → routing
@@ -243,8 +248,9 @@ describe('poll loop integration', () => {
     await loopPromise.catch(() => {});
   });
 
-  it('resolves most recent thread_id when destination has multiple inbound messages', async () => {
-    // Two messages from same destination, different threads
+  it('replies in the thread of the message the batch is answering when the batch spans threads', async () => {
+    // Two messages from the same channel, different threads, one batch. The
+    // reply goes where in_reply_to points: the first non-echo message.
     insertMessage(
       'm-old',
       { sender: 'Alice', text: 'old' },
@@ -265,8 +271,8 @@ describe('poll loop integration', () => {
 
     const out = getUndeliveredMessages();
     expect(out).toHaveLength(1);
-    expect(out[0].thread_id).toBe('thread-new');
-    expect(out[0].in_reply_to).toBe('m-new');
+    expect(out[0].thread_id).toBe('thread-old');
+    expect(out[0].in_reply_to).toBe('m-old');
 
     await loopPromise.catch(() => {});
   });
@@ -385,6 +391,7 @@ async function runPollLoopWithTimeout(provider: AgentProvider, signal: AbortSign
   return Promise.race([
     runPollLoop({
       provider,
+      providerContract: MOCK_PROVIDER_CONTRACT,
       providerName: 'mock',
       cwd: '/tmp',
       signal,
@@ -497,7 +504,7 @@ describe('poll loop — exchange hook (onExchangeComplete)', () => {
 });
 
 describe('poll loop — provider error recovery', () => {
-  it('writes error to outbound and continues loop on provider throw', async () => {
+  it('writes a safe error notice to outbound and continues loop on provider throw', async () => {
     insertMessage('m1', { sender: 'Alice', text: 'trigger error' }, { platformId: 'chan-1', channelType: 'discord' });
 
     const provider = new ThrowingProvider('API rate limit exceeded');
@@ -509,8 +516,8 @@ describe('poll loop — provider error recovery', () => {
 
     const out = getUndeliveredMessages();
     expect(out).toHaveLength(1);
-    expect(JSON.parse(out[0].content).text).toContain('Error:');
-    expect(JSON.parse(out[0].content).text).toContain('API rate limit exceeded');
+    expect(JSON.parse(out[0].content).text).toBe('The agent run failed. Check the logs for details.');
+    expect(out[0].content).not.toContain('API rate limit exceeded');
 
     // Input message should be marked completed despite the error
     const pending = getPendingMessages();
@@ -535,10 +542,11 @@ describe('poll loop — stale session recovery', () => {
     await waitFor(() => getUndeliveredMessages().length > 0, 2000);
     controller.abort();
 
-    // Error was written to outbound
+    // A safe notice reaches the user; the provider diagnostic stays private.
     const out = getUndeliveredMessages();
     expect(out).toHaveLength(1);
-    expect(JSON.parse(out[0].content).text).toContain('Error:');
+    expect(JSON.parse(out[0].content).text).toBe('The agent run failed. Check the logs for details.');
+    expect(out[0].content).not.toContain('session not found');
 
     // Continuation was cleared (isSessionInvalid returned true)
     expect(getContinuation('mock')).toBeUndefined();
@@ -587,7 +595,6 @@ describe('poll loop — /clear command', () => {
  * Provider that throws on every query, simulating API failures.
  */
 class ThrowingProvider {
-  readonly supportsNativeSlashCommands = false;
   private errorMessage: string;
 
   constructor(errorMessage: string) {
@@ -616,8 +623,6 @@ class ThrowingProvider {
  * First emits an init event (setting continuation), then throws.
  */
 class InvalidSessionProvider {
-  readonly supportsNativeSlashCommands = false;
-
   isSessionInvalid(): boolean {
     return true;
   }
@@ -686,7 +691,6 @@ describe('poll loop — slash command during active query', () => {
  * the loop interrupts an active stream.
  */
 class BlockingProvider {
-  readonly supportsNativeSlashCommands = false;
   queries = 0;
   aborts = 0;
   ends = 0;

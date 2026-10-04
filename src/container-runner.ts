@@ -50,12 +50,31 @@ import { getSessionDriver, isSessionEventsDriver } from './drivers/index.js';
 import type { SupervisedHandle, SupervisedSnapshot } from './drivers/session-events.js';
 import { GROUP_FOLDER_LABEL, labelValueLegal, specInvalid } from './drivers/types.js';
 import type { ContainerSpec, MountSpec, SessionFailure, SessionSpec } from './drivers/types.js';
-import { getGatewayProvider, type GatewayContribution } from './gateway-providers/index.js';
+import {
+  gatewayRuntimeIdentity,
+  getGatewayProvider,
+  selectGatewayAgentSkills,
+  type GatewayContribution,
+  type GatewaySessionInput,
+  type GatewaySessionLease,
+} from './gateway-providers/index.js';
+import { releaseGatewaySession, type GatewaySessionControl } from './gateway-session-lifecycle.js';
 import { initGroupFilesystem } from './group-init.js';
 import { getAgentMailbox } from './mailbox/index.js';
 import { stopTypingRefresh } from './modules/typing/index.js';
 import { log } from './log.js';
 import { validateAdditionalMounts } from './modules/mount-security/index.js';
+// Provider contracts use a separate barrel so update-skills identity detection
+// remains tied to src/providers/index.ts.
+import './provider-contracts/index.js';
+import { getProviderHostContract } from './provider-contracts/registry.js';
+import { resolveProviderName } from './providers/provider-name.js';
+import {
+  providerStateVolumePath,
+  realizeProviderSpawnSurfaces,
+  syncSharedSkillLinks,
+  type ProviderSpawnRealization,
+} from './provider-contracts/realize.js';
 // Provider host-side config barrel — each provider that needs host-side
 // container setup self-registers on import.
 import './providers/index.js';
@@ -150,6 +169,7 @@ interface ActiveSessionRuntime {
    * docker CLI inexpressible.
    */
   handle: SupervisedHandle;
+  gateway: GatewaySessionControl;
   containerName: string;
   /**
    * When this host started tracking the runtime. Backs the sweep's ceiling
@@ -168,6 +188,7 @@ interface ActiveSessionRuntime {
   finishedPromise: Promise<void>;
   resolveFinished: () => void;
   stopReason?: string;
+  teardownIncomplete?: boolean;
   /** Incarnation this process shadow-claimed in session_claims, if the write landed. */
   claimIncarnation?: number;
   /** A deferred fenced finalization is already queued for this runtime. */
@@ -175,6 +196,8 @@ interface ActiveSessionRuntime {
 }
 
 const activeContainers = new Map<string, ActiveSessionRuntime>();
+let gatewayUnavailableReason: string | undefined;
+let gatewayAdmissionGeneration = 0;
 
 // Claimant identity for the session_claims rows: the host's durable lease
 // instance id when the lease is running, else a process-scoped fallback
@@ -255,6 +278,38 @@ export function getContainerStartedAtMs(sessionId: string): number | undefined {
   return activeContainers.get(sessionId)?.startedAtMs;
 }
 
+/** Stop host-local observation without revoking resources that may survive restart. */
+export async function abortGatewaySessionObservers(reason = 'host-shutdown'): Promise<void> {
+  await Promise.all(
+    [...activeContainers.values()].map(async (runtime) => {
+      try {
+        await releaseGatewaySession(runtime.gateway, { kind: 'host-detached', reason });
+      } catch (err) {
+        log.error('Gateway session detachment failed', { containerName: runtime.containerName, err });
+      }
+    }),
+  );
+}
+
+/** Fail closed when the selected gateway can no longer authorize requests. */
+export function stopGatewaySessionsForUnavailability(reason: string): void {
+  gatewayUnavailableReason = reason;
+  gatewayAdmissionGeneration++;
+  log.error('Gateway unavailable; stopping active sessions', { reason, sessions: activeContainers.size });
+  for (const sessionId of activeContainers.keys()) killContainer(sessionId, 'gateway-unavailable');
+}
+
+/**
+ * Reopen admission once the gateway can authorize again. Closure is a
+ * fail-closed state, not a terminal one: without this the host stays up while
+ * silently refusing every session, and only a service restart clears it.
+ */
+export function resumeGatewaySessionAdmission(): void {
+  if (!gatewayUnavailableReason) return;
+  log.info('Gateway available again; reopening session admission', { previousReason: gatewayUnavailableReason });
+  gatewayUnavailableReason = undefined;
+}
+
 /**
  * Sessions whose running container could not be claim-fenced at adoption (the
  * store was unreachable). They are deliberately NOT in the registry — nothing
@@ -289,12 +344,32 @@ async function retryPendingAdoption(session: Session): Promise<boolean> {
       `session ${session.id} is claimed by another live host process — not adopting or spawning a duplicate`,
     );
   }
-  const runtime = registerRuntime(session.id, snapshot.handle, snapshot.handle.name, true);
+  let gatewaySession: GatewaySessionControl;
+  try {
+    const group = await getAgentGroup(session.agent_group_id);
+    if (!group) throw new Error(`Agent group ${session.agent_group_id} no longer exists`);
+    gatewaySession = await ensureGatewaySession({
+      disposition: 'adopt',
+      key: snapshot.handle.key,
+      runtimeIdentity: gatewayRuntimeIdentity(snapshot.handle.key),
+      groupName: group.name,
+      containerName: snapshot.handle.name,
+      capabilities: driver.capabilities(),
+    });
+  } catch (err) {
+    await releaseClaimQuietly(session.id, claimIncarnation);
+    throw err;
+  }
+  const runtime = registerRuntime(session.id, snapshot.handle, gatewaySession, snapshot.handle.name, true);
   runtime.claimIncarnation = claimIncarnation;
   runtime.stopReason = undefined;
   snapshot.handle.onTerminal((failure) => {
     void finishAndResolve(session.id, runtime, failure);
   });
+  if (armGatewayAvailability(session.id, gatewaySession)) {
+    await runtime.finishedPromise;
+    return false;
+  }
   await markContainerRunning(session.id);
   pendingAdoptions.delete(session.id);
   log.info('Adopted surviving container on retry after a failed claim write', { sessionId: session.id });
@@ -306,7 +381,7 @@ async function retryPendingAdoption(session: Session): Promise<boolean> {
  * (the in-flight wake promise is reused).
  *
  * Contract: never throws. Returns `true` on successful spawn, `false` on
- * transient spawn failure (e.g. OneCLI gateway unreachable). Callers don't
+ * transient spawn failure (e.g. the selected gateway is unreachable). Callers don't
  * need to wrap — the inbound row stays pending and host-sweep retries on its
  * next tick.
  */
@@ -380,100 +455,142 @@ async function spawnContainer(session: Session): Promise<void> {
   const providerName = resolveProviderName(session.agent_provider, containerConfig.provider);
   await initGroupFilesystem(agentGroup, { provider: providerName });
 
-  // Resolve the effective provider/channel/agent-scoped contributions (extra
-  // mounts, env passthrough, MCP servers, user-visible tools). Computed once
-  // and threaded through buildMounts and composeSessionSpec so side effects
-  // (mkdir, etc.) fire once.
-  const contribution = await resolveContainerContribution(session, agentGroup, containerConfig);
-
-  const mounts = await buildMounts(agentGroup, session, containerConfig, providerName, contribution);
+  // Resolve the effective provider + any host-side contribution it declares
+  // (extra mounts, env passthrough). Computed once and threaded through both
+  // buildMounts and buildContainerArgs so side effects (mkdir, etc.) fire once.
+  const {
+    provider,
+    contribution: providerContribution,
+    surfaces,
+  } = await resolveProviderContribution(session, agentGroup, containerConfig);
+  // Fork: channel + agent-scoped contributions (env, MCP servers, user-visible
+  // tools, mounts) layered over the provider's. Kept out of
+  // resolveProviderContribution so upstream's provider path stays untouched.
+  const sessionContribution = await resolveSessionContribution(session, agentGroup);
+  const contribution = mergeContainerContributions(providerContribution, sessionContribution);
   const containerName = `nanoclaw-v2-${agentGroup.folder}-${Date.now()}`;
+  const mounts = await buildMounts(
+    agentGroup,
+    session,
+    containerConfig,
+    provider,
+    providerContribution,
+    surfaces,
+    sessionContribution.mounts,
+  );
   const mailboxEnvironment = await mailbox.runnerEnvironment(mailboxKey);
 
   const driver = getSessionDriver();
-  // The gateway's per-session contribution — typed env and mounts (and, on a
-  // driver that manages them, auxiliary containers), merged into the spec
-  // BEFORE validation so admission sees the whole session. Fail-closed exactly
-  // as the old wiring was: contribute() throwing aborts the spawn, the inbound
-  // row stays pending, and the sweep retries. Network selection is NOT here —
-  // topology is driver-private (see `drivers/index.ts`).
-  const gateway = await getGatewayProvider().contribute({
+  // Core calls the same idempotent provider operation for new and surviving
+  // sessions. The returned typed contribution enters driver validation whole.
+  const gatewaySession = await ensureGatewaySession({
+    disposition: 'create',
     key: { installSlug: INSTALL_SLUG, agentGroupId: agentGroup.id, sessionId: session.id },
+    runtimeIdentity: gatewayRuntimeIdentity({
+      installSlug: INSTALL_SLUG,
+      agentGroupId: agentGroup.id,
+      sessionId: session.id,
+    }),
     groupName: agentGroup.name,
+    containerName,
     capabilities: driver.capabilities(),
   });
-  if (gateway.containers?.length && !driver.capabilities().auxiliaryContainers) {
-    // Named at composition, where the error can say which side to change —
-    // not left for the driver's refusal backstop to discover.
-    throw specInvalid(
-      `gateway provider composed auxiliary containers, but driver '${driver.kind}' does not manage them ` +
-        `(capabilities().auxiliaryContainers is false)`,
-    );
+  const admissionGeneration = gatewayAdmissionGeneration;
+  const gateway = gatewaySession.lease.contribution;
+  let spec: SessionSpec;
+  let claimIncarnation: number | null = null;
+  try {
+    if (gateway.containers?.length && !driver.capabilities().auxiliaryContainers) {
+      // Named at composition, where the error can say which side to change —
+      // not left for the driver's refusal backstop to discover.
+      throw specInvalid(
+        `gateway provider composed auxiliary containers, but driver '${driver.kind}' does not manage them ` +
+          `(capabilities().auxiliaryContainers is false)`,
+      );
+    }
+
+    spec = composeSessionSpec({
+      agentGroup,
+      session,
+      containerName,
+      mounts,
+      containerConfig,
+      contribution,
+      gateway,
+      mailboxEnvironment,
+    });
+
+    log.info('Spawning session', { sessionId: session.id, agentGroup: agentGroup.name, containerName });
+
+    // Claim before touching runtime state. Another host may already own the session.
+    claimIncarnation = await claimSessionRun(session.id, containerName);
+    if (claimIncarnation === null) {
+      throw new Error(`session ${session.id} is claimed by another live host process — not spawning a duplicate`);
+    }
+
+    // Clear any orphan heartbeat from a previous container instance — the sweep's
+    // ceiling check treats a missing file as "fresh spawn, give grace". Without
+    // this, the stale mtime can trigger an immediate kill before the new container
+    // touches the file itself.
+    fs.rmSync(heartbeatPath(agentGroup.id, session.id), { force: true });
+  } catch (err) {
+    if (claimIncarnation !== null) await releaseClaimQuietly(session.id, claimIncarnation);
+    await releaseGatewaySession(gatewaySession, {
+      kind: claimIncarnation === null ? 'host-detached' : 'session-ended',
+      reason: 'spawn-failed',
+    });
+    throw err;
   }
   // Compose deployment: the gateway's proxy env points sibling containers at
   // `host.docker.internal`, unreachable/incorrect from the compose network.
   // No-op unless NANOCLAW_ONECLI_HOSTNAME is set.
   if (gateway.env) gateway.env = rewriteOneCliProxyEnv(gateway.env);
 
-  const spec = composeSessionSpec({
-    agentGroup,
-    session,
-    containerName,
-    mounts,
-    containerConfig,
-    contribution,
-    gateway,
-    mailboxEnvironment,
-  });
-
-  log.info('Spawning session', { sessionId: session.id, agentGroup: agentGroup.name, containerName });
-
-  // The claim is the cross-process spawn fence: winning it is what licenses
-  // touching the session's runtime state (the heartbeat clear below included).
-  // Losing it means another live claimant runs this session — abort; the wake
-  // contract turns the throw into `false` and the sweep re-checks next tick.
-  const claimIncarnation = await claimSessionRun(session.id, containerName);
-  if (claimIncarnation === null) {
-    throw new Error(`session ${session.id} is claimed by another live host process — not spawning a duplicate`);
-  }
-
-  // Clear any orphan heartbeat from a previous container instance — the sweep's
-  // ceiling check treats a missing file as "fresh spawn, give grace". Without
-  // this, the stale mtime can trigger an immediate kill before the new container
-  // touches the file itself.
-  fs.rmSync(heartbeatPath(agentGroup.id, session.id), { force: true });
-
-  let handle;
+  let handle: SupervisedHandle;
   try {
     handle = await driver.prepare(spec);
   } catch (err) {
     await releaseClaimQuietly(session.id, claimIncarnation);
+    await releaseGatewaySession(gatewaySession, { kind: 'session-ended', reason: 'driver-prepare-failed' });
     throw err;
   }
-
-  const runtime = registerRuntime(session.id, handle, containerName, false);
+  const runtime = registerRuntime(session.id, handle, gatewaySession, containerName, false);
   runtime.claimIncarnation = claimIncarnation;
 
-  try {
-    await armSessionLifecycle({
-      handle,
-      onTerminal: (failure) => {
-        void finishAndResolve(session.id, runtime, failure);
-      },
-      afterStart: () => {
-        return markContainerRunning(session.id);
-      },
-    });
-  } catch (err) {
-    if (activeContainers.get(session.id) === runtime && !runtime.finished) {
-      activeContainers.delete(session.id);
-      runtime.resolveFinished();
-      await releaseClaimQuietly(session.id, claimIncarnation);
-    } else {
+  await armSessionLifecycle({
+    handle,
+    onTerminal: (failure) => {
+      void finishAndResolve(session.id, runtime, failure);
+    },
+    afterStart: () => {
+      return markContainerRunning(session.id);
+    },
+    beforeStart: () => {
+      if (
+        gatewayUnavailableReason ||
+        admissionGeneration !== gatewayAdmissionGeneration ||
+        gatewaySession.controller.signal.aborted
+      ) {
+        throw new Error('Gateway session admission closed before agent start');
+      }
+      if (armGatewayAvailability(session.id, gatewaySession)) {
+        throw new Error('Gateway session became unavailable before agent start');
+      }
+    },
+    onFailure: async () => {
+      if (!runtime.stopReason) {
+        runtime.stopReason = 'start-failed';
+        try {
+          await handle.stop('start-failed');
+        } catch (err) {
+          runtime.teardownIncomplete = true;
+          log.error('Failed to clean up session after start failure', { sessionId: session.id, err });
+        }
+      }
+      if (!runtime.finished) await finishAndResolve(session.id, runtime);
       await runtime.finishedPromise;
-    }
-    throw err;
-  }
+    },
+  });
 }
 
 /**
@@ -488,16 +605,25 @@ async function spawnContainer(session: Session): Promise<void> {
 export async function armSessionLifecycle(deps: {
   handle: Pick<SupervisedHandle, 'onTerminal' | 'start'>;
   onTerminal: (failure?: SessionFailure) => void;
+  beforeStart?: () => void | Promise<void>;
   afterStart?: () => void | Promise<void>;
+  onFailure?: () => void | Promise<void>;
 }): Promise<void> {
   deps.handle.onTerminal(deps.onTerminal);
-  await deps.handle.start();
-  await deps.afterStart?.();
+  try {
+    await deps.beforeStart?.();
+    await deps.handle.start();
+    await deps.afterStart?.();
+  } catch (err) {
+    await deps.onFailure?.();
+    throw err;
+  }
 }
 
 function registerRuntime(
   sessionId: string,
   handle: SupervisedHandle,
+  gateway: GatewaySessionControl,
   containerName: string,
   adopted: boolean,
 ): ActiveSessionRuntime {
@@ -507,6 +633,7 @@ function registerRuntime(
   });
   const runtime: ActiveSessionRuntime = {
     handle,
+    gateway,
     containerName,
     startedAtMs: Date.now(),
     adopted,
@@ -517,6 +644,48 @@ function registerRuntime(
   };
   activeContainers.set(sessionId, runtime);
   return runtime;
+}
+
+/** Returns true when registration reports an already-unavailable lease synchronously. */
+function armGatewayAvailability(sessionId: string, gateway: GatewaySessionControl): boolean {
+  return watchGatewayAvailability(gateway.lease, gateway.controller.signal, (reason) => {
+    log.error('Gateway session became unavailable; stopping agent runtime', { sessionId, reason });
+    killContainer(sessionId, 'gateway-unavailable');
+  });
+}
+
+/** Returns true when a lease reports unavailability during callback registration. */
+export function watchGatewayAvailability(
+  gateway: GatewaySessionLease,
+  signal: AbortSignal,
+  onUnavailable: (reason: string) => void,
+): boolean {
+  let unavailable = false;
+  gateway.onUnavailable?.((reason) => {
+    if (signal.aborted) return;
+    unavailable = true;
+    onUnavailable(reason);
+  });
+  return unavailable;
+}
+
+async function ensureGatewaySession(input: GatewaySessionInput): Promise<GatewaySessionControl> {
+  if (gatewayUnavailableReason) {
+    throw new Error(`Gateway session admission is closed: ${gatewayUnavailableReason}`);
+  }
+  const controller = new AbortController();
+  const generation = gatewayAdmissionGeneration;
+  try {
+    const session = { lease: await getGatewayProvider().sessions.ensure(input, controller.signal), controller };
+    if (gatewayUnavailableReason || generation !== gatewayAdmissionGeneration) {
+      await releaseGatewaySession(session, { kind: 'host-detached', reason: 'admission-closed' });
+      throw new Error('Gateway session admission closed while acquiring lease');
+    }
+    return session;
+  } catch (err) {
+    controller.abort('ensure-failed');
+    throw err;
+  }
 }
 
 /**
@@ -625,6 +794,16 @@ async function finish(sessionId: string, runtime: ActiveSessionRuntime, failure?
   }
 
   try {
+    await runtime.handle.stop(runtime.stopReason ?? 'runtime-ended');
+    runtime.teardownIncomplete = false;
+  } catch (err) {
+    runtime.teardownIncomplete = true;
+    log.error('Session teardown incomplete; retaining its claim and gateway lease', { sessionId, err });
+    scheduleDeferredFinish(sessionId, runtime, failure);
+    return;
+  }
+
+  try {
     await markContainerStopped(sessionId);
   } catch (err) {
     log.error('Failed to record stopped container', { sessionId, containerName, err });
@@ -650,6 +829,14 @@ async function finish(sessionId: string, runtime: ActiveSessionRuntime, failure?
   }
   if (runtime.claimIncarnation !== undefined) {
     await releaseClaimQuietly(sessionId, runtime.claimIncarnation);
+  }
+  try {
+    await releaseGatewaySession(runtime.gateway, {
+      kind: runtime.teardownIncomplete ? 'host-detached' : 'session-ended',
+      reason: runtime.stopReason ?? (failure ? `runtime-${failure.kind}` : 'runtime-ended'),
+    });
+  } catch (err) {
+    log.error('Gateway session release failed', { sessionId, containerName, err });
   }
   for (const callback of runtime.exitCallbacks) {
     try {
@@ -679,6 +866,7 @@ export function killContainer(sessionId: string, reason: string, onExit?: () => 
       if (!entry.finished) void finishAndResolve(sessionId, entry, undefined);
     },
     (err: unknown) => {
+      entry.teardownIncomplete = true;
       log.error('Failed to stop session', { sessionId, reason, err });
       if (!entry.finished) void finishAndResolve(sessionId, entry, undefined);
     },
@@ -690,7 +878,7 @@ export function killContainer(sessionId: string, reason: string, onExit?: () => 
  *
  * This replaces the old reap-everything `cleanupOrphans()`. A surviving session
  * used to be destroyed on every host restart and its work recovered only
- * through the DB; now the host re-registers it and delivery resumes. The OneCLI
+ * through the DB; now the host re-registers it and delivery resumes. The
  * gateway resolves credentials per request on the host side, so an adopted
  * session's egress keeps working without any per-process state to rebuild.
  */
@@ -708,11 +896,12 @@ export async function adoptRunningSessions(): Promise<{ adopted: number; stopped
   let stopped = 0;
   for (const { handle, phase } of snapshots) {
     const session = handle.key.sessionId ? await getSession(handle.key.sessionId) : undefined;
+    const agentGroup = session ? await getAgentGroup(session.agent_group_id) : undefined;
     // The snapshot's phase is the listing's own truth: a corpse arrives as
     // 'terminal' (or not at all), so telling adoptable sessions apart needs
     // no per-handle status() round trip. `stop()` on a corpse is still full
     // teardown — a self-exited runtime needs its residue cleaned up.
-    if (!session || session.status !== 'active' || phase !== 'running') {
+    if (!session || !agentGroup || session.status !== 'active' || phase !== 'running') {
       await handle.stop('orphan-at-startup').catch(() => {});
       stopped += 1;
       continue;
@@ -742,16 +931,40 @@ export async function adoptRunningSessions(): Promise<{ adopted: number; stopped
       continue;
     }
     pendingAdoptions.delete(session.id);
-    const runtime = registerRuntime(session.id, handle, handle.name, true);
+    let gatewaySession: GatewaySessionControl;
+    try {
+      gatewaySession = await ensureGatewaySession({
+        disposition: 'adopt',
+        key: handle.key,
+        runtimeIdentity: gatewayRuntimeIdentity(handle.key),
+        groupName: agentGroup.name,
+        containerName: handle.name,
+        capabilities: driver.capabilities(),
+      });
+      await driver.reconcileNetworkAccess?.(gatewaySession.lease.contribution.networkAccess);
+    } catch (err) {
+      log.error('Gateway could not adopt running session; stopping it', { sessionId: session.id, err });
+      await handle.stop('gateway-adoption-failed').catch(() => {});
+      await releaseClaimQuietly(session.id, claimIncarnation);
+      stopped += 1;
+      continue;
+    }
+    const runtime = registerRuntime(session.id, handle, gatewaySession, handle.name, true);
     runtime.claimIncarnation = claimIncarnation;
     runtime.stopReason = undefined;
     handle.onTerminal((failure) => {
       void finishAndResolve(session.id, runtime, failure);
     });
+    if (armGatewayAvailability(session.id, gatewaySession)) {
+      await runtime.finishedPromise;
+      stopped += 1;
+      continue;
+    }
     await markContainerRunning(session.id);
     adopted += 1;
   }
 
+  await getGatewayProvider().sessions.reapOrphans?.();
   await driver.reapResidue?.(INSTALL_SLUG).catch?.(() => {});
   // Reconcile terminals the watch stream missed while no host was listening —
   // adoption is the one place a full re-list is already cheap, so the hub's
@@ -765,6 +978,34 @@ export async function adoptRunningSessions(): Promise<{ adopted: number; stopped
   await honorPendingStopIntents();
 
   return { adopted, stopped };
+}
+
+/**
+ * Stop the sessions this process supervises whose session row or agent group
+ * no longer exists. The per-session reconcile only visits live rows, so a
+ * delete (setup cleanup, `ncl groups delete`) would otherwise leave the
+ * container up until the next host restart, where adoption stops it the same
+ * way. Containers no process supervises are adoption's job, not this sweep's.
+ *
+ * Not racy against a legitimate spawn: a runtime is registered only after its
+ * session row was read (`spawnContainer`) or checked (adoption), and the rows
+ * are read after that, so a missing row was deleted. A spawn still in flight
+ * is left for the next tick, once `start()` has returned.
+ */
+export async function stopOrphanedSessions(): Promise<number> {
+  let stopped = 0;
+  for (const [sessionId, runtime] of [...activeContainers]) {
+    if (wakePromises.has(sessionId) || runtime.stopReason) continue;
+    const session = await getSession(sessionId);
+    if (session && (await getAgentGroup(session.agent_group_id))) continue;
+    log.warn('Stopping container whose session or agent group was deleted', {
+      sessionId,
+      containerName: runtime.containerName,
+    });
+    killContainer(sessionId, 'orphaned');
+    stopped += 1;
+  }
+  return stopped;
 }
 
 /**
@@ -822,31 +1063,66 @@ export async function honorPendingStopIntents(
  * Resolve the provider name for a session:
  *
  *   sessions.agent_provider → container_configs.provider → 'claude'
+ *
+ * The rule lives in providers/provider-name.ts so host commands that validate
+ * against the group's provider (e.g. `--speed`) share it; re-exported here for
+ * the spawn path's existing callers.
  */
-export function resolveProviderName(
-  sessionProvider: string | null | undefined,
-  containerConfigProvider: string | null | undefined,
-): string {
-  return (sessionProvider || containerConfigProvider || 'claude').toLowerCase();
-}
+export { resolveProviderName };
 
-async function resolveContainerContribution(
+export async function resolveProviderContribution(
   session: Session,
   agentGroup: AgentGroup,
-  containerConfig: ContainerConfig,
-): Promise<ProviderContainerContribution> {
+  containerConfig: import('./container-config.js').ContainerConfig,
+): Promise<{ provider: string; contribution: ProviderContainerContribution; surfaces?: ProviderSpawnRealization }> {
   const provider = resolveProviderName(session.agent_provider, containerConfig.provider);
-  const providerFn = getProviderContainerConfig(provider);
-  const providerContribution = providerFn
-    ? await providerFn({
-        sessionDir: sessionDir(agentGroup.id, session.id),
-        agentGroupId: agentGroup.id,
-        groupDir: path.resolve(GROUPS_DIR, agentGroup.folder),
-        selectedSkills: selectedSkillNames(containerConfig),
-        hostEnv: process.env,
-      })
-    : {};
+  const fn = getProviderContainerConfig(provider);
+  const contract = getProviderHostContract(provider);
+  if (!contract && !fn) {
+    // Same as before contracts existed: the group spawns with the default
+    // (Claude) surfaces. Say so once per spawn so an operator can spot it.
+    log.warn('Provider has no registered host contract or adapter; spawning with default surfaces', {
+      provider,
+      agentGroupId: agentGroup.id,
+    });
+  }
+  const context = {
+    sessionDir: sessionDir(agentGroup.id, session.id),
+    agentGroupId: agentGroup.id,
+    groupDir: path.resolve(GROUPS_DIR, agentGroup.folder),
+    selectedSkills: selectedSkillNames(containerConfig),
+    hostEnv: process.env,
+  };
+  if (!contract) return { provider, contribution: fn ? await fn(context) : {} };
+  if (contract.legacyHostAdapter === 'required' && !fn) {
+    throw new Error(`Provider '${provider}' host contract requires a legacy host adapter`);
+  }
 
+  const surfaces = await realizeProviderSpawnSurfaces(
+    provider,
+    contract,
+    agentGroup.id,
+    context.groupDir,
+    context.sessionDir,
+    context.selectedSkills,
+    {
+      legacyOverlay: () => Promise.resolve(fn?.({ ...context, coreOwnsProviderSurfaces: true as const }) ?? {}),
+      composeProjectDocument: (spec) => composeGroupProjectDoc(agentGroup, context.groupDir, spec),
+    },
+  );
+  return { provider, contribution: surfaces.contribution, surfaces };
+}
+
+/**
+ * Fork: channel- and agent-scoped container contributions for a session.
+ * Channel contributions come from the session's messaging group; agent-scoped
+ * ones apply to every session of the group regardless of channel (e.g. Band
+ * grants cross-channel control tools).
+ */
+async function resolveSessionContribution(
+  session: Session,
+  agentGroup: AgentGroup,
+): Promise<ProviderContainerContribution> {
   const messagingGroup = session.messaging_group_id
     ? ((await getMessagingGroup(session.messaging_group_id)) ?? null)
     : null;
@@ -860,15 +1136,17 @@ async function resolveContainerContribution(
       })
     : {};
 
-  // Agent-scoped contributions apply to every session of the group regardless
-  // of the session's channel (e.g. Band grants cross-channel control tools).
   const agentContributions = await Promise.all(
     getAgentContainerConfigs().map((fn) => fn({ session, agentGroupId: agentGroup.id, hostEnv: process.env })),
   );
 
-  return mergeContainerContributions(providerContribution, channelContribution, ...agentContributions);
+  return mergeContainerContributions(channelContribution, ...agentContributions);
 }
 
+/**
+ * Merge contributions in precedence order (later wins for `env` and
+ * `mcpServers`; `mounts` and `userVisibleTools` concatenate).
+ */
 export function mergeContainerContributions(
   ...contributions: ProviderContainerContribution[]
 ): ProviderContainerContribution {
@@ -886,25 +1164,48 @@ export async function buildMounts(
   containerConfig: ContainerConfig,
   provider: string,
   providerContribution: ProviderContainerContribution,
+  providerSurfaces?: ProviderSpawnRealization,
+  sessionMounts?: ProviderContainerContribution['mounts'],
 ): Promise<VolumeMount[]> {
   const projectRoot = process.cwd();
 
-  // Default agent surfaces (composed project doc, skill links, provider state
-  // dir) apply unless the provider's registration declares it provides its own.
-  const defaultSurfaces = !providerProvidesAgentSurfaces(provider);
+  const contract = getProviderHostContract(provider);
+  // Undeclared payloads stay on the legacy capability gate. Declared payloads
+  // are realized below from their contract.
+  const defaultSurfaces = !contract && !providerProvidesAgentSurfaces(provider);
 
   const groupDir = path.resolve(GROUPS_DIR, agentGroup.folder);
   const claudeDir = path.join(DATA_DIR, 'v2-sessions', agentGroup.id, '.claude-shared');
-  if (defaultSurfaces) {
+  const sessDir = sessionDir(agentGroup.id, session.id);
+  const projectDocument = contract?.projectDocument;
+  let lateProjectDocumentMount: VolumeMount | undefined;
+  const lateStateVolumeMounts = new Map<string, VolumeMount>();
+  const lateSkillViewMounts = new Map<string, VolumeMount[]>();
+  let skillBackingPaths = new Map<string, string>();
+  if (contract) {
+    providerSurfaces ??= await realizeProviderSpawnSurfaces(
+      provider,
+      contract,
+      agentGroup.id,
+      groupDir,
+      sessDir,
+      selectedSkillNames(containerConfig),
+      {
+        legacyOverlay: async () => providerContribution,
+        composeProjectDocument: (spec) =>
+          composeGroupProjectDoc(agentGroup, groupDir, spec, selectedSkillNames(containerConfig)),
+      },
+    );
+    skillBackingPaths = providerSurfaces.skillBackingPaths;
+  } else if (defaultSurfaces) {
     syncSkillSymlinks(claudeDir, containerConfig);
 
     // Compose CLAUDE.md fresh every spawn: every instruction source inlined
     // into one flat file. See `project-doc-compose.ts`.
-    await composeGroupProjectDoc(agentGroup, groupDir, DEFAULT_PROJECT_DOC);
+    await composeGroupProjectDoc(agentGroup, groupDir, DEFAULT_PROJECT_DOC, selectedSkillNames(containerConfig));
   }
 
   const mounts: VolumeMount[] = [];
-  const sessDir = sessionDir(agentGroup.id, session.id);
   const scope = agentGroup.id;
 
   // Session workspace: mailbox-selected state plus outbox and heartbeat files.
@@ -974,20 +1275,54 @@ export async function buildMounts(
   // The composed project document — one nested RO mount on top of the RW group
   // dir, holding the full text of every instruction source. `container/CLAUDE.md`
   // is read on the host at compose time, so nothing needs it inside the container.
-  const composedClaudeMd = path.join(groupDir, 'CLAUDE.md');
-  if (defaultSurfaces && fs.existsSync(composedClaudeMd)) {
-    mounts.push({
-      hostPath: composedClaudeMd,
-      containerPath: '/workspace/agent/CLAUDE.md',
+  const composedProjectDocument = path.join(groupDir, projectDocument?.fileName ?? DEFAULT_PROJECT_DOC.fileName);
+  if ((projectDocument || defaultSurfaces) && fs.existsSync(composedProjectDocument)) {
+    const mount = {
+      hostPath: composedProjectDocument,
+      containerPath: projectDocument?.containerPath ?? '/workspace/agent/CLAUDE.md',
       readonly: true,
-      mountClass: 'group-state',
+      mountClass: projectDocument?.mountClass ?? 'group-state',
       scope,
-    });
+    } satisfies VolumeMount;
+    if (mount.mountClass === 'allowlisted-extra') lateProjectDocumentMount = mount;
+    else mounts.push(mount);
   }
 
   // Per-group .claude-shared at /home/node/.claude (provider state, settings,
   // skill symlinks). Per agent group, not per session.
-  if (defaultSurfaces) {
+  if (contract) {
+    for (const volume of contract.stateVolumes) {
+      const hostPath = providerStateVolumePath(volume, agentGroup.id, sessDir);
+      const mount = {
+        hostPath,
+        containerPath: volume.containerPath,
+        readonly: volume.mode === 'ro',
+        mountClass: volume.mountClass,
+        scope,
+      } satisfies VolumeMount;
+      if (mount.mountClass === 'allowlisted-extra') lateStateVolumeMounts.set(volume.id, mount);
+      else mounts.push(mount);
+    }
+    for (const view of contract.skillViews) {
+      const hostPath = skillBackingPaths.get(view.backingId);
+      if (!hostPath)
+        throw new Error(`Provider '${provider}' skill view references unknown backing '${view.backingId}'`);
+      const mount = {
+        hostPath,
+        containerPath: view.containerPath,
+        readonly: view.mode === 'ro',
+        mountClass: view.mountClass,
+        scope,
+      } satisfies VolumeMount;
+      if (mount.mountClass === 'allowlisted-extra') {
+        const backingMounts = lateSkillViewMounts.get(view.backingId) ?? [];
+        backingMounts.push(mount);
+        lateSkillViewMounts.set(view.backingId, backingMounts);
+      } else {
+        mounts.push(mount);
+      }
+    }
+  } else if (defaultSurfaces) {
     mounts.push({
       hostPath: claudeDir,
       containerPath: '/home/node/.claude',
@@ -1025,12 +1360,32 @@ export async function buildMounts(
     mounts.push(...validated.map((m) => ({ ...m, mountClass: 'allowlisted-extra' as const, scope })));
   }
 
-  // Provider/channel/agent-contributed mounts (e.g. opencode-xdg). Vetted
-  // upstream by the in-tree provider/channel registration, which is exactly
-  // the 'allowlisted-extra' contract — classing them group-state would deny
-  // any contributor whose state root sits outside the group subtree.
-  if (providerContribution.mounts) {
+  // Declared allowlisted-extra surfaces replace the old callback contribution
+  // at the same late slot, in the spawn order derived from resource kinds.
+  if (contract) {
+    for (const volume of contract.stateVolumes) {
+      const mount = lateStateVolumeMounts.get(volume.id);
+      if (mount) mounts.push(mount);
+    }
+    for (const backing of contract.skillBackings) {
+      mounts.push(...(lateSkillViewMounts.get(backing.id) ?? []));
+    }
+    if (lateProjectDocumentMount) mounts.push(lateProjectDocumentMount);
+  }
+
+  // Provider-contributed mounts (e.g. opencode-xdg). Vetted upstream by the
+  // in-tree provider registration, which is exactly the 'allowlisted-extra'
+  // contract — classing them group-state would deny any provider whose state
+  // root sits outside the group subtree.
+  if (!contract && providerContribution.mounts) {
     mounts.push(...providerContribution.mounts.map((m) => ({ ...m, mountClass: 'allowlisted-extra' as const, scope })));
+  }
+
+  // Fork: channel/agent-scoped mounts. A provider contract never covers these,
+  // so they apply whether or not one is declared. Same 'allowlisted-extra'
+  // vetting as provider mounts — the contributor is in-tree registration.
+  if (sessionMounts?.length) {
+    mounts.push(...sessionMounts.map((m) => ({ ...m, mountClass: 'allowlisted-extra' as const, scope })));
   }
 
   // Compose deployment: mount sources computed above are all repo-relative
@@ -1166,11 +1521,12 @@ export function composeSessionSpec(input: ComposeSessionSpecInput): SessionSpec 
 
   return {
     key: { installSlug: INSTALL_SLUG, agentGroupId: agentGroup.id, sessionId: session.id },
-    labels: { 'nanoclaw-container-name': containerName, [GROUP_FOLDER_LABEL]: agentGroup.folder },
+    labels: { ...gateway.labels, 'nanoclaw-container-name': containerName, [GROUP_FOLDER_LABEL]: agentGroup.folder },
     // The gateway's auxiliary containers ride beside the agent; capability-
     // gated in the spawn path before composition ever runs.
     containers: [agent, ...(gateway.containers ?? [])],
     network: 'shared-private',
+    networkAccess: gateway.networkAccess,
     hardening: 'standard',
     resources: {
       cpus: CONTAINER_CPU_LIMIT || undefined,
@@ -1243,64 +1599,31 @@ export function parsePidsLimit(value: string): number | undefined {
  * scan that follows a link wherever it lands, and only `@` imports are gated on
  * resolving inside the project directory.
  */
-export function syncSkillSymlinks(claudeDir: string, containerConfig: ContainerConfig): void {
+export function syncSkillSymlinks(
+  claudeDir: string,
+  containerConfig: import('./container-config.js').ContainerConfig,
+): string[] {
   const skillsDir = path.join(claudeDir, 'skills');
   if (!fs.existsSync(skillsDir)) {
     fs.mkdirSync(skillsDir, { recursive: true });
   }
 
-  const desired = selectedSkillNames(containerConfig);
-  const desiredSet = new Set(desired);
-
-  // Remove symlinks not in the desired set
-  for (const entry of fs.readdirSync(skillsDir)) {
-    const entryPath = path.join(skillsDir, entry);
-    let isSymlink = false;
-    try {
-      isSymlink = fs.lstatSync(entryPath).isSymbolicLink();
-    } catch {
-      continue;
-    }
-    if (isSymlink && !desiredSet.has(entry)) {
-      fs.unlinkSync(entryPath);
-    }
-  }
-
-  // Create symlinks for desired skills (container path targets)
-  for (const skill of desired) {
-    const linkPath = path.join(skillsDir, skill);
-    let entry: fs.Stats | undefined;
-    try {
-      entry = fs.lstatSync(linkPath);
-    } catch {
-      /* missing */
-    }
-    if (!entry) {
-      fs.symlinkSync(`/app/skills/${skill}`, linkPath);
-    } else if (!entry.isSymbolicLink()) {
-      // A real entry here is either a template overlay (intentional; see
-      // src/group-skills.ts) or a stale pre-refactor skill copy that shadows
-      // the shared skill (#3001). No marker distinguishes them yet, so
-      // surface the skip instead of staying silent.
-      log.warn(
-        'Shared skill not symlinked: real entry occupies the path (template overlay or stale pre-refactor copy)',
-        {
-          skill,
-          path: linkPath,
-        },
-      );
-    }
-  }
+  // Same body as the declared-contract path; real (non-symlink) entries are
+  // either a template overlay (intentional; see src/group-skills.ts) or a stale
+  // pre-refactor skill copy that shadows the shared skill (#3001), so the
+  // skip is surfaced as a warning.
+  const selected = selectedSkillNames(containerConfig);
+  syncSharedSkillLinks(skillsDir, selected, true);
+  return selected;
 }
 
 /**
  * Resolve the group's skill selection to concrete names — `'all'` recomputes
  * from `container/skills/` so newly-added upstream skills appear automatically.
  */
-function selectedSkillNames(containerConfig: ContainerConfig): string[] {
-  if (containerConfig.skills !== 'all') return containerConfig.skills;
+function selectedSkillNames(containerConfig: import('./container-config.js').ContainerConfig): string[] {
   const sharedSkillsDir = path.join(process.cwd(), 'container', 'skills');
-  return fs.existsSync(sharedSkillsDir)
+  const available = fs.existsSync(sharedSkillsDir)
     ? fs.readdirSync(sharedSkillsDir).filter((e) => {
         try {
           return fs.statSync(path.join(sharedSkillsDir, e)).isDirectory();
@@ -1309,6 +1632,8 @@ function selectedSkillNames(containerConfig: ContainerConfig): string[] {
         }
       })
     : [];
+  const selected = containerConfig.skills === 'all' ? available : containerConfig.skills;
+  return selectGatewayAgentSkills(selected);
 }
 
 // execFile (not exec/promisify(exec)) — CONTAINER_IMAGE, CONTAINER_IMAGE_BASE,

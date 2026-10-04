@@ -4,7 +4,7 @@
  * Runs inside a container. All message IO goes through the registered mailbox.
  *
  * Config is read from /workspace/agent/container.json (mounted RO).
- * Only TZ and OneCLI networking vars come from env.
+ * Only TZ and gateway networking vars come from env.
  *
  * Mount structure:
  *   /workspace/
@@ -34,11 +34,17 @@ import { getAgentMailbox, readMailboxContext } from './mailbox/index.js';
 // Providers barrel — each enabled provider self-registers on import.
 // Provider skills append imports to providers/index.ts.
 import './providers/index.js';
+// Provider-contracts barrel — each provider's runtime contract attaches to its
+// registration on import. Provider skills append imports to
+// provider-contracts/index.ts alongside the providers barrel line.
+import './provider-contracts/index.js';
 // Channel lifecycle-hook modules self-register on import (start/stop hooks).
 // Such an import must follow the providers barrel (so providers register
 // first) and precede the runStartHooks call below; channel install skills
 // append their `import './<channel>-lifecycle.js';` here.
-import { createProvider, type ProviderName } from './providers/factory.js';
+import { createProvider } from './providers/factory.js';
+import { getProviderRuntimeContract, requireProviderName } from './providers/provider-registry.js';
+import { registerProviderMemorySessionHook } from './provider-contracts/realize.js';
 import { buildMcpServers } from './mcp-servers.js';
 import { runStartHooks, runStopHooks } from './lifecycle.js';
 import { runPollLoop } from './poll-loop.js';
@@ -52,7 +58,7 @@ const CWD = '/workspace/agent';
 
 async function main(): Promise<void> {
   const config = loadConfig();
-  const providerName = config.provider.toLowerCase() as ProviderName;
+  const providerName = requireProviderName(config.provider);
   const mailbox = getAgentMailbox();
   await mailbox.start(await readMailboxContext());
 
@@ -126,9 +132,9 @@ async function main(): Promise<void> {
     additionalDirectories: additionalDirectories.length > 0 ? additionalDirectories : undefined,
     model: config.model,
     effort: config.effort,
-    fastMode: config.fastMode,
+    speed: config.speed,
   });
-  provider.registerMemorySessionHook(MEMORY_SESSION_HOOK);
+  registerProviderMemorySessionHook(providerName, provider, MEMORY_SESSION_HOOK);
 
   // Graceful shutdown: when the host stops the container (SIGTERM from
   // `docker stop`), abort the poll loop so the in-flight query can wind
@@ -148,6 +154,7 @@ async function main(): Promise<void> {
   try {
     await runPollLoop({
       provider,
+      providerContract: getProviderRuntimeContract(providerName),
       providerName,
       cwd: CWD,
       systemContext: { instructions },
