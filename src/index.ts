@@ -15,7 +15,6 @@ import {
 } from './container-runner.js';
 import { closeDb, initDb } from './db/connection.js';
 import { runMigrations } from './db/migrations/index.js';
-import { registerForkMigrations } from './db/migrations/fork.js';
 import { getSessionDriver } from './drivers/index.js';
 import { startActiveDeliveryPoll, startSweepDeliveryPoll, setDeliveryAdapter, stopDeliveryPolls } from './delivery.js';
 import { startHostInstanceLease, stopHostInstanceLease } from './host-instance.js';
@@ -68,6 +67,9 @@ import {
   teardownChannelAdapters,
   createChannelDeliveryAdapter,
 } from './channels/channel-registry.js';
+// Fork: fork-owned migrations + inbound route results returned to adapters.
+import { registerForkMigrations } from './db/migrations/fork.js';
+import { failedInboundRoute } from './fork/inbound-route.js';
 
 let stopGatewayAvailabilityMonitor: (() => void) | undefined;
 
@@ -85,9 +87,7 @@ async function main(): Promise<void> {
   const gatewayProvider = getGatewayProvider();
 
   // 1. Init central DB
-  // Fork migrations register outside upstream's core array (see fork.ts) —
-  // wire them in before running migrations so the migration set picks them up.
-  registerForkMigrations();
+  registerForkMigrations(); // Fork: register before runMigrations so the fork's migrations are in the set (see fork.ts)
   const db = await initDb(CENTRAL_DB_PATH, { role: 'host' });
   await runMigrations(db, undefined, { mode: 'auto' });
   log.info('Central DB ready', { dialect: db.dialect });
@@ -108,52 +108,42 @@ async function main(): Promise<void> {
   // 2. Channel adapters
   await initChannelAdapters((adapter: ChannelAdapter): ChannelSetup => {
     return {
-      async onInbound(platformId, threadId, message) {
-        await inboundReady;
-        try {
-          return await routeInbound({
-            channelType: adapter.channelType,
-            // The one host-side stamping seam: adapters stay instance-blind,
-            // the host stamps the receiving instance on every inbound event.
-            instance: adapter.instance ?? adapter.channelType,
-            platformId,
-            threadId,
-            message: {
-              id: message.id,
-              kind: message.kind,
-              content: JSON.stringify(message.content),
-              timestamp: message.timestamp,
-              isMention: message.isMention,
-              isGroup: message.isGroup,
-            },
+      onInbound(platformId, threadId, message) {
+        return inboundReady
+          .then(() =>
+            routeInbound({
+              channelType: adapter.channelType,
+              // The one host-side stamping seam: adapters stay instance-blind,
+              // the host stamps the receiving instance on every inbound event.
+              instance: adapter.instance ?? adapter.channelType,
+              platformId,
+              threadId,
+              message: {
+                id: message.id,
+                kind: message.kind,
+                content: JSON.stringify(message.content),
+                timestamp: message.timestamp,
+                isMention: message.isMention,
+                isGroup: message.isGroup,
+              },
+            }),
+          )
+          .catch((err) => {
+            log.error('Failed to route inbound message', { channelType: adapter.channelType, err });
+            return failedInboundRoute(message.id, err);
           });
-        } catch (err) {
-          log.error('Failed to route inbound message', { channelType: adapter.channelType, err });
-          return {
-            status: 'failed',
-            platformMessageId: message.id,
-            reason: err instanceof Error ? err.message : 'route_failed',
-            retryable: true,
-          };
-        }
       },
-      async onInboundEvent(event) {
-        await inboundReady;
-        try {
-          return await routeInbound(event);
-        } catch (err) {
-          log.error('Failed to route inbound event', {
-            sourceAdapter: adapter.channelType,
-            targetChannelType: event.channelType,
-            err,
+      onInboundEvent(event) {
+        return inboundReady
+          .then(() => routeInbound(event))
+          .catch((err) => {
+            log.error('Failed to route inbound event', {
+              sourceAdapter: adapter.channelType,
+              targetChannelType: event.channelType,
+              err,
+            });
+            return failedInboundRoute(event.message.id, err);
           });
-          return {
-            status: 'failed',
-            platformMessageId: event.message.id,
-            reason: err instanceof Error ? err.message : 'route_failed',
-            retryable: true,
-          };
-        }
       },
       onMetadata(platformId, name, isGroup) {
         log.info('Channel metadata discovered', {

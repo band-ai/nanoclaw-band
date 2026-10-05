@@ -7,7 +7,7 @@
  * here is composition and lifecycle policy: which mounts, which env, restart
  * ordering, exit bookkeeping.
  */
-import { execFile, execFileSync } from 'child_process';
+import { execFile } from 'child_process';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
@@ -25,11 +25,9 @@ import {
   TIMEZONE,
 } from './config.js';
 import { CONTAINER_PLUGINS_DIR, materializeContainerJson } from './container-config.js';
-import type { ContainerConfig } from './container-config.js';
 import { getContainerConfig } from './db/container-configs.js';
 import { updateContainerConfigScalars } from './db/container-configs.js';
-import { CONTAINER_RUNTIME_BIN, FAST_STOP_GRACE_SEC } from './container-runtime.js';
-import { getChannelContainerConfig, getAgentContainerConfigs } from './channels/channel-container-registry.js';
+import { CONTAINER_RUNTIME_BIN } from './container-runtime.js';
 import { composeGroupProjectDoc, DEFAULT_PROJECT_DOC } from './project-doc-compose.js';
 import { getAgentGroup } from './db/agent-groups.js';
 import {
@@ -44,7 +42,6 @@ import {
 } from './db/coordination.js';
 import { getHostInstanceId } from './host-instance.js';
 import { getDb, hasTable } from './db/connection.js';
-import { getMessagingGroup } from './db/messaging-groups.js';
 import { getSession } from './db/sessions.js';
 import { getSessionDriver, isSessionEventsDriver } from './drivers/index.js';
 import type { SupervisedHandle, SupervisedSnapshot } from './drivers/session-events.js';
@@ -94,6 +91,16 @@ import {
   writeSessionRouting,
 } from './session-manager.js';
 import type { AgentGroup, Session } from './types.js';
+// Fork: Band session contributions, compose deployment, stop grace, wake guard (src/fork/).
+import { alignSessionOwnership, rewriteOneCliProxyEnv } from './fork/compose-deployment.js';
+import {
+  applySessionMounts,
+  forkContributionEnv,
+  mergeContainerContributions,
+  resolveSessionContribution,
+} from './fork/session-contribution.js';
+import { FAST_STOP_GRACE_SEC } from './fork/stop-grace.js';
+import { isStoppingForWake } from './fork/wake-guard.js';
 
 /**
  * Docker defaults /dev/shm to 64m, which silently short-writes past that size.
@@ -101,64 +108,8 @@ import type { AgentGroup, Session } from './types.js';
  * Playwright launcher may not.
  */
 const SHM_SIZE_MB = 1024;
-
-/**
- * Compose deployment support. NanoClaw's own host process can run inside a
- * Docker Compose stack (see `docs/docker-compose-deployment.md`), spawning
- * sibling agent containers via the host's Docker socket. Two things differ
- * from the bare-metal case, both no-ops unless the corresponding env var is
- * set:
- *
- *  - `NANOCLAW_DOCKER_NETWORK`: the compose network the agent container must
- *    join to reach the `onecli` service by name (wired into `dockerNetworkArgs`
- *    in `drivers/index.ts`, the seam upstream reserves for network topology).
- *  - `NANOCLAW_ONECLI_HOSTNAME`: OneCLI's injected proxy env vars point at
- *    `host.docker.internal`, which is not reachable/correct from a sibling
- *    container on the compose network — rewritten to the compose service name.
- */
-function composeOneCliHostname(): string | undefined {
-  return process.env.NANOCLAW_ONECLI_HOSTNAME || undefined;
-}
-
-/**
- * Remap a repo-local path back to the real host checkout. When NanoClaw's own
- * process runs inside the Compose container, `process.cwd()` and every mount
- * source it computes point at paths inside ITS OWN container (e.g. `/app`),
- * but the mounts it hands to `docker create` are realized by the Docker
- * daemon on the actual host — which only knows the host filesystem. A no-op
- * unless `NANOCLAW_HOST_PATH` (the absolute host checkout path) is set.
- */
-export function toHostPath(
-  hostPath: string,
-  projectRoot = process.cwd(),
-  hostProjectRoot = process.env.NANOCLAW_HOST_PATH,
-): string {
-  if (!hostProjectRoot) return hostPath;
-  const absolutePath = path.resolve(hostPath);
-  const absoluteProjectRoot = path.resolve(projectRoot);
-  if (absolutePath === absoluteProjectRoot) return hostProjectRoot;
-  if (!absolutePath.startsWith(`${absoluteProjectRoot}${path.sep}`)) return hostPath;
-  return path.join(hostProjectRoot, path.relative(absoluteProjectRoot, absolutePath));
-}
-
-/**
- * Rewrite `host.docker.internal` inside OneCLI's contributed proxy env values
- * to the compose service hostname. A no-op unless `NANOCLAW_ONECLI_HOSTNAME`
- * is set. Only touches `http(s)_proxy`-shaped keys — `NO_PROXY` is a denylist
- * of hosts to bypass, not a gateway address, and rewriting it would exempt
- * onecli from the very no-proxy list it needs to stay reachable outside of.
- */
-export function rewriteOneCliProxyEnv(
-  env: Record<string, string>,
-  hostname = composeOneCliHostname(),
-): Record<string, string> {
-  if (!hostname) return env;
-  const rewritten: Record<string, string> = {};
-  for (const [key, value] of Object.entries(env)) {
-    rewritten[key] = /^https?_proxy$/i.test(key) ? value.replace(/host\.docker\.internal/g, hostname) : value;
-  }
-  return rewritten;
-}
+/** Grace before SIGKILL. One second, as `docker stop -t 1` has always been. */
+const STOP_GRACE_SECONDS = FAST_STOP_GRACE_SEC; // Fork: 10 s base grace (src/fork/stop-grace.ts)
 
 /** Active sessions tracked by session ID. */
 interface ActiveSessionRuntime {
@@ -386,21 +337,8 @@ async function retryPendingAdoption(session: Session): Promise<boolean> {
  * next tick.
  */
 export function wakeContainer(session: Session): Promise<boolean> {
-  const active = activeContainers.get(session.id);
-  if (active) {
-    // `stopReason` is set by `killContainer` before the stop is even issued —
-    // a runtime that has one is on its way out. Treating it as "not running"
-    // (rather than the `has()` check's implicit "already running") lets the
-    // inbound row stay pending so host-sweep retries once the stop settles,
-    // instead of a wake mid-shutdown silently claiming success for a session
-    // about to disappear.
-    if (active.stopReason !== undefined) {
-      log.debug('Container is stopping; wake will retry after shutdown', {
-        sessionId: session.id,
-        reason: active.stopReason,
-      });
-      return Promise.resolve(false);
-    }
+  if (activeContainers.has(session.id)) {
+    if (isStoppingForWake(session.id, activeContainers.get(session.id)?.stopReason)) return Promise.resolve(false);
     log.debug('Container already running', { sessionId: session.id });
     return Promise.resolve(true);
   }
@@ -458,26 +396,12 @@ async function spawnContainer(session: Session): Promise<void> {
   // Resolve the effective provider + any host-side contribution it declares
   // (extra mounts, env passthrough). Computed once and threaded through both
   // buildMounts and buildContainerArgs so side effects (mkdir, etc.) fire once.
-  const {
-    provider,
-    contribution: providerContribution,
-    surfaces,
-  } = await resolveProviderContribution(session, agentGroup, containerConfig);
-  // Fork: channel + agent-scoped contributions (env, MCP servers, user-visible
-  // tools, mounts) layered over the provider's. Kept out of
-  // resolveProviderContribution so upstream's provider path stays untouched.
-  const sessionContribution = await resolveSessionContribution(session, agentGroup);
-  const contribution = mergeContainerContributions(providerContribution, sessionContribution);
+  const { provider, contribution, surfaces } = await resolveProviderContribution(session, agentGroup, containerConfig);
+  const sessionContribution = await resolveSessionContribution(session, agentGroup); // Fork: channel + agent-scoped
+
   const containerName = `nanoclaw-v2-${agentGroup.folder}-${Date.now()}`;
-  const mounts = await buildMounts(
-    agentGroup,
-    session,
-    containerConfig,
-    provider,
-    providerContribution,
-    surfaces,
-    sessionContribution.mounts,
-  );
+  const mounts = await buildMounts(agentGroup, session, containerConfig, provider, contribution, surfaces);
+  applySessionMounts(mounts, sessionContribution.mounts, agentGroup.id); // Fork: session mounts + compose host paths
   const mailboxEnvironment = await mailbox.runnerEnvironment(mailboxKey);
 
   const driver = getSessionDriver();
@@ -515,7 +439,7 @@ async function spawnContainer(session: Session): Promise<void> {
       containerName,
       mounts,
       containerConfig,
-      contribution,
+      contribution: mergeContainerContributions(contribution, sessionContribution), // Fork
       gateway,
       mailboxEnvironment,
     });
@@ -541,10 +465,7 @@ async function spawnContainer(session: Session): Promise<void> {
     });
     throw err;
   }
-  // Compose deployment: the gateway's proxy env points sibling containers at
-  // `host.docker.internal`, unreachable/incorrect from the compose network.
-  // No-op unless NANOCLAW_ONECLI_HOSTNAME is set.
-  if (gateway.env) gateway.env = rewriteOneCliProxyEnv(gateway.env);
+  if (gateway.env) gateway.env = rewriteOneCliProxyEnv(gateway.env); // Fork: compose OneCLI hostname
 
   let handle: SupervisedHandle;
   try {
@@ -599,7 +520,7 @@ async function spawnContainer(session: Session): Promise<void> {
  *
  * Terminal handling is armed before the session starts, so a failure that lands
  * during startup finds a runtime that already knows how to finalize. If
- * `start()` throws, `deps.afterStart` never runs — there is no container
+ * `start()` throws, the post-start bookkeeping never runs — there is nothing
  * running for it to record.
  */
 export async function armSessionLifecycle(deps: {
@@ -1113,59 +1034,13 @@ export async function resolveProviderContribution(
   return { provider, contribution: surfaces.contribution, surfaces };
 }
 
-/**
- * Fork: channel- and agent-scoped container contributions for a session.
- * Channel contributions come from the session's messaging group; agent-scoped
- * ones apply to every session of the group regardless of channel (e.g. Band
- * grants cross-channel control tools).
- */
-async function resolveSessionContribution(
-  session: Session,
-  agentGroup: AgentGroup,
-): Promise<ProviderContainerContribution> {
-  const messagingGroup = session.messaging_group_id
-    ? ((await getMessagingGroup(session.messaging_group_id)) ?? null)
-    : null;
-  const channelFn = messagingGroup ? getChannelContainerConfig(messagingGroup.channel_type) : undefined;
-  const channelContribution = channelFn
-    ? await channelFn({
-        session,
-        messagingGroup,
-        agentGroupId: agentGroup.id,
-        hostEnv: process.env,
-      })
-    : {};
-
-  const agentContributions = await Promise.all(
-    getAgentContainerConfigs().map((fn) => fn({ session, agentGroupId: agentGroup.id, hostEnv: process.env })),
-  );
-
-  return mergeContainerContributions(channelContribution, ...agentContributions);
-}
-
-/**
- * Merge contributions in precedence order (later wins for `env` and
- * `mcpServers`; `mounts` and `userVisibleTools` concatenate).
- */
-export function mergeContainerContributions(
-  ...contributions: ProviderContainerContribution[]
-): ProviderContainerContribution {
-  return {
-    mounts: contributions.flatMap((c) => c.mounts ?? []),
-    env: Object.assign({}, ...contributions.map((c) => c.env ?? {})),
-    mcpServers: Object.assign({}, ...contributions.map((c) => c.mcpServers ?? {})),
-    userVisibleTools: contributions.flatMap((c) => c.userVisibleTools ?? []),
-  };
-}
-
 export async function buildMounts(
   agentGroup: AgentGroup,
   session: Session,
-  containerConfig: ContainerConfig,
+  containerConfig: import('./container-config.js').ContainerConfig,
   provider: string,
   providerContribution: ProviderContainerContribution,
   providerSurfaces?: ProviderSpawnRealization,
-  sessionMounts?: ProviderContainerContribution['mounts'],
 ): Promise<VolumeMount[]> {
   const projectRoot = process.cwd();
 
@@ -1226,18 +1101,7 @@ export async function buildMounts(
     mountClass: 'group-state',
     scope,
   });
-
-  // The compose deployment runs this host as root (for docker-socket access),
-  // so the session/group files it creates are root-owned, while the agent
-  // image runs as `node` (uid 1000). On a native-Linux host the agent then
-  // cannot write its session DBs — SQLite fails with SQLITE_READONLY and the
-  // container dies at startup. (macOS Docker Desktop masks bind-mount
-  // ownership, which hides the mismatch.) Align ownership with the agent user
-  // before every spawn; non-root hosts are handled by the --user mapping
-  // (`SessionSpec.runAs`) instead.
-  if (process.getuid?.() === 0) {
-    execFileSync('chown', ['-R', '1000:1000', sessDir, groupDir]);
-  }
+  alignSessionOwnership(sessDir, groupDir); // Fork: root compose host → agent uid 1000
 
   // container.json — nested RO mount on top of RW group dir so the agent can
   // read its config but cannot modify it. Composed per group, so 'group-state'
@@ -1381,18 +1245,7 @@ export async function buildMounts(
     mounts.push(...providerContribution.mounts.map((m) => ({ ...m, mountClass: 'allowlisted-extra' as const, scope })));
   }
 
-  // Fork: channel/agent-scoped mounts. A provider contract never covers these,
-  // so they apply whether or not one is declared. Same 'allowlisted-extra'
-  // vetting as provider mounts — the contributor is in-tree registration.
-  if (sessionMounts?.length) {
-    mounts.push(...sessionMounts.map((m) => ({ ...m, mountClass: 'allowlisted-extra' as const, scope })));
-  }
-
-  // Compose deployment: mount sources computed above are all repo-relative
-  // (as seen from NanoClaw's own process), which is wrong when that process
-  // runs inside the Compose container itself. No-op unless NANOCLAW_HOST_PATH
-  // is set.
-  return mounts.map((mount) => ({ ...mount, hostPath: toHostPath(mount.hostPath, projectRoot) }));
+  return mounts;
 }
 
 /** VolumeMount (host vocabulary) → MountSpec (seam vocabulary). */
@@ -1411,7 +1264,7 @@ export interface ComposeSessionSpecInput {
   session: Session;
   containerName: string;
   mounts: VolumeMount[];
-  containerConfig: ContainerConfig;
+  containerConfig: import('./container-config.js').ContainerConfig;
   contribution: ProviderContainerContribution;
   /**
    * The gateway provider's typed per-session contribution. No argv-shaped
@@ -1458,16 +1311,7 @@ export function composeSessionSpec(input: ComposeSessionSpecInput): SessionSpec 
     ...(contribution.env ?? {}),
     ...(gateway.env ?? {}),
   };
-  // Channel-contributed MCP servers — serialized as JSON and picked up by
-  // buildMcpServers() in the container's main(). Empty stays absent so the
-  // container sees no extra servers rather than an empty map.
-  if (contribution.mcpServers && Object.keys(contribution.mcpServers).length > 0) {
-    contributedEnv.NANOCLAW_EXTRA_MCP_SERVERS = JSON.stringify(contribution.mcpServers);
-  }
-  // User-visible tool names seeded into the container at startup.
-  if (contribution.userVisibleTools && contribution.userVisibleTools.length > 0) {
-    contributedEnv.NANOCLAW_USER_VISIBLE_TOOLS = JSON.stringify(contribution.userVisibleTools);
-  }
+  Object.assign(contributedEnv, forkContributionEnv(contribution)); // Fork: mcpServers / userVisibleTools env
 
   const hostUid = process.getuid?.();
   const hostGid = process.getgid?.();
@@ -1538,12 +1382,7 @@ export function composeSessionSpec(input: ComposeSessionSpecInput): SessionSpec 
     // (validateSpec, against capabilities().isolationTiers).
     runtimeTier: containerConfig.runtimeTier ?? 'container',
     runAs,
-    // Base grace, honored as-is by any driver that reads `stopGraceSeconds`
-    // faithfully. The Docker realization additionally re-derives this from the
-    // STOP reason (see `stopGraceForReason` in `container-runtime.ts`), because
-    // the choice between a fast recovery kill and Band's memory-consolidation
-    // shutdown window is made at kill time, not at spawn time.
-    stopGraceSeconds: FAST_STOP_GRACE_SEC,
+    stopGraceSeconds: STOP_GRACE_SECONDS,
   };
 }
 
@@ -1636,12 +1475,7 @@ function selectedSkillNames(containerConfig: import('./container-config.js').Con
   return selectGatewayAgentSkills(selected);
 }
 
-// execFile (not exec/promisify(exec)) — CONTAINER_IMAGE, CONTAINER_IMAGE_BASE,
-// and the built imageTag/Dockerfile path are all env-overridable (config.ts).
-// A shell-string exec would let a metacharacter in any of those inject a
-// second command; execFile passes each argument straight to the runtime
-// binary's argv, never through a shell.
-const execFileAsync = promisify(execFile);
+const execAsync = promisify(execFile); // Fork: argv, never a shell string (image names are env-overridable)
 
 /** Build a per-agent-group Docker image with custom packages. */
 export async function buildAgentGroupImage(agentGroupId: string): Promise<void> {
@@ -1669,13 +1503,8 @@ export async function buildAgentGroupImage(agentGroupId: string): Promise<void> 
   // all and an id is unambiguous either way.
   let baseId = '';
   try {
-    const { stdout } = await execFileAsync(CONTAINER_RUNTIME_BIN, [
-      'image',
-      'inspect',
-      '--format',
-      '{{.Id}}',
-      CONTAINER_IMAGE,
-    ]);
+    const inspectArgs = ['image', 'inspect', '--format', '{{.Id}}', CONTAINER_IMAGE]; // Fork: execFile argv
+    const { stdout } = await execAsync(CONTAINER_RUNTIME_BIN, inspectArgs);
     baseId = stdout.trim();
   } catch {
     // Non-fatal: the build below fails on its own if the base is really absent.
@@ -1714,10 +1543,8 @@ export async function buildAgentGroupImage(agentGroupId: string): Promise<void> 
   fs.writeFileSync(tmpDockerfile, dockerfile);
   try {
     // Awaited async exec so the single-threaded host stays responsive during
-    // the build (can take minutes) instead of blocking on execSync. execFile
-    // buffers stdout/stderr (matching the old stdio: 'pipe') and rejects on a
-    // non-zero exit, so error propagation is unchanged.
-    await execFileAsync(CONTAINER_RUNTIME_BIN, ['build', '-t', imageTag, '-f', tmpDockerfile, '.'], {
+    // the build (can take minutes) instead of blocking on execSync.
+    await execAsync(CONTAINER_RUNTIME_BIN, ['build', '-t', imageTag, '-f', tmpDockerfile, '.'], {
       cwd: DATA_DIR,
       timeout: 900_000,
     });

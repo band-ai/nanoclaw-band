@@ -38,17 +38,15 @@ import './providers/index.js';
 // registration on import. Provider skills append imports to
 // provider-contracts/index.ts alongside the providers barrel line.
 import './provider-contracts/index.js';
-// Channel lifecycle-hook modules self-register on import (start/stop hooks).
-// Such an import must follow the providers barrel (so providers register
-// first) and precede the runStartHooks call below; channel install skills
-// append their `import './<channel>-lifecycle.js';` here.
 import { createProvider } from './providers/factory.js';
 import { getProviderRuntimeContract, requireProviderName } from './providers/provider-registry.js';
+import { resolvePluginServer } from './plugin-mcp.js';
 import { registerProviderMemorySessionHook } from './provider-contracts/realize.js';
-import { buildMcpServers } from './mcp-servers.js';
-import { runStartHooks, runStopHooks } from './lifecycle.js';
+import type { McpServerConfig } from './providers/types.js';
 import { runPollLoop } from './poll-loop.js';
-import { getContinuation } from './db/session-state.js';
+// Fork: channel lifecycle start/stop hooks, channel MCP servers + full env, graceful shutdown.
+import { addExtraMcpServers, fullMcpEnv } from './mcp-servers.js';
+import { installShutdownSignal, runStopHooksAfterLoop, withStartAddenda } from './fork/runner-hooks.js';
 
 function log(msg: string): void {
   console.error(`[agent-runner] ${msg}`);
@@ -79,14 +77,7 @@ async function main(): Promise<void> {
     config.assistantName || undefined,
     taskId ? { kind: 'task', taskId } : { kind: 'chat' },
   );
-
-  // Start hooks: channel/provider callbacks that may return a system-prompt
-  // addendum (e.g. Band memory pre-load). Core ships no hooks; channels
-  // register them via band-lifecycle.ts (imported as a side effect).
-  const startAddenda = await runStartHooks({ assistantName: config.assistantName || undefined, cwd: CWD });
-  for (const addendum of startAddenda) {
-    instructions = `${instructions}\n\n${addendum}`;
-  }
+  instructions = await withStartAddenda(instructions, { assistantName: config.assistantName || undefined, cwd: CWD });
 
   // Discover additional directories mounted at /workspace/extra/*
   const additionalDirectories: string[] = [];
@@ -107,23 +98,26 @@ async function main(): Promise<void> {
   const __dirname = path.dirname(fileURLToPath(import.meta.url));
   const mcpServerPath = path.join(__dirname, 'mcp-tools', 'index.ts');
 
-  const mcpEnv = Object.fromEntries(
-    Object.entries(process.env).filter((entry): entry is [string, string] => typeof entry[1] === 'string'),
-  );
-
-  const mcpServers = buildMcpServers({
-    builtin: {
-      nanoclaw: {
-        command: 'bun',
-        args: ['run', mcpServerPath],
-        env: mcpEnv,
-      },
+  // Build MCP servers config: nanoclaw built-in + any from container.json
+  const mcpServers: Record<string, McpServerConfig> = {
+    nanoclaw: {
+      command: 'bun',
+      args: ['run', mcpServerPath],
+      env: fullMcpEnv(),
     },
-    configServers: config.mcpServers,
-    mcpEnv,
-    extraMcpJson: process.env.NANOCLAW_EXTRA_MCP_SERVERS,
-    log,
-  });
+  };
+
+  for (const [name, serverConfig] of Object.entries(config.mcpServers)) {
+    // Plugin-shipped servers get ${PLUGIN_ROOT}/${PLUGIN_DATA} expansion and
+    // the two injected env vars; everything else passes through untouched.
+    mcpServers[name] = resolvePluginServer(serverConfig);
+    log(
+      serverConfig.type === 'http'
+        ? `Additional MCP server: ${name} (HTTP)`
+        : `Additional MCP server: ${name} (${serverConfig.command})`,
+    );
+  }
+  addExtraMcpServers(mcpServers, log);
 
   const provider = createProvider(providerName, {
     assistantName: config.assistantName || undefined,
@@ -136,21 +130,6 @@ async function main(): Promise<void> {
   });
   registerProviderMemorySessionHook(providerName, provider, MEMORY_SESSION_HOOK);
 
-  // Graceful shutdown: when the host stops the container (SIGTERM from
-  // `docker stop`), abort the poll loop so the in-flight query can wind
-  // down cleanly. After the loop returns, Band.ai consolidation runs
-  // (no-op when not enabled) before the process exits.
-  const shutdown = new AbortController();
-  let shuttingDown = false;
-  const onSignal = (sig: NodeJS.Signals) => {
-    if (shuttingDown) return;
-    shuttingDown = true;
-    log(`Received ${sig} — aborting poll loop`);
-    shutdown.abort();
-  };
-  process.on('SIGTERM', () => onSignal('SIGTERM'));
-  process.on('SIGINT', () => onSignal('SIGINT'));
-
   try {
     await runPollLoop({
       provider,
@@ -158,16 +137,12 @@ async function main(): Promise<void> {
       providerName,
       cwd: CWD,
       systemContext: { instructions },
-      signal: shutdown.signal,
+      signal: installShutdownSignal(log),
     });
   } finally {
     await mailbox.stop();
   }
-
-  // Stop hooks: run after poll loop exits (on SIGTERM/SIGINT). Errors are
-  // swallowed per hook so one failure can't block the others.
-  const continuation = getContinuation(providerName);
-  await runStopHooks({ provider, providerName, cwd: CWD, continuation });
+  await runStopHooksAfterLoop({ provider, providerName, cwd: CWD });
 }
 
 main().catch((err) => {

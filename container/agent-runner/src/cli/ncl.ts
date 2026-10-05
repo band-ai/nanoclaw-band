@@ -59,11 +59,7 @@ async function writeRequest(mailbox: AgentMailbox, req: RequestFrame): Promise<v
 /**
  * Poll the mailbox for a cli_response matching our requestId.
  */
-async function pollResponse(
-  mailbox: AgentMailbox,
-  requestId: string,
-  timeoutMs: number,
-): Promise<ResponseFrame | null> {
+async function pollResponse(mailbox: AgentMailbox, requestId: string, timeoutMs: number): Promise<ResponseFrame | null> {
   const deadline = Date.now() + timeoutMs;
 
   while (Date.now() < deadline) {
@@ -215,7 +211,9 @@ function formatHuman(resp: ResponseFrame): string {
   const header = keys.map((k, i) => k.padEnd(widths[i])).join('  ');
   const sep = widths.map((w) => '-'.repeat(w)).join('  ');
   const rows = data.map((r) =>
-    keys.map((k, i) => String((r as Record<string, unknown>)[k] ?? '').padEnd(widths[i])).join('  '),
+    keys
+      .map((k, i) => String((r as Record<string, unknown>)[k] ?? '').padEnd(widths[i]))
+      .join('  '),
   );
 
   return [header, sep, ...rows, ''].join('\n');

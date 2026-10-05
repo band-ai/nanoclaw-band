@@ -1,12 +1,8 @@
 import { registerProvider } from './provider-registry.js';
 import type { MemorySessionHookRegistration } from '../memory/session-hook.js';
 import type { AgentProvider, AgentQuery, ProviderEvent, ProviderOptions, QueryInput } from './types.js';
-
-function defaultMockResponse(prompt: string): string {
-  const fromMatch = prompt.match(/\bfrom="([^"]+)"/);
-  const response = `Mock response to: ${prompt.slice(0, 100)}`;
-  return fromMatch ? `<message to="${fromMatch[1]}">${response}</message>` : response;
-}
+// Fork: default response addressed to the prompt's origin.
+import { defaultMockResponse } from '../fork/mock-response.js';
 
 /**
  * Mock provider for testing. Returns canned responses.

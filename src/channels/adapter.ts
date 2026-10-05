@@ -5,36 +5,14 @@
  * Two patterns: native adapters (implement directly) or Chat SDK bridge (wrap a Chat SDK adapter).
  */
 
-export type InboundRouteResult =
-  | {
-      status: 'persisted';
-      platformMessageId: string;
-      sessionIds: string[];
-      sessionMessageIds: string[];
-    }
-  | {
-      status: 'dropped';
-      platformMessageId: string;
-      reason: string;
-      audited: boolean;
-      retryable: boolean;
-      intentional: boolean;
-    }
-  | {
-      status: 'failed';
-      platformMessageId: string;
-      reason: string;
-      retryable: boolean;
-    };
+// Fork: route-result types + optional ChannelAdapter capability flags (augmented in src/fork/channel-adapter.ts).
+import type { InboundRouteResult, InboundRouteReturn } from '../fork/channel-adapter.js';
+export type { InboundRouteResult };
 
 /** Passed to the adapter at setup time. */
 export interface ChannelSetup {
   /** Called when an inbound message arrives from the platform. */
-  onInbound(
-    platformId: string,
-    threadId: string | null,
-    message: InboundMessage,
-  ): void | InboundRouteResult | Promise<void | InboundRouteResult>;
+  onInbound(platformId: string, threadId: string | null, message: InboundMessage): InboundRouteReturn;
 
   /**
    * Called by admin-transport adapters (CLI) that want to route a message to
@@ -42,7 +20,7 @@ export interface ChannelSetup {
    * Regular chat adapters should use `onInbound`; `onInboundEvent` skips the
    * adapter-channel-type injection so the caller can target any wired mg.
    */
-  onInboundEvent(event: InboundEvent): void | InboundRouteResult | Promise<void | InboundRouteResult>;
+  onInboundEvent(event: InboundEvent): InboundRouteReturn;
 
   /** Called when the adapter discovers metadata about a conversation. */
   onMetadata(platformId: string, name?: string, isGroup?: boolean): void;
@@ -256,27 +234,6 @@ export interface ChannelAdapter {
    *         router; agent replies go to the channel.
    */
   supportsThreads: boolean;
-
-  /**
-   * Whether this adapter implements delivery ACK semantics.
-   *
-   * When true, the router writes the inbound_delivery_ledger rows
-   * (beginInboundDelivery / markInboundDeliveryDropped /
-   * markInboundDeliveryPersisted) so the adapter can use the ledger to
-   * confirm durable persistence before emitting platform-level processed
-   * markers. Adapters that don't support ACKing skip ledger writes entirely.
-   * Default: false.
-   */
-  supportsDeliveryAck?: boolean;
-
-  /**
-   * Whether this adapter needs a graceful stop window for its container
-   * teardown work (e.g. Band memory consolidation). When true, the host
-   * sweep tags ceiling kills with 'graceful' so stopGraceForReason grants
-   * GRACEFUL_STOP_GRACE_SEC (30 min) instead of FAST_STOP_GRACE_SEC (10 s).
-   * Default: false.
-   */
-  needsGracefulStop?: boolean;
 
   // Lifecycle
   setup(config: ChannelSetup): Promise<void>;

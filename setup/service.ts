@@ -402,12 +402,7 @@ async function setupLinux(projectRoot: string, nodePath: string, homeDir: string
  */
 function killOrphanedProcesses(projectRoot: string): void {
   try {
-    // execFileSync, not a shell string: projectRoot comes from process.cwd()
-    // (config.ts), and a shell-interpolated `'${projectRoot}/...'` breaks out
-    // of its own quoting if the path ever contains a single quote. execFile
-    // passes it straight through to pkill's argv, never through a shell. The
-    // enclosing try/catch already covers "no matching process" (pkill exits
-    // non-zero) the same way the old `|| true` did.
+    // Fork: execFileSync, not a shell string — a quote in projectRoot would break out of the shell quoting.
     execFileSync('pkill', ['-f', `${projectRoot}/dist/index\\.js`], {
       stdio: 'ignore',
     });

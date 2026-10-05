@@ -2,7 +2,6 @@
  * Session lifecycle: folders, mailboxes, messages, and container status.
  * Storage layout and consistency belong to the registered mailbox.
  */
-import { randomUUID } from 'crypto';
 import { AsyncLocalStorage } from 'async_hooks';
 import fs from 'fs';
 import path from 'path';
@@ -27,6 +26,8 @@ import { log } from './log.js';
 import { getAgentMailbox, type InboundMessage, type MailboxSession } from './mailbox/index.js';
 import { enqueueSessionReconcile } from './reconcile-feeds.js';
 import type { Session } from './types.js';
+// Fork: collision-resistant id suffix.
+import { randomUUID } from 'crypto';
 
 /** Root directory for all session data. */
 export function sessionsBaseDir(): string {

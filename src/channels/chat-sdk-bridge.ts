@@ -28,6 +28,8 @@ import { normalizeOptions, type NormalizedOption } from './ask-question.js';
 import type { ChannelAdapter, ChannelDefaults, ChannelSetup, InboundMessage } from './adapter.js';
 import { INSTANCE_KEY_RE } from './channel-registry.js';
 import { resolveQuestionRender, dispatchQuestionAction } from './question-render-registry.js';
+// Fork: path-encoded Discord interaction callback URL.
+import { discordInteractionCallbackUrl } from '../fork/discord-interaction.js';
 
 /** Adapter with optional gateway support (e.g., Discord). */
 interface GatewayAdapter extends Adapter {
@@ -1156,26 +1158,23 @@ async function handleForwardedEvent(
       const actorName = user?.global_name || user?.username || '';
       const resolution = actorName ? `${selectedLabel} by ${actorName}` : selectedLabel;
       try {
-        await fetch(
-          `https://discord.com/api/v10/interactions/${encodeURIComponent(interactionId)}/${encodeURIComponent(interactionToken)}/callback`,
-          {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              type: 7, // UPDATE_MESSAGE — acknowledge + update in one call
-              data: {
-                embeds: [
-                  {
-                    title: cardTitle,
-                    description: originalDescription || render?.question || '',
-                    footer: { text: resolution },
-                  },
-                ],
-                components: [], // remove buttons
-              },
-            }),
-          },
-        );
+        await fetch(discordInteractionCallbackUrl(interactionId, interactionToken), {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            type: 7, // UPDATE_MESSAGE — acknowledge + update in one call
+            data: {
+              embeds: [
+                {
+                  title: cardTitle,
+                  description: originalDescription || render?.question || '',
+                  footer: { text: resolution },
+                },
+              ],
+              components: [], // remove buttons
+            },
+          }),
+        });
       } catch (err) {
         log.error('Failed to update interaction', { err });
       }

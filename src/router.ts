@@ -18,17 +18,10 @@
  * for policy refusals.
  */
 import { getChannelAdapter, getChannelDefaults } from './channels/channel-registry.js';
-import { randomUUID } from 'crypto';
 import { resolveThreadPolicy, resolveUnknownSenderPolicy } from './channels/channel-defaults.js';
 import { gateCommand } from './command-gate.js';
 import { getAgentGroup } from './db/agent-groups.js';
 import { recordDroppedMessage } from './db/dropped-messages.js';
-import {
-  beginInboundDelivery,
-  markInboundDeliveryDropped,
-  markInboundDeliveryPersisted,
-  type InboundDeliveryKey,
-} from './db/inbound-delivery-ledger.js';
 import {
   createMessagingGroupIfAbsent,
   getMessagingGroupAgents,
@@ -42,7 +35,17 @@ import { resolveSession, writeSessionMessage, writeOutboundDirect } from './sess
 import { requestWake } from './request-wake.js';
 import { getSession } from './db/sessions.js';
 import type { AgentGroup, MessagingGroup, MessagingGroupAgent, Session } from './types.js';
-import type { InboundEvent, InboundRouteResult } from './channels/adapter.js';
+import type { InboundEvent } from './channels/adapter.js';
+// Fork: inbound route results + delivery-ACK ledger (src/fork/inbound-route.ts); collision-resistant ids.
+import { randomUUID } from 'crypto';
+import {
+  addInboundDelivery,
+  beginInboundRoute,
+  dropInboundRoute,
+  persistInboundRoute,
+  type InboundDelivery,
+  type InboundRouteResult,
+} from './fork/inbound-route.js';
 
 function generateId(): string {
   return `msg-${Date.now()}-${randomUUID().slice(0, 8)}`;
@@ -215,89 +218,31 @@ function safeParseContent(raw: string): { text?: string; sender?: string; sender
   }
 }
 
-function deliveryKey(event: InboundEvent): InboundDeliveryKey {
-  return {
-    channelType: event.channelType,
-    platformId: event.platformId,
-    platformMessageId: event.message.id,
-  };
-}
-
-async function droppedResult(
-  event: InboundEvent,
-  reason: string,
-  opts: { intentional?: boolean; retryable?: boolean } = {},
-  ackMode = false,
-): Promise<InboundRouteResult> {
-  if (ackMode) {
-    await markInboundDeliveryDropped(deliveryKey(event), {
-      reason,
-      intentional: opts.intentional ?? false,
-      retryable: opts.retryable ?? false,
-    });
-  }
-  return {
-    status: 'dropped',
-    platformMessageId: event.message.id,
-    reason,
-    audited: ackMode,
-    retryable: opts.retryable ?? false,
-    intentional: opts.intentional ?? false,
-  };
-}
-
 /**
  * Route an inbound message from a channel adapter to the correct session.
  * Creates messaging group + session if they don't exist yet.
  */
 export async function routeInbound(event: InboundEvent): Promise<InboundRouteResult> {
-  // 0. Apply the adapter's thread policy. Non-threaded adapters (Telegram,
-  //    WhatsApp, iMessage, email) collapse threads to the channel. Resolved
-  //    by the RECEIVING instance — sibling instances of one platform can
-  //    differ in thread support.
-  const adapter = getChannelAdapter(event.instance ?? event.channelType);
-  const ackMode = adapter?.supportsDeliveryAck === true;
-  if (adapter && !adapter.supportsThreads) {
-    event = { ...event, threadId: null };
-  }
-
-  const isMention = event.message.isMention === true;
-  const key = deliveryKey(event);
-  if (ackMode) {
-    const existingDelivery = await beginInboundDelivery(key, event.threadId);
-    if (existingDelivery.status === 'persisted' || existingDelivery.status === 'processed') {
-      return {
-        status: 'persisted',
-        platformMessageId: event.message.id,
-        sessionIds: existingDelivery.session_ids_json
-          ? (JSON.parse(existingDelivery.session_ids_json) as string[])
-          : [],
-        sessionMessageIds: existingDelivery.session_message_ids_json
-          ? (JSON.parse(existingDelivery.session_message_ids_json) as string[])
-          : [],
-      };
-    }
-    if (existingDelivery.status === 'intentionally_dropped') {
-      return {
-        status: 'dropped',
-        platformMessageId: event.message.id,
-        reason: existingDelivery.reason ?? 'intentionally_dropped',
-        audited: true,
-        retryable: false,
-        intentional: true,
-      };
-    }
-  }
-
+  const route = await beginInboundRoute(event); // Fork: thread policy + delivery-ACK ledger before interceptors
+  if (route.settled) return route.settled;
   // Pre-route interceptors — let modules consume messages before any routing
   // (e.g. free-text DM replies during multi-step approval flows). They run in
   // registration order; the first to claim the message stops routing. The
   // sequential await is intentional — first-to-claim is order-dependent.
   for (const intercept of messageInterceptors) {
-    if (await intercept(event)) {
-      return await droppedResult(event, 'intercepted', { intentional: true }, ackMode);
-    }
+    if (await intercept(route.event)) return dropInboundRoute(route, 'intercepted', { intentional: true });
   }
+
+  // 0. Apply the adapter's thread policy. Non-threaded adapters (Telegram,
+  //    WhatsApp, iMessage, email) collapse threads to the channel. Resolved
+  //    by the RECEIVING instance — sibling instances of one platform can
+  //    differ in thread support.
+  const adapter = getChannelAdapter(event.instance ?? event.channelType);
+  if (adapter && !adapter.supportsThreads) {
+    event = { ...event, threadId: null };
+  }
+
+  const isMention = event.message.isMention === true;
 
   // 1. Combined lookup: messaging_group row + count of wired agents in a
   //    single query. Cheap short-circuit for the common "unwired channel"
@@ -316,9 +261,8 @@ export async function routeInbound(event: InboundEvent): Promise<InboundRouteRes
   if (!found) {
     // No messaging_groups row. Auto-create only when the message warrants
     // attention (the bot was addressed — @mention or DM). Plain chatter in
-    // channels we merely sit in is now audited for ACK-aware adapters without
-    // creating a messaging_group row.
-    if (!isMention) return await droppedResult(event, 'no_messaging_group', { retryable: true }, ackMode);
+    // channels we merely sit in stays silent — no row, no DB writes.
+    if (!isMention) return dropInboundRoute(route, 'no_messaging_group', { retryable: true });
     const mgId = `mg-${Date.now()}-${randomUUID().slice(0, 8)}`;
     mg = {
       id: mgId,
@@ -362,16 +306,16 @@ export async function routeInbound(event: InboundEvent): Promise<InboundRouteRes
     agentCount = found.agentCount;
   }
 
-  // 1b. No wirings — either audited drop (plain chatter / denied channel) or
+  // 1b. No wirings — either silent drop (plain chatter / denied channel) or
   //     escalate to owner for channel-registration approval.
   if (agentCount === 0) {
-    if (!isMention) return await droppedResult(event, 'no_agent_wired_unmentioned', { retryable: true }, ackMode);
+    if (!isMention) return dropInboundRoute(route, 'no_agent_wired_unmentioned', { retryable: true });
     if (mg.denied_at) {
       log.debug('Message dropped — channel was denied by owner', {
         messagingGroupId: mg.id,
         deniedAt: mg.denied_at,
       });
-      return await droppedResult(event, 'channel_denied', { intentional: true }, ackMode);
+      return dropInboundRoute(route, 'channel_denied', { intentional: true });
     }
 
     const parsed = safeParseContent(event.message.content);
@@ -400,7 +344,7 @@ export async function routeInbound(event: InboundEvent): Promise<InboundRouteRes
         platformId: event.platformId,
       });
     }
-    return await droppedResult(event, 'no_agent_wired', { retryable: true }, ackMode);
+    return dropInboundRoute(route, 'no_agent_wired', { retryable: true });
   }
 
   // 2. Sender resolution (permissions module upserts the users row as a
@@ -438,8 +382,6 @@ export async function routeInbound(event: InboundEvent): Promise<InboundRouteRes
   let engagedCount = 0;
   let accumulatedCount = 0;
   let subscribed = false;
-  const sessionIds: string[] = [];
-  const sessionMessageIds: string[] = [];
 
   for (const agent of agents) {
     const agentGroup = await getAgentGroup(agent.agent_group_id);
@@ -466,21 +408,8 @@ export async function routeInbound(event: InboundEvent): Promise<InboundRouteRes
     const scopeOk = engages && (!senderScopeGate || (await senderScopeGate(event, userId, mg, agent)).allowed);
 
     if (engages && accessOk && scopeOk) {
-      const routed = await deliverToAgent(
-        agent,
-        agentGroup,
-        mg,
-        event,
-        userId,
-        threadsEnabled,
-        effectiveThreadId,
-        true,
-      );
-      if (routed) {
-        sessionIds.push(routed.sessionId);
-        sessionMessageIds.push(routed.sessionMessageId);
-        engagedCount++;
-      }
+      const ids = await deliverToAgent(agent, agentGroup, mg, event, userId, threadsEnabled, effectiveThreadId, true);
+      if (addInboundDelivery(route, ids)) engagedCount++;
 
       // Mention-sticky: ask the adapter to subscribe the thread so the
       // platform's subscribed-message path carries follow-ups without
@@ -511,21 +440,8 @@ export async function routeInbound(event: InboundEvent): Promise<InboundRouteRes
       // message (which also stages their attachments to disk via
       // writeSessionMessage → extractAttachmentFiles) is exactly what the
       // gate is meant to prevent.
-      const routed = await deliverToAgent(
-        agent,
-        agentGroup,
-        mg,
-        event,
-        userId,
-        threadsEnabled,
-        effectiveThreadId,
-        false,
-      );
-      if (routed) {
-        sessionIds.push(routed.sessionId);
-        sessionMessageIds.push(routed.sessionMessageId);
-        accumulatedCount++;
-      }
+      const ids = await deliverToAgent(agent, agentGroup, mg, event, userId, threadsEnabled, effectiveThreadId, false);
+      if (addInboundDelivery(route, ids)) accumulatedCount++;
     } else {
       log.debug('Message not engaged for agent (drop policy)', {
         agentGroupId: agent.agent_group_id,
@@ -547,16 +463,9 @@ export async function routeInbound(event: InboundEvent): Promise<InboundRouteRes
       messaging_group_id: mg.id,
       agent_group_id: null,
     });
-    return await droppedResult(event, 'no_agent_engaged', { retryable: false }, ackMode);
+    return dropInboundRoute(route, 'no_agent_engaged', { retryable: false });
   }
-
-  if (ackMode) await markInboundDeliveryPersisted(key, { sessionIds, sessionMessageIds });
-  return {
-    status: 'persisted',
-    platformMessageId: event.message.id,
-    sessionIds,
-    sessionMessageIds,
-  };
+  return persistInboundRoute(route);
 }
 
 /**
@@ -628,7 +537,7 @@ async function deliverToAgent(
   threadsEnabled: boolean,
   effectiveThreadId: string | null,
   wake: boolean,
-): Promise<{ sessionId: string; sessionMessageId: string } | null> {
+): Promise<InboundDelivery | null> {
   // Apply the resolved thread policy (wiring override AND channel declaration
   // AND adapter capability — resolveThreadPolicy at fanout): thread-enabled
   // wiring in a group chat → per-thread session regardless of wiring
@@ -771,7 +680,6 @@ async function deliverToAgent(
       timestamp: event.message.timestamp,
     });
   }
-
   return { sessionId: session.id, sessionMessageId: messageId };
 }
 

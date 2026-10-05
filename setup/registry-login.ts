@@ -778,13 +778,7 @@ function openInBrowser(url: string): void {
   else if (process.platform === 'linux') {
     if (commandExists('xdg-open')) cmd = ['xdg-open', [url]];
     else if (isWSL() && commandExists('wslview')) cmd = ['wslview', [url]];
-    // No cmd.exe fallback for WSL without wslview: unlike the openers above,
-    // cmd.exe is itself a command interpreter over its own argv — `/c start`
-    // re-parses the joined arguments as a command line, so an `&`/`|`/`^` in
-    // a verification URL from the IdP response would inject a second
-    // command even though spawn() here never invokes a shell. Falling
-    // through to `!cmd` below is silent and safe: the link is already on
-    // screen (printDeviceCard), so the user opens it by hand instead.
+    // Fork: no cmd.exe fallback on WSL — `/c start` re-parses the URL, so `&`/`|`/`^` would inject commands.
   }
   if (!cmd) return;
   try {

@@ -1,6 +1,8 @@
 # Dependencies
 node_modules/
 .npm-cache/
+# pnpm content-addressable store (created when running in sandbox mode)
+.pnpm-store/
 # Build output
 dist/
 
@@ -9,14 +11,8 @@ store/
 data/
 logs/
 
-# Groups - only track base structure and specific CLAUDE.md files
+# Groups - per-installation state, not tracked
 groups/*
-!groups/main/
-!groups/global/
-groups/main/*
-groups/global/*
-!groups/main/CLAUDE.md
-!groups/global/CLAUDE.md
 
 # The same roots when an operator points them at external storage with a
 # symlink. A trailing slash matches directories only, so a symlink named
@@ -31,10 +27,7 @@ groups
 # Secrets
 *.keys.json
 .env
-.env.local
-.env.prod
-.env.compose
-.env.compose.local
+.env*
 
 # Temp files
 .tmp-*
@@ -55,7 +48,6 @@ nanoclaw.pid
 .nanoclaw/
 
 agents-sdk-docs
-container/agent-runner/vendor/
 .agents
 AGENTS.md
 
@@ -64,3 +56,13 @@ docs/maintainer-guide.md
 docs/drafts/
 forks.md
 .worktrees/
+
+# Fork: ignore only the listed .env files (not .env*), do not ignore .pnpm-store/, ignore vendored agent-runner deps.
+!.env*
+.env
+.env.local
+.env.prod
+.env.compose
+.env.compose.local
+!.pnpm-store/
+container/agent-runner/vendor/

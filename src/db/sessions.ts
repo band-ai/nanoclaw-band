@@ -146,22 +146,6 @@ export async function getActiveSessions(): Promise<Session[]> {
   return getDb().all<Session>("SELECT * FROM sessions WHERE status = 'active'");
 }
 
-export async function getActiveSessionsByMessagingGroup(messagingGroupId: string): Promise<Session[]> {
-  return getDb().all<Session>(
-    "SELECT * FROM sessions WHERE messaging_group_id = ? AND status = 'active'",
-    messagingGroupId,
-  );
-}
-
-export async function closeActiveSessionsForMessagingGroup(messagingGroupId: string): Promise<number> {
-  const result = await getDb().run(
-    "UPDATE sessions SET status = 'closed', container_status = 'stopped', last_active = ? WHERE messaging_group_id = ? AND status = 'active'",
-    new Date().toISOString(),
-    messagingGroupId,
-  );
-  return result.changes;
-}
-
 export async function getRunningSessions(): Promise<Session[]> {
   return getDb().all<Session>("SELECT * FROM sessions WHERE container_status IN ('running', 'idle')");
 }
@@ -380,3 +364,6 @@ export async function bindPendingApprovalMessage(approvalId: string, messageId: 
     approvalId,
   );
 }
+
+// Fork: Band session queries live in fork-sessions.ts; re-exported for '../db/sessions.js' importers.
+export { getActiveSessionsByMessagingGroup, closeActiveSessionsForMessagingGroup } from './fork-sessions.js';

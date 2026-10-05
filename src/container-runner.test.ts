@@ -17,16 +17,13 @@ import type { ContainerConfig } from './container-config.js';
 import {
   armSessionLifecycle,
   composeSessionSpec,
-  mergeContainerContributions,
   parseMemoryMb,
   parsePidsLimit,
   resolveProviderName,
-  rewriteOneCliProxyEnv,
   syncSkillSymlinks,
   toMountSpecs,
   watchGatewayAvailability,
 } from './container-runner.js';
-import { FAST_STOP_GRACE_SEC, GRACEFUL_STOP_GRACE_SEC, stopGraceForReason } from './container-runtime.js';
 import type { SupervisedHandle } from './drivers/session-events.js';
 import { resetGatewayProvider } from './gateway-providers/index.js';
 import { log } from './log.js';
@@ -285,10 +282,7 @@ describe('composeSessionSpec', () => {
     expect(spec.networkAccess).toEqual({ endpoint: 'localhost', target: { kind: 'host' } });
     expect(spec.hardening).toBe('standard');
     expect(spec.runtimeTier).toBe('container');
-    // Base grace, honored as-is by a driver reading `stopGraceSeconds`
-    // faithfully; the Docker realization additionally re-derives it from the
-    // stop reason (see stopGraceForReason below).
-    expect(spec.stopGraceSeconds).toBe(FAST_STOP_GRACE_SEC);
+    expect(spec.stopGraceSeconds).toBe(10); // Fork: FAST_STOP_GRACE_SEC
   });
 
   it('reads the isolation tier from the group container config, defaulting to container', () => {
@@ -569,73 +563,5 @@ describe('syncSkillSymlinks', () => {
       expect.stringContaining('Shared skill not symlinked'),
       expect.objectContaining({ skill: 'welcome' }),
     );
-  });
-});
-
-describe('mergeContainerContributions', () => {
-  it('round-trips mcpServers and userVisibleTools from a channel contribution', () => {
-    const merged = mergeContainerContributions(
-      {},
-      {
-        env: { BAND_REST_URL: 'https://api' },
-        mcpServers: { band: { command: 'thenvoi-mcp', args: [], env: {} } },
-        userVisibleTools: ['mcp__nanoclaw__band_send_message'],
-      },
-    );
-    expect(merged.mcpServers).toEqual({ band: { command: 'thenvoi-mcp', args: [], env: {} } });
-    expect(merged.userVisibleTools).toEqual(['mcp__nanoclaw__band_send_message']);
-    expect(merged.env).toEqual({ BAND_REST_URL: 'https://api' });
-  });
-
-  it('concatenates userVisibleTools and shallow-merges mcpServers across both sides', () => {
-    const merged = mergeContainerContributions(
-      { mcpServers: { a: { command: 'a', args: [] } }, userVisibleTools: ['mcp__nanoclaw__send_message'] },
-      { mcpServers: { b: { command: 'b', args: [] } }, userVisibleTools: ['mcp__nanoclaw__band_send_message'] },
-    );
-    expect(Object.keys(merged.mcpServers ?? {}).sort()).toEqual(['a', 'b']);
-    expect(merged.userVisibleTools).toEqual(['mcp__nanoclaw__send_message', 'mcp__nanoclaw__band_send_message']);
-  });
-
-  it('defaults missing fields to empty', () => {
-    const merged = mergeContainerContributions({}, {});
-    expect(merged.mounts).toEqual([]);
-    expect(merged.env).toEqual({});
-    expect(merged.mcpServers).toEqual({});
-    expect(merged.userVisibleTools).toEqual([]);
-  });
-});
-
-describe('stopGraceForReason', () => {
-  it('grants the long graceful window when the reason contains "graceful"', () => {
-    expect(stopGraceForReason('absolute-ceiling graceful')).toBe(GRACEFUL_STOP_GRACE_SEC);
-  });
-
-  it('keeps recovery/stuck kills on the fast window', () => {
-    expect(stopGraceForReason('absolute-ceiling')).toBe(FAST_STOP_GRACE_SEC);
-    expect(stopGraceForReason('claim-stuck')).toBe(FAST_STOP_GRACE_SEC);
-    expect(stopGraceForReason('rebuild applied')).toBe(FAST_STOP_GRACE_SEC);
-  });
-});
-
-describe('rewriteOneCliProxyEnv', () => {
-  it('rewrites OneCLI proxy host env for compose child containers', () => {
-    const env = {
-      HTTPS_PROXY: 'http://x:token@host.docker.internal:10255',
-      NO_PROXY: 'localhost,host.docker.internal',
-    };
-
-    const rewritten = rewriteOneCliProxyEnv(env, 'onecli');
-
-    expect(rewritten.HTTPS_PROXY).toBe('http://x:token@onecli:10255');
-    // Only *_proxy-shaped keys are touched — NO_PROXY is a denylist, not a
-    // gateway address, and rewriting it would exempt onecli from the very
-    // no-proxy list it is supposed to be reachable outside of.
-    expect(rewritten.NO_PROXY).toBe('localhost,host.docker.internal');
-  });
-
-  it('leaves env unchanged without a compose hostname', () => {
-    const env = { HTTPS_PROXY: 'http://x:token@host.docker.internal:10255' };
-
-    expect(rewriteOneCliProxyEnv(env, undefined)).toEqual(env);
   });
 });

@@ -19,7 +19,6 @@
  * core throws with a "module not installed" message so retry → mark failed.
  */
 import fs from 'fs';
-import { randomUUID } from 'crypto';
 import path from 'path';
 
 import { isSafeAttachmentName } from '../../attachment-safety.js';
@@ -33,6 +32,8 @@ import { resolveSession, sessionDir, withExistingMailboxSession, writeSessionMes
 import type { PendingApproval, Session } from '../../types.js';
 import { requestApproval } from '../approvals/index.js';
 import { A2A_MESSAGE_GATE_ACTION, a2aSend } from './guard.js';
+// Fork: collision-resistant id suffix.
+import { randomUUID } from 'crypto';
 
 export { isSafeAttachmentName };
 export { A2A_MESSAGE_GATE_ACTION } from './guard.js';

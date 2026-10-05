@@ -12,6 +12,8 @@
  */
 import { getAgentMailbox } from './mailbox/index.js';
 import type { Destination } from './mailbox/types.js';
+// Fork: destination label wording.
+import { destinationLabel as forkDestinationLabel } from './fork/destination-label.js';
 
 export interface DestinationEntry {
   name: string;
@@ -64,13 +66,7 @@ export function buildSystemPromptAddendum(assistantName?: string, mode: SessionM
   const sections: string[] = [];
 
   if (assistantName) {
-    sections.push(
-      [
-        '# You are ' + assistantName,
-        '',
-        `Your name is **${assistantName}**. Use it when the channel asks who you are, when introducing yourself, and when signing any message that explicitly calls for a signature.`,
-      ].join('\n'),
-    );
+    sections.push(['# You are ' + assistantName, '', `Your name is **${assistantName}**. Use it when the channel asks who you are, when introducing yourself, and when signing any message that explicitly calls for a signature.`].join('\n'));
   }
 
   sections.push(buildDestinationsSection(mode));
@@ -151,13 +147,6 @@ function buildDestinationsSection(mode: SessionMode): string {
   return lines.join('\n');
 }
 
-// Label includes the display name and the kind of destination (channel type,
-// e.g. "Band"/"Telegram", or "agent") so the model can map a user's natural
-// reference ("send it on Band") to the right local name.
 function destinationLabel(d: DestinationEntry): string {
-  const parts: string[] = [];
-  if (d.displayName && d.displayName !== d.name) parts.push(d.displayName);
-  if (d.type === 'agent') parts.push('agent');
-  else if (d.channelType) parts.push(d.channelType.charAt(0).toUpperCase() + d.channelType.slice(1));
-  return parts.length ? ` (${parts.join(' — ')})` : '';
+  return forkDestinationLabel(d);
 }

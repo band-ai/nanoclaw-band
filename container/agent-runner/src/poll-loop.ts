@@ -33,6 +33,8 @@ import { stripHarnessTagArtifacts } from './harness-tag-strip.js';
 import { isUploadTraceCommand, uploadTrace } from './upload-trace.js';
 import type { AgentProvider, AgentQuery, ProviderEvent, ProviderExchange } from './providers/types.js';
 import type { ProviderRuntimeContract } from './provider-contracts/registry.js';
+// Fork: suppress fallback delivery after a user-visible MCP tool already replied.
+import { UserVisibleToolTurn } from './fork/user-visible-tools.js';
 
 const POLL_INTERVAL_MS = 1000;
 const ACTIVE_POLL_INTERVAL_MS = 500;
@@ -377,11 +379,7 @@ export async function processQuery(
   let queryContinuation: string | undefined;
   let done = false;
   let unwrappedNudged = false;
-  // Set when the agent invokes a user-visible MCP tool (e.g. band_send_message)
-  // that already delivered content to the channel this turn. The SDK's final
-  // `result` text is then a terse tool summary ("Sent.") that must not be
-  // re-delivered by the fallback dispatch path.
-  let userVisibleToolUsed = false;
+  const userVisibleTool = new UserVisibleToolTurn();
   // Once-per-turn guard for the task-run "<message> block was not delivered"
   // nudge — mirrors unwrappedNudged for chat turns.
   let taskBlockNudged = false;
@@ -579,6 +577,7 @@ export async function processQuery(
   try {
     for await (const event of query.events) {
       handleEvent(event, routing);
+      userVisibleTool.observe(event);
       touchHeartbeat();
 
       if (event.type === 'init') {
@@ -590,8 +589,6 @@ export async function processQuery(
         // effectively orphaned and the next message started a blank
         // Claude session with no prior context.
         setContinuation(providerName, event.continuation);
-      } else if (event.type === 'user_visible_tool') {
-        userVisibleToolUsed = true;
       } else if (event.type === 'text') {
         // Assistant text emitted mid-turn (e.g. between tool calls). The
         // final result only carries the LAST assistant text, so complete
@@ -615,18 +612,13 @@ export async function processQuery(
         markCompleted(initialBatchIds);
         const resultText = event.text ?? '';
         const failed = event.isError === true;
-        if (resultText && !failed && userVisibleToolUsed) {
-          // The agent already sent a user-visible MCP message this turn; the
-          // SDK's final text is a terse tool-result summary. Log it, don't
-          // re-deliver or nudge, and record the exchange as completed.
-          log(`[tool-result] ${resultText.slice(0, 200)}`);
+        if (userVisibleTool.suppressesResult(resultText, failed)) {
           notifyExchangeComplete(onExchangeComplete, {
-            prompt: archivePrompts[0] ?? initialPrompt,
+            prompt: archivePrompts.shift() ?? initialPrompt,
             result: resultText,
             continuation: queryContinuation ?? initialContinuation,
             status: 'completed',
           });
-          archivePrompts.shift();
         } else if (resultText || failed) {
           const { hasUnwrapped, taskBlocks } = await dispatchResultText(resultText, routing, {
             midTurnSent,
@@ -696,8 +688,6 @@ export async function processQuery(
           // user prompt at their own position in the FIFO queue.
           archivePrompts.shift();
         } else archivePrompts.shift();
-        // Reset for the next turn within this open query.
-        userVisibleToolUsed = false;
         // Turn boundary: reset the per-turn sent count after the result's
         // nudge decision has used it. A nudge retry re-counts via its own
         // text events before the retry result, so resetting on every result
@@ -795,9 +785,6 @@ function handleEvent(event: ProviderEvent, _routing: RoutingContext): void {
       break;
     case 'progress':
       log(`Progress: ${event.message}`);
-      break;
-    case 'user_visible_tool':
-      log(`User-visible tool: ${event.name}`);
       break;
   }
 }

@@ -23,12 +23,7 @@ vi.mock('../lib/bright-select.js', async (importActual) => {
 
 afterEach(() => delete process.env.NANOCLAW_TEMPLATE_AGENT_ID);
 
-// Matches the OAuth token-exchange call the add-teams skill fences
-// (see SKILL.md: curl ... https://login.microsoftonline.com/{tenant}/oauth2/v2.0/token).
-// Parses the URL embedded in the command line and checks hostname/pathname
-// exactly, rather than a bare `cmd.includes('login.microsoftonline.com')`
-// substring test that a coincidental match elsewhere in the command could
-// satisfy without actually being this call.
+// Fork: exact URL host/path match instead of a substring check (CodeQL incomplete-url-substring-sanitization).
 function isMicrosoftTokenExchangeCall(cmd: string): boolean {
   const match = cmd.match(/https:\/\/[^\s"']+/);
   if (!match) return false;

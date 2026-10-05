@@ -114,9 +114,6 @@ export interface QueryInput {
   systemContext?: {
     instructions?: string;
   };
-
-  /** Per-query environment overrides, also forwarded to MCP server subprocesses. */
-  env?: Record<string, string>;
 }
 
 export type McpServerConfig =
@@ -179,7 +176,7 @@ export type ProviderEvent =
   | { type: 'text'; text: string }
   | { type: 'error'; message: string; retryable: boolean; classification?: string }
   | { type: 'progress'; message: string }
-  | { type: 'user_visible_tool'; name: string }
+  | { type: 'user_visible_tool'; name: string } // Fork: see fork/user-visible-tools.ts
   | { type: 'file'; path: string }
   /**
    * Liveness signal. Providers MUST yield this on every underlying SDK

@@ -1,7 +1,6 @@
 import { query as sdkQuery, type HookCallback, type PreCompactHookInput } from '@anthropic-ai/claude-agent-sdk';
 
 import { clearContainerToolInFlight, setContainerToolInFlight } from '../db/container-state.js';
-import { isUserVisibleToolName, markUserVisibleTool } from '../mcp-tools/server.js';
 import type { MemorySessionHookRegistration } from '../memory/session-hook.js';
 import type { ResolvedRuntimeConfiguration } from '../provider-contracts/registry.js';
 // The execution-policy, inference, MCP, and memory derivations live in
@@ -21,35 +20,12 @@ import {
 import { archiveClaudeTranscript, rotateClaudeContinuation } from './claude-history.js';
 import { registerProvider } from './provider-registry.js';
 import type { AgentProvider, AgentQuery, ProviderEvent, ProviderOptions, QueryInput } from './types.js';
+// Fork: query env/MCP env merge, executable override, user-visible tool events.
+import { CLAUDE_CODE_EXECUTABLE, mergeEnv, queryMcpServers } from '../fork/claude-env.js';
+import { userVisibleToolEvents } from '../fork/user-visible-tools.js';
 
 function log(msg: string): void {
   console.error(`[claude-provider] ${msg}`);
-}
-
-// Seed user-visible tools from the env var injected by buildContainerArgs.
-// The env var carries JSON: e.g. '["mcp__nanoclaw__band_send_message"]'.
-// Errors are swallowed — a malformed value means no extra tools are seeded.
-((): void => {
-  const raw = process.env.NANOCLAW_USER_VISIBLE_TOOLS;
-  if (!raw) return;
-  try {
-    const names = JSON.parse(raw) as unknown[];
-    for (const name of names) {
-      if (typeof name === 'string') markUserVisibleTool(name);
-    }
-  } catch {
-    // malformed JSON — no-op
-  }
-})();
-
-export function mergeEnv(...sources: Array<Record<string, string | undefined>>): Record<string, string> {
-  const merged: Record<string, string> = {};
-  for (const source of sources) {
-    for (const [key, value] of Object.entries(source)) {
-      if (value !== undefined) merged[key] = value;
-    }
-  }
-  return merged;
 }
 
 export interface SdkRateLimitInfo {
@@ -102,24 +78,6 @@ interface SDKUserMessage {
   message: { role: 'user'; content: string };
   parent_tool_use_id: null;
   session_id: string;
-}
-
-interface SDKToolUseContent {
-  type: 'tool_use';
-  name?: string;
-}
-
-function userVisibleToolNames(message: unknown): string[] {
-  if (!message || typeof message !== 'object') return [];
-  const content = (message as { message?: { content?: unknown } }).message?.content;
-  if (!Array.isArray(content)) return [];
-
-  return content.flatMap((part): string[] => {
-    if (!part || typeof part !== 'object') return [];
-    const item = part as SDKToolUseContent;
-    if (item.type !== 'tool_use' || typeof item.name !== 'string') return [];
-    return isUserVisibleToolName(item.name) ? [item.name] : [];
-  });
 }
 
 /**
@@ -245,7 +203,6 @@ function createPreCompactHook(assistantName?: string): HookCallback {
  * with a 1M-context model variant or when emergency-tuning a deployment.
  */
 const CLAUDE_CODE_AUTO_COMPACT_WINDOW = process.env.CLAUDE_CODE_AUTO_COMPACT_WINDOW || '165000';
-const CLAUDE_CODE_EXECUTABLE = process.env.CLAUDE_CODE_EXECUTABLE || '/pnpm/claude';
 
 /**
  * Stale-session detection. Matches Claude Code's error text when a
@@ -312,13 +269,6 @@ export class ClaudeProvider implements AgentProvider {
     stream.push(input.prompt);
 
     const instructions = input.systemContext?.instructions;
-    const queryEnv = mergeEnv(this.env, input.env ?? {});
-    const mcpServers = Object.fromEntries(
-      Object.entries(this.mcp.mcpServers).map(([name, server]) => [
-        name,
-        server.type === 'http' ? server : { ...server, env: mergeEnv(input.env ?? {}, server.env ?? {}) },
-      ]),
-    );
 
     const sdkResult = sdkQuery({
       prompt: stream,
@@ -342,7 +292,7 @@ export class ClaudeProvider implements AgentProvider {
         // Streaming deltas are the liveness signal for that window; translateEvents
         // turns them into throttled `activity` and nothing else.
         includePartialMessages: true,
-        env: queryEnv,
+        env: mergeEnv(this.env, input.env ?? {}),
         model: this.inference.model,
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
         effort: this.inference.effort as any,
@@ -354,9 +304,7 @@ export class ClaudeProvider implements AgentProvider {
         // input can never override them. Both are Settings members rather
         // than query options, which is why they ride `settings`.
         settings: { ...this.inference.settings, ...this.executionPolicy.settings },
-        // Fork: `mcpServers` is the locally-built map that folds `input.env`
-        // into each stdio server's env — not the raw `this.mcp.mcpServers`.
-        mcpServers,
+        mcpServers: queryMcpServers(this.mcp.mcpServers, input),
         hooks: {
           PreToolUse: [{ hooks: [preToolUseHook] }],
           PostToolUse: [{ hooks: [postToolUseHook] }],
@@ -390,10 +338,7 @@ export class ClaudeProvider implements AgentProvider {
         if (message.type === 'system' && message.subtype === 'init') {
           yield { type: 'init', continuation: message.session_id };
         } else if (message.type === 'assistant') {
-          for (const name of userVisibleToolNames(message)) {
-            yield { type: 'user_visible_tool', name };
-          }
-
+          yield* userVisibleToolEvents(message);
           // Surface each assistant message's text as it streams in. The final
           // `result` event only carries the LAST assistant text — a wrapped
           // <message> block composed between tool calls would otherwise be
