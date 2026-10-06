@@ -225,15 +225,23 @@ import './band-lifecycle.js';
 ### 4. Install the pinned dependencies
 
 Exact versions only (never a range, per the supply-chain policy). The host needs
-the SDK and the REST client; the agent-runner container tree needs the SDK only:
+the SDK and the REST client; the agent-runner container tree needs the SDK only.
+
+The agent-runner is a separate **Bun** package tree: the image build installs it
+with `bun install --frozen-lockfile`, so the dependency must land in its
+`package.json` **and** `bun.lock`. Setup never installs Bun on the host, so don't
+call a host `bun`. Run the Bun release the image pins (`ARG BUN_VERSION` in
+`container/Dockerfile`) through `pnpm dlx`. That keeps the lockfile in the
+format the image build reads, with nothing installed globally:
 
 ```bash
 pnpm add @band-ai/sdk@0.1.6 @band-ai/rest-client@0.0.121
-( cd "$ROOT/container/agent-runner" && bun add @band-ai/sdk@0.1.6 )
+BUN_VERSION=$(sed -n 's/^ARG BUN_VERSION=//p' "$ROOT/container/Dockerfile")
+( cd "$ROOT/container/agent-runner" && pnpm dlx "bun@$BUN_VERSION" add @band-ai/sdk@0.1.6 )
 ```
 
-(Second approval gate from **Before you start** — the classifier may hold the
-`@band-ai/*` install. Surface it; don't work around it.)
+(This is the second external-code step from **Before you start**: an auto-mode
+classifier denial lands here. Surface it; don't work around it.)
 
 > `@band-ai/sdk@0.1.6` still exports its link class under the **pre-rename** name
 > `ThenvoiLink`. The host adapter imports it as `ThenvoiLink as BandLink`; the
@@ -254,11 +262,13 @@ agent-runner overlay pick up the copied container files.
 
 ### 6. Verify
 
-Run [VERIFY.md](VERIFY.md). At minimum:
+Run [VERIFY.md](VERIFY.md). At minimum (the container tests run under the
+image's Bun release, no host Bun needed):
 
 ```bash
-( cd "$ROOT" && pnpm test -- src/channels/band.test.ts )
-( cd "$ROOT/container/agent-runner" && bun test src/mcp-tools/band.test.ts src/band-lifecycle.test.ts )
+( cd "$ROOT" && pnpm exec vitest run src/channels/band.test.ts )
+BUN_VERSION=$(sed -n 's/^ARG BUN_VERSION=//p' "$ROOT/container/Dockerfile")
+( cd "$ROOT/container/agent-runner" && pnpm dlx "bun@$BUN_VERSION" test src/mcp-tools/band.test.ts src/band-lifecycle.test.ts )
 ```
 
 ## Bring Band online (end-to-end)

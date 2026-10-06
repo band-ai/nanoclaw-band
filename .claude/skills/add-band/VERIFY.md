@@ -43,7 +43,7 @@ dependency — rebuild.
 
 ```bash
 pnpm run build
-cd container/agent-runner && bun run typecheck && cd -
+pnpm exec tsc -p container/agent-runner/tsconfig.json --noEmit
 ```
 
 A clean build proves the **source** typechecks and the **host** tree resolves the
