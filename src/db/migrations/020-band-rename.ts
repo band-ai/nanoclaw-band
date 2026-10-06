@@ -23,6 +23,7 @@ import type { Migration } from './index.js';
 export const bandRename: Migration = {
   version: 20,
   name: 'band-rename',
+  sqliteOnly: true,
   up: (db: Database.Database) => {
     // users.id is a referenced PK; defer FK checks to commit so parent and
     // children can be rewritten in any order within this transaction.

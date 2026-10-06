@@ -13,7 +13,7 @@ const fakeLinks: FakeBandLink[] = [];
 const fakeRestClients: FakeBandClient[] = [];
 let fakeChats: Record<string, unknown>[] = [{ id: 'room-1', title: 'Room 1', type: 'direct' }];
 let fakeParticipants: Record<string, unknown[]> = {};
-let closeTestDb: (() => void) | null = null;
+let closeTestDb: (() => Promise<void>) | null = null;
 
 class FakeBandClient {
   public readonly agentApiIdentity = {
@@ -134,12 +134,12 @@ function clearBandEnv(): void {
   }
 }
 
-async function waitFor(predicate: () => boolean): Promise<void> {
+async function waitFor(predicate: () => boolean | Promise<boolean>): Promise<void> {
   for (let i = 0; i < 20; i += 1) {
-    if (predicate()) return;
+    if (await predicate()) return;
     await new Promise((resolve) => setTimeout(resolve, 0));
   }
-  expect(predicate()).toBe(true);
+  expect(await predicate()).toBe(true);
 }
 
 describe('band channel adapter', () => {
@@ -157,13 +157,13 @@ describe('band channel adapter', () => {
     // idempotent against the same post-resetModules module instance.
     await import('./band.js');
     const { closeDb, initTestDb, runMigrations } = await import('../db/index.js');
-    const db = initTestDb();
-    runMigrations(db);
+    const db = await initTestDb();
+    await runMigrations(db);
     closeTestDb = closeDb;
   });
 
-  afterEach(() => {
-    closeTestDb?.();
+  afterEach(async () => {
+    await closeTestDb?.();
     closeTestDb = null;
     clearBandEnv();
   });
@@ -230,8 +230,8 @@ describe('band channel adapter', () => {
     const { beginInboundDelivery, getInboundDelivery, markInboundDeliveryPersisted } = await import('../db/index.js');
     const onInbound = vi.fn(async (platformId: string, threadId: string | null) => {
       const key: InboundDeliveryKey = { channelType: 'band', platformId, platformMessageId: 'msg-1' };
-      beginInboundDelivery(key, threadId);
-      markInboundDeliveryPersisted(key, {
+      await beginInboundDelivery(key, threadId);
+      await markInboundDeliveryPersisted(key, {
         sessionIds: result.sessionIds,
         sessionMessageIds: result.sessionMessageIds,
       });
@@ -273,7 +273,8 @@ describe('band channel adapter', () => {
     expect(fakeLinks[0].markProcessing).toHaveBeenCalledWith('room-1', 'msg-1');
     expect(fakeLinks[0].markProcessed).toHaveBeenCalledWith('room-1', 'msg-1');
     expect(
-      getInboundDelivery({ channelType: 'band', platformId: 'band:room-1', platformMessageId: 'msg-1' })?.status,
+      (await getInboundDelivery({ channelType: 'band', platformId: 'band:room-1', platformMessageId: 'msg-1' }))
+        ?.status,
     ).toBe('processed');
   });
 
@@ -290,8 +291,8 @@ describe('band channel adapter', () => {
     const { beginInboundDelivery, markInboundDeliveryPersisted } = await import('../db/index.js');
     const onInbound = vi.fn(async (platformId: string, threadId: string | null) => {
       const key: InboundDeliveryKey = { channelType: 'band', platformId, platformMessageId: 'pending-1' };
-      beginInboundDelivery(key, threadId);
-      markInboundDeliveryPersisted(key, {
+      await beginInboundDelivery(key, threadId);
+      await markInboundDeliveryPersisted(key, {
         sessionIds: result.sessionIds,
         sessionMessageIds: result.sessionMessageIds,
       });
@@ -745,11 +746,11 @@ describe('band channel adapter', () => {
     });
 
     const { getModuleState, getMessagingGroupByPlatform } = await import('../db/index.js');
-    expect(getModuleState('band', 'main-room')).toMatchObject({
+    expect(await getModuleState('band', 'main-room')).toMatchObject({
       roomId: 'hub-room-1',
       platformId: 'band:hub-room-1',
     });
-    expect(getMessagingGroupByPlatform('band', 'band:hub-room-1')).toMatchObject({
+    expect(await getMessagingGroupByPlatform('band', 'band:hub-room-1')).toMatchObject({
       name: 'Nano Hub',
       is_group: 0,
     });
@@ -809,7 +810,7 @@ describe('band channel adapter', () => {
     }));
 
     const { getModuleState } = await import('../db/index.js');
-    expect(getModuleState('band', 'main-room')).toMatchObject({ roomId: 'room-1', platformId: 'band:room-1' });
+    expect(await getModuleState('band', 'main-room')).toMatchObject({ roomId: 'room-1', platformId: 'band:room-1' });
     // Sync detection won — the bootstrap must not have created a hub room.
     expect(fakeRestClients[0].agentApiChats.createAgentChat).not.toHaveBeenCalled();
   });
@@ -842,9 +843,9 @@ describe('band channel adapter', () => {
     }));
 
     const { getModuleState, getMessagingGroupByPlatform } = await import('../db/index.js');
-    expect(getModuleState('band', 'main-room')).toMatchObject({ roomId: 'room-1', platformId: 'band:room-1' });
+    expect(await getModuleState('band', 'main-room')).toMatchObject({ roomId: 'room-1', platformId: 'band:room-1' });
 
-    const mg = getMessagingGroupByPlatform('band', 'band:room-1')!;
+    const mg = (await getMessagingGroupByPlatform('band', 'band:room-1'))!;
     const { getChannelContainerConfig } = await import('./channel-container-registry.js');
     const config = await getChannelContainerConfig('band')!({
       session: {
@@ -874,15 +875,26 @@ describe('band channel adapter', () => {
     setBandEnv();
     fakeChats = [{ id: 'room-new', title: 'New Room', type: 'group' }];
 
-    const { createAgentGroup, createMessagingGroup, createMessagingGroupAgent, setModuleState } = await import(
-      '../db/index.js'
-    );
+    const { createAgentGroup, createMessagingGroup, createMessagingGroupAgent, setModuleState } =
+      await import('../db/index.js');
     // ag-other is created first, so getAllAgentGroups()[0] is NOT the hub agent —
     // proving the room follows the hub's wiring, not the first-agent fallback.
-    createAgentGroup({ id: 'ag-other', name: 'Other', folder: 'other', agent_provider: null, created_at: '2020-01-01T00:00:00.000Z' });
-    createAgentGroup({ id: 'ag-hub', name: 'Hub Agent', folder: 'hub-agent', agent_provider: null, created_at: '2020-01-02T00:00:00.000Z' });
+    await createAgentGroup({
+      id: 'ag-other',
+      name: 'Other',
+      folder: 'other',
+      agent_provider: null,
+      created_at: '2020-01-01T00:00:00.000Z',
+    });
+    await createAgentGroup({
+      id: 'ag-hub',
+      name: 'Hub Agent',
+      folder: 'hub-agent',
+      agent_provider: null,
+      created_at: '2020-01-02T00:00:00.000Z',
+    });
     // Seed a wired hub + main-room state so resolveHubAgentGroupId resolves ag-hub.
-    createMessagingGroup({
+    await createMessagingGroup({
       id: 'mg-hub',
       channel_type: 'band',
       platform_id: 'band:hub-1',
@@ -892,7 +904,7 @@ describe('band channel adapter', () => {
       denied_at: null,
       created_at: new Date().toISOString(),
     });
-    createMessagingGroupAgent({
+    await createMessagingGroupAgent({
       id: 'mga-hub',
       messaging_group_id: 'mg-hub',
       agent_group_id: 'ag-hub',
@@ -904,7 +916,7 @@ describe('band channel adapter', () => {
       priority: 0,
       created_at: new Date().toISOString(),
     });
-    setModuleState('band', 'main-room', {
+    await setModuleState('band', 'main-room', {
       roomId: 'hub-1',
       platformId: 'band:hub-1',
       updatedAt: new Date().toISOString(),
@@ -926,9 +938,9 @@ describe('band channel adapter', () => {
     }));
 
     const { getMessagingGroupByPlatform, getMessagingGroupAgents } = await import('../db/index.js');
-    const mg = getMessagingGroupByPlatform('band', 'band:room-new');
+    const mg = await getMessagingGroupByPlatform('band', 'band:room-new');
     expect(mg).toMatchObject({ unknown_sender_policy: 'public' });
-    const agents = getMessagingGroupAgents(mg!.id);
+    const agents = await getMessagingGroupAgents(mg!.id);
     expect(agents).toHaveLength(1);
     expect(agents[0]).toMatchObject({
       agent_group_id: 'ag-hub',
@@ -947,8 +959,14 @@ describe('band channel adapter', () => {
     fakeChats = [{ id: 'room-1', title: 'Room 1', type: 'group' }];
 
     const { createAgentGroup, createMessagingGroup, createMessagingGroupAgent } = await import('../db/index.js');
-    createAgentGroup({ id: 'ag-1', name: 'Agent 1', folder: 'agent-1', agent_provider: null, created_at: new Date().toISOString() });
-    createMessagingGroup({
+    await createAgentGroup({
+      id: 'ag-1',
+      name: 'Agent 1',
+      folder: 'agent-1',
+      agent_provider: null,
+      created_at: new Date().toISOString(),
+    });
+    await createMessagingGroup({
       id: 'mg-pre',
       channel_type: 'band',
       platform_id: 'band:room-1',
@@ -958,7 +976,7 @@ describe('band channel adapter', () => {
       denied_at: null,
       created_at: new Date().toISOString(),
     });
-    createMessagingGroupAgent({
+    await createMessagingGroupAgent({
       id: 'mga-pre',
       messaging_group_id: 'mg-pre',
       agent_group_id: 'ag-1',
@@ -987,7 +1005,7 @@ describe('band channel adapter', () => {
     }));
 
     const { getMessagingGroupByPlatform } = await import('../db/index.js');
-    expect(getMessagingGroupByPlatform('band', 'band:room-1')).toMatchObject({ unknown_sender_policy: 'public' });
+    expect(await getMessagingGroupByPlatform('band', 'band:room-1')).toMatchObject({ unknown_sender_policy: 'public' });
   });
 
   it('does not mark a direct room as main without owner-agent participant proof', async () => {
@@ -1020,8 +1038,8 @@ describe('band channel adapter', () => {
     const { getModuleState, getMessagingGroupByPlatform } = await import('../db/index.js');
     // room-1 lacks owner-agent proof, so the bootstrap creates a fresh Nano
     // Hub and that — not room-1 — becomes the main room.
-    expect(getModuleState('band', 'main-room')).toMatchObject({ roomId: 'hub-room-1' });
-    expect(getMessagingGroupByPlatform('band', 'band:room-1')).toMatchObject({
+    expect(await getModuleState('band', 'main-room')).toMatchObject({ roomId: 'hub-room-1' });
+    expect(await getMessagingGroupByPlatform('band', 'band:room-1')).toMatchObject({
       name: 'Room 1',
       is_group: 0,
     });
@@ -1056,15 +1074,15 @@ describe('band channel adapter', () => {
 
     const { createAgentGroup, createSession, getMessagingGroupByPlatform, getModuleState, getSession } =
       await import('../db/index.js');
-    createAgentGroup({
+    await createAgentGroup({
       id: 'ag-1',
       name: 'Agent 1',
       folder: 'agent-1',
       agent_provider: null,
       created_at: new Date().toISOString(),
     });
-    const mg = getMessagingGroupByPlatform('band', 'band:room-1')!;
-    createSession({
+    const mg = (await getMessagingGroupByPlatform('band', 'band:room-1'))!;
+    await createSession({
       id: 'sess-room-1',
       agent_group_id: 'ag-1',
       messaging_group_id: mg.id,
@@ -1082,9 +1100,9 @@ describe('band channel adapter', () => {
       payload: { id: 'user-42', name: 'Jane', type: 'User', handle: 'jane' },
     });
 
-    await waitFor(() => getSession('sess-room-1')?.status === 'closed');
-    expect(getModuleState('band', 'main-room')).toBeUndefined();
-    expect(getMessagingGroupByPlatform('band', 'band:room-1')).toMatchObject({
+    await waitFor(async () => (await getSession('sess-room-1'))?.status === 'closed');
+    expect(await getModuleState('band', 'main-room')).toBeUndefined();
+    expect(await getMessagingGroupByPlatform('band', 'band:room-1')).toMatchObject({
       name: 'Nano Hub',
       is_group: 0,
     });
@@ -1109,15 +1127,15 @@ describe('band channel adapter', () => {
     }));
 
     const { createAgentGroup, createSession, getMessagingGroupByPlatform, getSession } = await import('../db/index.js');
-    createAgentGroup({
+    await createAgentGroup({
       id: 'ag-1',
       name: 'Agent 1',
       folder: 'agent-1',
       agent_provider: null,
       created_at: new Date().toISOString(),
     });
-    const mg = getMessagingGroupByPlatform('band', 'band:room-1')!;
-    createSession({
+    const mg = (await getMessagingGroupByPlatform('band', 'band:room-1'))!;
+    await createSession({
       id: 'sess-room-1',
       agent_group_id: 'ag-1',
       messaging_group_id: mg.id,
@@ -1130,7 +1148,7 @@ describe('band channel adapter', () => {
     });
 
     fakeLinks[0].emit({ type: 'participant_removed', roomId: 'room-1', payload: { participant_id: 'agent-1' } });
-    await waitFor(() => getSession('sess-room-1')?.status === 'closed');
+    await waitFor(async () => (await getSession('sess-room-1'))?.status === 'closed');
   });
 
   it('consumes a retryable drop on the platform but leaves the host ledger for replay', async () => {
@@ -1175,7 +1193,7 @@ describe('band channel adapter', () => {
     // But the host dedup ledger is NOT flipped to 'processed' — the channel
     // approval gate's host-side replay must be able to re-route this event.
     expect(
-      getInboundDelivery({ channelType: 'band', platformId: 'band:room-1', platformMessageId: 'msg-drop' }),
+      await getInboundDelivery({ channelType: 'band', platformId: 'band:room-1', platformMessageId: 'msg-drop' }),
     ).toBeUndefined();
   });
 
@@ -1244,7 +1262,7 @@ describe('band channel adapter', () => {
     process.env.BAND_CONTACT_STRATEGY = 'hub_room';
     process.env.BAND_CONTACT_AGENT_GROUP_ID = 'ag-contact';
     const { createAgentGroup } = await import('../db/index.js');
-    createAgentGroup({
+    await createAgentGroup({
       id: 'ag-contact',
       name: 'Contact Agent',
       folder: 'contact-agent',
@@ -1299,10 +1317,10 @@ describe('band channel adapter', () => {
 
     const { getModuleState, getMessagingGroupByPlatform, getMessagingGroupAgentByPair } =
       await import('../db/index.js');
-    expect(getModuleState('band', 'hub-room')).toMatchObject({ roomId: 'hub-room-1' });
-    const mg = getMessagingGroupByPlatform('band', 'band:hub-room-1');
+    expect(await getModuleState('band', 'hub-room')).toMatchObject({ roomId: 'hub-room-1' });
+    const mg = await getMessagingGroupByPlatform('band', 'band:hub-room-1');
     expect(mg).toMatchObject({ name: 'Contact Hub', unknown_sender_policy: 'public' });
-    expect(getMessagingGroupAgentByPair(mg!.id, 'ag-contact')).toMatchObject({
+    expect(await getMessagingGroupAgentByPair(mg!.id, 'ag-contact')).toMatchObject({
       agent_group_id: 'ag-contact',
       engage_mode: 'mention',
       session_mode: 'shared',
@@ -1506,24 +1524,24 @@ describe('bandAgentControlEnv', () => {
     vi.resetModules();
     clearBandEnv();
     const { initTestDb, runMigrations } = await import('../db/index.js');
-    runMigrations(initTestDb());
+    await runMigrations(await initTestDb());
   });
 
-  afterEach(() => {
+  afterEach(async () => {
     clearBandEnv();
   });
 
   async function wireBandGroup(agentGroupId: string): Promise<void> {
     const { createAgentGroup, createMessagingGroup } = await import('../db/index.js');
     const { createDestination } = await import('../modules/agent-to-agent/db/agent-destinations.js');
-    createAgentGroup({
+    await createAgentGroup({
       id: agentGroupId,
       name: agentGroupId,
       folder: agentGroupId,
       agent_provider: null,
       created_at: new Date().toISOString(),
     });
-    createMessagingGroup({
+    await createMessagingGroup({
       id: `mg-${agentGroupId}`,
       channel_type: 'band',
       platform_id: 'band:room-x',
@@ -1532,7 +1550,7 @@ describe('bandAgentControlEnv', () => {
       unknown_sender_policy: 'public',
       created_at: new Date().toISOString(),
     });
-    createDestination({
+    await createDestination({
       agent_group_id: agentGroupId,
       local_name: 'room-x',
       target_type: 'channel',
@@ -1546,7 +1564,7 @@ describe('bandAgentControlEnv', () => {
     const { bandAgentControlEnv } = await import('./band.js');
     await wireBandGroup('ag-band');
 
-    const env = bandAgentControlEnv('ag-band');
+    const env = await bandAgentControlEnv('ag-band');
 
     expect(env.BAND_AGENT_ID).toBe('agent-1');
     expect(env.BAND_AGENT_CONTROL).toBe('true');
@@ -1561,7 +1579,7 @@ describe('bandAgentControlEnv', () => {
     setBandEnv();
     const { bandAgentControlEnv } = await import('./band.js');
     const { createAgentGroup } = await import('../db/index.js');
-    createAgentGroup({
+    await createAgentGroup({
       id: 'ag-none',
       name: 'None',
       folder: 'none',
@@ -1569,7 +1587,7 @@ describe('bandAgentControlEnv', () => {
       created_at: new Date().toISOString(),
     });
 
-    expect(bandAgentControlEnv('ag-none')).toEqual({});
+    expect(await bandAgentControlEnv('ag-none')).toEqual({});
   });
 
   it('returns {} when Band is not configured', async () => {
@@ -1577,7 +1595,7 @@ describe('bandAgentControlEnv', () => {
     const { bandAgentControlEnv } = await import('./band.js');
     await wireBandGroup('ag-band-2');
 
-    expect(bandAgentControlEnv('ag-band-2')).toEqual({});
+    expect(await bandAgentControlEnv('ag-band-2')).toEqual({});
   });
 });
 
@@ -1591,8 +1609,8 @@ describe('band channel migrations (M2)', () => {
     vi.resetModules();
   });
 
-  afterEach(() => {
-    closeTestDb?.();
+  afterEach(async () => {
+    await closeTestDb?.();
     closeTestDb = null;
   });
 
@@ -1601,17 +1619,17 @@ describe('band channel migrations (M2)', () => {
     const { moduleBandState } = await import('../db/migrations/module-band-state.js');
     const { initTestDb, closeDb, hasTable } = await import('../db/connection.js');
     registerChannelMigrations('band-m2-test', [moduleBandState]);
-    const db = initTestDb();
+    const db = await initTestDb();
     closeTestDb = closeDb;
-    runMigrations(db);
-    expect(hasTable(db, 'module_state')).toBe(true);
+    await runMigrations(db);
+    expect(await hasTable(db, 'module_state')).toBe(true);
   });
 
   it('is idempotent when module_state already exists (existing origin DB)', async () => {
     const { runMigrations, registerChannelMigrations } = await import('../db/migrations/index.js');
     const { moduleBandState } = await import('../db/migrations/module-band-state.js');
     const { initTestDb, closeDb, hasTable } = await import('../db/connection.js');
-    const db = initTestDb();
+    const db = await initTestDb();
     closeTestDb = closeDb;
     // Simulate an existing origin DB that already had module_state from the old
     // core migration 019. CREATE TABLE IF NOT EXISTS makes the re-run a no-op.
@@ -1619,7 +1637,7 @@ describe('band channel migrations (M2)', () => {
       `CREATE TABLE module_state (module_name TEXT NOT NULL, key TEXT NOT NULL, value_json TEXT NOT NULL, updated_at TEXT NOT NULL, PRIMARY KEY (module_name, key));`,
     );
     registerChannelMigrations('band-idempotent', [moduleBandState]);
-    expect(() => runMigrations(db)).not.toThrow();
-    expect(hasTable(db, 'module_state')).toBe(true);
+    await expect(runMigrations(db)).resolves.toBeUndefined();
+    expect(await hasTable(db, 'module_state')).toBe(true);
   });
 });

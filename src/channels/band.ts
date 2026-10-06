@@ -22,6 +22,7 @@ import { closeActiveSessionsForMessagingGroup, getSession } from '../db/sessions
 import { writeSessionMessage } from '../session-manager.js';
 import { wakeContainer } from '../container-runner.js';
 import { registerDeliveryAction } from '../delivery.js';
+import { unguarded } from '../guard/index.js';
 import { getModuleState, setModuleState, deleteModuleState } from '../db/module-state.js';
 import { registerChannelMigrations } from '../db/migrations/index.js';
 import { moduleBandState } from '../db/migrations/module-band-state.js';
@@ -37,6 +38,10 @@ const MAIN_ROOM_STATE_KEY = 'main-room';
 const MAIN_ROOM_NAME = 'Nano Hub';
 const HUB_ROOM_STATE_KEY = 'hub-room';
 const HUB_ROOM_NAME = 'Contact Hub';
+
+/** Unique, stable per agent so the owner can tell hubs apart; Band locks a creation-time title. */
+const shortAgentId = (agentId: string): string => agentId.slice(0, 8);
+const ownerHubTitle = (agentId: string): string => `nanoclaw-hub-${shortAgentId(agentId)}`;
 const SYNTHETIC_CONTACT_SENDER_ID = 'contact-events';
 const SYNTHETIC_CONTACT_SENDER_NAME = 'Contact Events';
 const MAX_CONTACT_DEDUP = 1000;
@@ -163,28 +168,28 @@ function isOwnerAgentDirectRoom(room: Record<string, unknown>, config: BandConfi
   );
 }
 
-function getMainRoomState(): BandMainRoomState | undefined {
+async function getMainRoomState(): Promise<BandMainRoomState | undefined> {
   return getModuleState<BandMainRoomState>(BAND_MODULE_NAME, MAIN_ROOM_STATE_KEY);
 }
 
-function setMainRoom(roomId: string): void {
-  setModuleState(BAND_MODULE_NAME, MAIN_ROOM_STATE_KEY, {
+async function setMainRoom(roomId: string): Promise<void> {
+  await setModuleState(BAND_MODULE_NAME, MAIN_ROOM_STATE_KEY, {
     roomId,
     platformId: formatBandPlatformId(roomId),
     updatedAt: now(),
   } satisfies BandMainRoomState);
 }
 
-function isMainRoomPlatformId(platformId: string): boolean {
-  return getMainRoomState()?.platformId === platformId;
+async function isMainRoomPlatformId(platformId: string): Promise<boolean> {
+  return (await getMainRoomState())?.platformId === platformId;
 }
 
-function getHubRoomState(): BandHubRoomState | undefined {
+async function getHubRoomState(): Promise<BandHubRoomState | undefined> {
   return getModuleState<BandHubRoomState>(BAND_MODULE_NAME, HUB_ROOM_STATE_KEY);
 }
 
-function setHubRoom(roomId: string): void {
-  setModuleState(BAND_MODULE_NAME, HUB_ROOM_STATE_KEY, {
+async function setHubRoom(roomId: string): Promise<void> {
+  await setModuleState(BAND_MODULE_NAME, HUB_ROOM_STATE_KEY, {
     roomId,
     platformId: formatBandPlatformId(roomId),
     createdAt: now(),
@@ -195,31 +200,35 @@ function roomOriginStateKey(roomId: string): string {
   return `origin:${roomId}`;
 }
 
-function getBandRoomOrigin(roomId: string): BandRoomOriginState | undefined {
+async function getBandRoomOrigin(roomId: string): Promise<BandRoomOriginState | undefined> {
   return getModuleState<BandRoomOriginState>(BAND_MODULE_NAME, roomOriginStateKey(roomId));
 }
 
 // Delivery action emitted by the container when the agent opens a room via
 // band_create_chatroom: record which session created it for the relay path.
-registerDeliveryAction('band_room_origin', async (content, session) => {
-  const roomId = typeof content.roomId === 'string' ? content.roomId : null;
-  if (!roomId) return;
-  setModuleState(BAND_MODULE_NAME, roomOriginStateKey(roomId), {
-    sessionId: session.id,
-    agentGroupId: session.agent_group_id,
-    createdAt: now(),
-  } satisfies BandRoomOriginState);
-  log.info('Band.ai room origin recorded', { roomId, sessionId: session.id });
-});
+registerDeliveryAction(
+  'band_room_origin',
+  async (content, session) => {
+    const roomId = typeof content.roomId === 'string' ? content.roomId : null;
+    if (!roomId) return;
+    await setModuleState(BAND_MODULE_NAME, roomOriginStateKey(roomId), {
+      sessionId: session.id,
+      agentGroupId: session.agent_group_id,
+      createdAt: now(),
+    } satisfies BandRoomOriginState);
+    log.info('Band.ai room origin recorded', { roomId, sessionId: session.id });
+  },
+  unguarded('records the calling session as the opener of a Band room it created itself; no cross-session effect'),
+);
 
-function ensureHubMessagingGroup(roomId: string, agentGroupId: string | null): void {
+async function ensureHubMessagingGroup(roomId: string, agentGroupId: string | null): Promise<void> {
   const platformId = formatBandPlatformId(roomId);
   let messagingGroupId: string;
-  const existing = getMessagingGroupByPlatform(BAND_CHANNEL_TYPE, platformId);
+  const existing = await getMessagingGroupByPlatform(BAND_CHANNEL_TYPE, platformId);
   if (existing) {
     messagingGroupId = existing.id;
     if (existing.unknown_sender_policy !== 'public' || existing.name !== HUB_ROOM_NAME) {
-      updateMessagingGroup(existing.id, {
+      await updateMessagingGroup(existing.id, {
         name: HUB_ROOM_NAME,
         is_group: 1,
         unknown_sender_policy: 'public',
@@ -227,7 +236,7 @@ function ensureHubMessagingGroup(roomId: string, agentGroupId: string | null): v
     }
   } else {
     messagingGroupId = `mg-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-    createMessagingGroup({
+    await createMessagingGroup({
       id: messagingGroupId,
       channel_type: BAND_CHANNEL_TYPE,
       platform_id: platformId,
@@ -240,8 +249,8 @@ function ensureHubMessagingGroup(roomId: string, agentGroupId: string | null): v
   }
 
   if (!agentGroupId) return;
-  if (getMessagingGroupAgentByPair(messagingGroupId, agentGroupId)) return;
-  createMessagingGroupAgent({
+  if (await getMessagingGroupAgentByPair(messagingGroupId, agentGroupId)) return;
+  await createMessagingGroupAgent({
     id: `mga-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
     messaging_group_id: messagingGroupId,
     agent_group_id: agentGroupId,
@@ -267,13 +276,13 @@ function ensureHubMessagingGroup(roomId: string, agentGroupId: string | null): v
  * would drop to "first agent group", which is creation-ordered and often NOT the
  * Band agent. Null only if no hub exists or it isn't wired.
  */
-function resolveHubAgentGroupId(): string | null {
-  const main = getMainRoomState();
+async function resolveHubAgentGroupId(): Promise<string | null> {
+  const main = await getMainRoomState();
   const mg =
-    (main ? getMessagingGroupByPlatform(BAND_CHANNEL_TYPE, main.platformId) : undefined) ??
-    getMessagingGroupsByChannel(BAND_CHANNEL_TYPE).find((g) => g.name === MAIN_ROOM_NAME);
+    (main ? await getMessagingGroupByPlatform(BAND_CHANNEL_TYPE, main.platformId) : undefined) ??
+    (await getMessagingGroupsByChannel(BAND_CHANNEL_TYPE)).find((g) => g.name === MAIN_ROOM_NAME);
   if (!mg) return null;
-  const agents = getMessagingGroupAgents(mg.id);
+  const agents = await getMessagingGroupAgents(mg.id);
   return agents.length > 0 ? agents[0].agent_group_id : null;
 }
 
@@ -294,10 +303,10 @@ function resolveHubAgentGroupId(): string | null {
  * escalates the channel-registration card — no prompt ever lands on the hub.
  * Only a zero-agent-group install returns null (nothing exists to wire to).
  */
-function resolveAutoWireAgentGroupId(): string | null {
-  const agentGroups = getAllAgentGroups();
+async function resolveAutoWireAgentGroupId(): Promise<string | null> {
+  const agentGroups = await getAllAgentGroups();
   if (agentGroups.length === 0) return null;
-  return resolveHubAgentGroupId() ?? agentGroups[0].id;
+  return (await resolveHubAgentGroupId()) ?? agentGroups[0].id;
 }
 
 /**
@@ -315,19 +324,19 @@ function resolveAutoWireAgentGroupId(): string | null {
  * no agent group exists yet. Multi-agent installs no longer fall through to the
  * router's approval card — resolveAutoWireAgentGroupId picks the hub's agent.
  */
-function autoWireDiscoveredRoom(roomId: string): void {
-  const agentGroupId = resolveAutoWireAgentGroupId();
+async function autoWireDiscoveredRoom(roomId: string): Promise<void> {
+  const agentGroupId = await resolveAutoWireAgentGroupId();
   if (!agentGroupId) return;
 
-  const mg = getMessagingGroupByPlatform(BAND_CHANNEL_TYPE, formatBandPlatformId(roomId));
+  const mg = await getMessagingGroupByPlatform(BAND_CHANNEL_TYPE, formatBandPlatformId(roomId));
   if (!mg || mg.denied_at) return;
 
   if (mg.unknown_sender_policy !== 'public') {
-    updateMessagingGroup(mg.id, { unknown_sender_policy: 'public' });
+    await updateMessagingGroup(mg.id, { unknown_sender_policy: 'public' });
   }
 
-  if (getMessagingGroupAgentByPair(mg.id, agentGroupId)) return;
-  createMessagingGroupAgent({
+  if (await getMessagingGroupAgentByPair(mg.id, agentGroupId)) return;
+  await createMessagingGroupAgent({
     id: `mga-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
     messaging_group_id: mg.id,
     agent_group_id: agentGroupId,
@@ -342,20 +351,20 @@ function autoWireDiscoveredRoom(roomId: string): void {
   log.info('Band.ai auto-wired discovered room', { messagingGroupId: mg.id, agentGroupId, roomId });
 }
 
-function upsertDiscoveredMessagingGroup(
+async function upsertDiscoveredMessagingGroup(
   roomId: string,
   room: Record<string, unknown>,
   config: BandConfig,
   forceMain = false,
-): void {
+): Promise<void> {
   const platformId = formatBandPlatformId(roomId);
   const isMain = forceMain || isOwnerAgentDirectRoom(room, config);
   const name = isMain ? MAIN_ROOM_NAME : safeRoomTitle(room, roomId);
   const isGroup = isMain ? 0 : room.type === 'direct' ? 0 : 1;
-  const existing = getMessagingGroupByPlatform(BAND_CHANNEL_TYPE, platformId);
+  const existing = await getMessagingGroupByPlatform(BAND_CHANNEL_TYPE, platformId);
 
   if (!existing) {
-    createMessagingGroup({
+    await createMessagingGroup({
       id: `mg-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
       channel_type: BAND_CHANNEL_TYPE,
       platform_id: platformId,
@@ -382,25 +391,25 @@ function upsertDiscoveredMessagingGroup(
     // (already wired) and never reaches it. The existing-row branch is the only
     // place discovery touches a pre-existing room, so it must assert the
     // invariant: every Band room is 'public' (platform ACL = authorization).
-    updateMessagingGroup(existing.id, { name, is_group: isGroup, unknown_sender_policy: 'public' });
+    await updateMessagingGroup(existing.id, { name, is_group: isGroup, unknown_sender_policy: 'public' });
   }
 
-  if (isMain) setMainRoom(roomId);
+  if (isMain) await setMainRoom(roomId);
 
   // Band controls room ACL on the platform, so the host's approval cards are
   // redundant: auto-wire + open the room instead of escalating to the owner.
-  autoWireDiscoveredRoom(roomId);
+  await autoWireDiscoveredRoom(roomId);
 }
 
-function closeSessionsForRoom(roomId: string, reason: string): void {
-  const mg = getMessagingGroupByPlatform(BAND_CHANNEL_TYPE, formatBandPlatformId(roomId));
+async function closeSessionsForRoom(roomId: string, reason: string): Promise<void> {
+  const mg = await getMessagingGroupByPlatform(BAND_CHANNEL_TYPE, formatBandPlatformId(roomId));
   if (!mg) return;
-  const closed = closeActiveSessionsForMessagingGroup(mg.id);
+  const closed = await closeActiveSessionsForMessagingGroup(mg.id);
   if (closed > 0) log.info('Band.ai closed stale room sessions', { roomId, reason, closed });
 }
 
-function clearMainRoomIfMatches(roomId: string): void {
-  if (getMainRoomState()?.roomId === roomId) deleteModuleState(BAND_MODULE_NAME, MAIN_ROOM_STATE_KEY);
+async function clearMainRoomIfMatches(roomId: string): Promise<void> {
+  if ((await getMainRoomState())?.roomId === roomId) await deleteModuleState(BAND_MODULE_NAME, MAIN_ROOM_STATE_KEY);
 }
 
 class BandChannelAdapter implements ChannelAdapter {
@@ -419,6 +428,7 @@ class BandChannelAdapter implements ChannelAdapter {
   private readonly link: BandLink;
   private readonly restClient: BandClient;
   private ownerMention: { id: string; name?: string } | null = null;
+  private resolvedOwnerId: string | null = null;
   private hubRoomInitPromise: Promise<string | null> | null = null;
   private readonly contactDedup = new Set<string>();
   private readonly contactDedupOrder: string[] = [];
@@ -600,14 +610,18 @@ class BandChannelAdapter implements ChannelAdapter {
    * call. Failure is non-fatal — the room is processed without participants.
    */
   private async withParticipants(roomId: string, room: Record<string, unknown>): Promise<Record<string, unknown>> {
-    if (getMainRoomState() || Array.isArray(room.participants)) return room;
+    if ((await getMainRoomState()) || Array.isArray(room.participants)) return room;
     const participants = await this.fetchParticipants(roomId);
     return participants ? { ...room, participants } : room;
   }
 
-  /** Create a room and add one participant; returns the room id or null. */
-  private async createDirectRoomWith(participantId: string): Promise<string | null> {
-    const response = await this.restClient.agentApiChats.createAgentChat({ chat: {} });
+  /**
+   * Create a room and add one participant; returns the room id or null. A
+   * `title` set at creation is locked by Band (no LLM auto-title), and room
+   * identity never depends on the title — a later owner rename is cosmetic.
+   */
+  private async createDirectRoomWith(participantId: string, title?: string): Promise<string | null> {
+    const response = await this.restClient.agentApiChats.createAgentChat({ chat: title ? { title } : {} });
     const data = (response as { data?: { id?: unknown } }).data;
     const roomId = typeof data?.id === 'string' ? data.id : null;
     if (!roomId) {
@@ -629,7 +643,7 @@ class BandChannelAdapter implements ChannelAdapter {
    */
   public async openDM(userHandle: string): Promise<string> {
     // Owner fast-path: the Nano Hub is the owner DM.
-    const main = getMainRoomState();
+    const main = await getMainRoomState();
     if (main) {
       const ownerId = await this.resolveOwnerId();
       if (ownerId === userHandle) return main.platformId;
@@ -663,19 +677,19 @@ class BandChannelAdapter implements ChannelAdapter {
    * participants fetch) wins and nothing is created. Idempotent — no-ops
    * whenever a main room is already known.
    *
-   * Note: the agent API cannot set a room title, so on the platform the
-   * room keeps its default name until the owner renames it; locally the
-   * messaging group is named "Nano Hub".
+   * Note: the agent API can set a room title only at creation (it cannot rename
+   * later), so the hub is created as `nanoclaw-hub-<agent id prefix>`; locally
+   * the messaging group is named "Nano Hub". Hub identity never depends on the title.
    */
   private async ensureOwnerHub(): Promise<void> {
-    if (getMainRoomState()) return;
+    if (await getMainRoomState()) return;
     const ownerId = await this.resolveOwnerId();
     if (!ownerId) {
       log.warn('Band.ai owner hub skipped — owner identity unavailable');
       return;
     }
     try {
-      const roomId = await this.createDirectRoomWith(ownerId);
+      const roomId = await this.createDirectRoomWith(ownerId, ownerHubTitle(this.config.agentId));
       if (!roomId) return;
       try {
         await this.link.subscribeRoom(roomId);
@@ -683,8 +697,8 @@ class BandChannelAdapter implements ChannelAdapter {
         log.warn('Band.ai failed to subscribe to new owner hub', { err, roomId });
       }
       this.knownRoomIds.add(roomId);
-      upsertDiscoveredMessagingGroup(roomId, { id: roomId, type: 'direct' }, this.config, true);
-      this.wireOwnerHub(roomId);
+      await upsertDiscoveredMessagingGroup(roomId, { id: roomId, type: 'direct' }, await this.discoveryConfig(), true);
+      await this.wireOwnerHub(roomId);
       this.setupConfig?.onMetadata(formatBandPlatformId(roomId), MAIN_ROOM_NAME, false);
       log.info('Band.ai owner hub created and set as main room', { roomId, ownerId });
     } catch (err) {
@@ -696,18 +710,18 @@ class BandChannelAdapter implements ChannelAdapter {
    * Wire the owner hub to the agent group when the choice is unambiguous.
    * With zero or multiple agent groups, leave wiring to /manage-channels.
    */
-  private wireOwnerHub(roomId: string): void {
-    const agentGroups = getAllAgentGroups();
+  private async wireOwnerHub(roomId: string): Promise<void> {
+    const agentGroups = await getAllAgentGroups();
     if (agentGroups.length !== 1) {
       log.warn('Band.ai owner hub left unwired — wire it via /manage-channels', {
         agentGroupCount: agentGroups.length,
       });
       return;
     }
-    const mg = getMessagingGroupByPlatform(BAND_CHANNEL_TYPE, formatBandPlatformId(roomId));
+    const mg = await getMessagingGroupByPlatform(BAND_CHANNEL_TYPE, formatBandPlatformId(roomId));
     if (!mg) return;
-    if (getMessagingGroupAgentByPair(mg.id, agentGroups[0].id)) return;
-    createMessagingGroupAgent({
+    if (await getMessagingGroupAgentByPair(mg.id, agentGroups[0].id)) return;
+    await createMessagingGroupAgent({
       id: `mga-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
       messaging_group_id: mg.id,
       agent_group_id: agentGroups[0].id,
@@ -737,13 +751,14 @@ class BandChannelAdapter implements ChannelAdapter {
       this.knownRoomIds.add(roomId);
 
       await this.link.subscribeRoom(roomId);
-      upsertDiscoveredMessagingGroup(
+      const isMainRoom = (await getMainRoomState())?.roomId === roomId;
+      await upsertDiscoveredMessagingGroup(
         roomId,
         await this.withParticipants(roomId, roomRecord),
-        this.config,
-        getMainRoomState()?.roomId === roomId,
+        await this.discoveryConfig(),
+        isMainRoom,
       );
-      const main = getMainRoomState()?.roomId === roomId;
+      const main = (await getMainRoomState())?.roomId === roomId;
       const title = main ? MAIN_ROOM_NAME : typeof roomRecord.title === 'string' ? roomRecord.title : undefined;
       const isGroup = main ? false : roomRecord.type !== 'direct';
       const platformId = formatBandPlatformId(roomId);
@@ -751,10 +766,10 @@ class BandChannelAdapter implements ChannelAdapter {
       this.setupConfig?.onMetadata(platformId, title, isGroup);
     }
 
-    const state = getMainRoomState();
+    const state = await getMainRoomState();
     if (state && !seenRoomIds.has(state.roomId)) {
-      clearMainRoomIfMatches(state.roomId);
-      closeSessionsForRoom(state.roomId, 'main_room_missing_during_sync');
+      await clearMainRoomIfMatches(state.roomId);
+      await closeSessionsForRoom(state.roomId, 'main_room_missing_during_sync');
     }
 
     return conversations;
@@ -790,10 +805,10 @@ class BandChannelAdapter implements ChannelAdapter {
       case 'room_removed':
       case 'room_deleted':
       case 'participant_removed':
-        this.handleRoomInvalidated(event.roomId, event.payload, event.type);
+        await this.handleRoomInvalidated(event.roomId, event.payload, event.type);
         break;
       case 'participant_added':
-        this.handleParticipantAdded(event.roomId, event.payload);
+        await this.handleParticipantAdded(event.roomId, event.payload);
         await this.maybeInjectParticipantMemories(event.roomId, event.payload);
         break;
       case 'message_created':
@@ -815,13 +830,14 @@ class BandChannelAdapter implements ChannelAdapter {
     if (!id) return;
     await this.link.subscribeRoom(id);
     this.knownRoomIds.add(id);
-    upsertDiscoveredMessagingGroup(
+    const isMainRoom = (await getMainRoomState())?.roomId === id;
+    await upsertDiscoveredMessagingGroup(
       id,
       await this.withParticipants(id, payload),
-      this.config,
-      getMainRoomState()?.roomId === id,
+      await this.discoveryConfig(),
+      isMainRoom,
     );
-    const main = getMainRoomState()?.roomId === id;
+    const main = (await getMainRoomState())?.roomId === id;
     const title = main ? MAIN_ROOM_NAME : typeof payload.title === 'string' ? payload.title : undefined;
     const isGroup = main ? false : payload.type !== 'direct';
     this.setupConfig?.onMetadata(formatBandPlatformId(id), title, isGroup);
@@ -830,7 +846,11 @@ class BandChannelAdapter implements ChannelAdapter {
     await this.drainPendingMessages(id);
   }
 
-  private handleRoomInvalidated(roomId: string | null, payload: Record<string, unknown>, reason: string): void {
+  private async handleRoomInvalidated(
+    roomId: string | null,
+    payload: Record<string, unknown>,
+    reason: string,
+  ): Promise<void> {
     const id =
       roomId ??
       (typeof payload.id === 'string'
@@ -840,19 +860,19 @@ class BandChannelAdapter implements ChannelAdapter {
           : null);
     if (!id) return;
     this.knownRoomIds.delete(id);
-    closeSessionsForRoom(id, reason);
-    clearMainRoomIfMatches(id);
+    await closeSessionsForRoom(id, reason);
+    await clearMainRoomIfMatches(id);
   }
 
-  private handleParticipantAdded(roomId: string | null, payload: Record<string, unknown>): void {
+  private async handleParticipantAdded(roomId: string | null, payload: Record<string, unknown>): Promise<void> {
     const id = roomId ?? (typeof payload.chat_room_id === 'string' ? payload.chat_room_id : null);
     if (!id) return;
 
     // participant_added payloads describe only the participant that joined, not the
     // full room. Do not upsert room metadata from that partial shape.
-    if (getMainRoomState()?.roomId === id) {
-      clearMainRoomIfMatches(id);
-      closeSessionsForRoom(id, 'main_room_participant_added');
+    if ((await getMainRoomState())?.roomId === id) {
+      await clearMainRoomIfMatches(id);
+      await closeSessionsForRoom(id, 'main_room_participant_added');
     }
   }
 
@@ -870,7 +890,7 @@ class BandChannelAdapter implements ChannelAdapter {
     if (!resolvedRoomId) return;
 
     const platformId = formatBandPlatformId(resolvedRoomId);
-    if (!getMessagingGroupByPlatform(BAND_CHANNEL_TYPE, platformId)) return;
+    if (!(await getMessagingGroupByPlatform(BAND_CHANNEL_TYPE, platformId))) return;
 
     const participantId = typeof payload.id === 'string' ? payload.id : null;
     const participantName = typeof payload.name === 'string' ? payload.name : 'Someone';
@@ -979,11 +999,11 @@ class BandChannelAdapter implements ChannelAdapter {
       }
     }
 
-    upsertDiscoveredMessagingGroup(
+    await upsertDiscoveredMessagingGroup(
       resolvedRoomId,
       { id: resolvedRoomId, title: resolvedRoomId, type: 'group' },
-      this.config,
-      getMainRoomState()?.roomId === resolvedRoomId,
+      await this.discoveryConfig(),
+      (await getMainRoomState())?.roomId === resolvedRoomId,
     );
     const content: BandMessageContent = {
       text: payload.content,
@@ -998,7 +1018,7 @@ class BandChannelAdapter implements ChannelAdapter {
     // If this room was opened by the agent on behalf of another conversation
     // (e.g. from Telegram), relay the reply back to that originating session
     // instead of spawning an isolated per-room session.
-    const origin = getBandRoomOrigin(resolvedRoomId);
+    const origin = await getBandRoomOrigin(resolvedRoomId);
     const result = origin
       ? await this.relayToOrigin(origin, resolvedRoomId, content, payload)
       : await this.setupConfig.onInbound(platformId, null, {
@@ -1035,7 +1055,7 @@ class BandChannelAdapter implements ChannelAdapter {
     // owner approval) so the approval gate's host-side replay re-routes the
     // original event instead of short-circuiting on a 'processed' row.
     if (result?.status === 'persisted') {
-      markInboundDeliveryProcessed({
+      await markInboundDeliveryProcessed({
         channelType: BAND_CHANNEL_TYPE,
         platformId,
         platformMessageId: payload.id,
@@ -1056,7 +1076,7 @@ class BandChannelAdapter implements ChannelAdapter {
     payload: { id: string; inserted_at: string; metadata?: Record<string, unknown> | null },
   ): Promise<InboundRouteResult> {
     const platformId = formatBandPlatformId(roomId);
-    const session = getSession(origin.sessionId);
+    const session = await getSession(origin.sessionId);
     if (!session || session.status === 'closed') {
       const fallback = await this.setupConfig!.onInbound(platformId, null, {
         id: payload.id,
@@ -1072,7 +1092,7 @@ class BandChannelAdapter implements ChannelAdapter {
 
     const who = content.senderName ?? content.sender;
     const relayId = `band-relay-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-    writeSessionMessage(session.agent_group_id, session.id, {
+    await writeSessionMessage(session.agent_group_id, session.id, {
       id: relayId,
       kind: 'chat',
       timestamp: payload.inserted_at,
@@ -1255,16 +1275,16 @@ class BandChannelAdapter implements ChannelAdapter {
     }
   }
 
-  private resolveHubAgentGroupId(): string | null {
+  private async resolveHubAgentGroupId(): Promise<string | null> {
     if (this.config.contactAgentGroupId) {
-      if (getAgentGroup(this.config.contactAgentGroupId)) return this.config.contactAgentGroupId;
+      if (await getAgentGroup(this.config.contactAgentGroupId)) return this.config.contactAgentGroupId;
       log.warn('Band.ai contact hub agent group not found; hub messages will not wake an agent', {
         agentGroupId: this.config.contactAgentGroupId,
       });
       return null;
     }
 
-    const agentGroups = getAllAgentGroups();
+    const agentGroups = await getAllAgentGroups();
     if (agentGroups.length === 1) return agentGroups[0].id;
     log.warn('Band.ai contact hub has no unambiguous agent group; set BAND_CONTACT_AGENT_GROUP_ID', {
       agentGroupCount: agentGroups.length,
@@ -1273,16 +1293,18 @@ class BandChannelAdapter implements ChannelAdapter {
   }
 
   private async ensureHubRoom(): Promise<string | null> {
-    const persisted = getHubRoomState();
+    const persisted = await getHubRoomState();
     if (persisted) {
-      ensureHubMessagingGroup(persisted.roomId, this.resolveHubAgentGroupId());
+      await ensureHubMessagingGroup(persisted.roomId, await this.resolveHubAgentGroupId());
       return persisted.roomId;
     }
     if (this.hubRoomInitPromise) return this.hubRoomInitPromise;
 
     this.hubRoomInitPromise = (async () => {
       try {
-        const response = await this.restClient.agentApiChats.createAgentChat({ chat: {} });
+        const response = await this.restClient.agentApiChats.createAgentChat({
+          chat: { title: `nanoclaw-contact-hub-${shortAgentId(this.config.agentId)}` },
+        });
         const data = (response as { data?: { id?: unknown } }).data;
         const newRoomId = typeof data?.id === 'string' ? data.id : null;
         if (!newRoomId) {
@@ -1303,8 +1325,8 @@ class BandChannelAdapter implements ChannelAdapter {
           log.warn('Band.ai hub room created without owner; owner will not see it');
         }
 
-        setHubRoom(newRoomId);
-        ensureHubMessagingGroup(newRoomId, this.resolveHubAgentGroupId());
+        await setHubRoom(newRoomId);
+        await ensureHubMessagingGroup(newRoomId, await this.resolveHubAgentGroupId());
         try {
           await this.link.subscribeRoom(newRoomId);
         } catch (err) {
@@ -1325,13 +1347,23 @@ class BandChannelAdapter implements ChannelAdapter {
     }
   }
 
+  /**
+   * Config for room discovery with the owner resolved. Main-room detection
+   * (owner↔agent direct room) needs the owner id, which is usually not set via
+   * BAND_OWNER_ID — fall back to GET /agent/me, as every other owner path does.
+   */
+  private async discoveryConfig(): Promise<BandConfig> {
+    const ownerId = await this.resolveOwnerId();
+    return ownerId ? { ...this.config, ownerId } : this.config;
+  }
   private async resolveOwnerId(): Promise<string | null> {
     if (this.config.ownerId) return this.config.ownerId;
+    if (this.resolvedOwnerId) return this.resolvedOwnerId;
     try {
       const response = await this.restClient.agentApiIdentity.getAgentMe();
       const data = (response as { data?: { owner_uuid?: unknown; ownerUuid?: unknown } }).data;
-      if (typeof data?.owner_uuid === 'string') return data.owner_uuid;
-      if (typeof data?.ownerUuid === 'string') return data.ownerUuid;
+      const resolved = typeof data?.owner_uuid === 'string' ? data.owner_uuid : data?.ownerUuid;
+      if (typeof resolved === 'string') return (this.resolvedOwnerId = resolved);
     } catch (err) {
       log.warn('Band.ai failed to resolve owner UUID', { err });
     }
@@ -1399,10 +1431,13 @@ function baseBandEnv(config: BandConfig, hostEnv: NodeJS.ProcessEnv): Record<str
 
 /** True if the agent group is wired to at least one Band room — the
  *  authorization signal for granting it the agent-scoped Band toolset. */
-function agentGroupHasBandDestination(agentGroupId: string): boolean {
-  return getDestinations(agentGroupId).some(
-    (d) => d.target_type === 'channel' && getMessagingGroup(d.target_id)?.channel_type === BAND_CHANNEL_TYPE,
-  );
+async function agentGroupHasBandDestination(agentGroupId: string): Promise<boolean> {
+  for (const d of await getDestinations(agentGroupId)) {
+    if (d.target_type === 'channel' && (await getMessagingGroup(d.target_id))?.channel_type === BAND_CHANNEL_TYPE) {
+      return true;
+    }
+  }
+  return false;
 }
 
 /**
@@ -1413,22 +1448,22 @@ function agentGroupHasBandDestination(agentGroupId: string): boolean {
  * chat_room_id. Returns {} when Band isn't configured or the group has no Band
  * destination.
  */
-export function bandAgentControlEnv(
+export async function bandAgentControlEnv(
   agentGroupId: string,
   hostEnv: NodeJS.ProcessEnv = process.env,
-): Record<string, string> {
+): Promise<Record<string, string>> {
   const config = getBandConfig();
-  if (!config || !agentGroupHasBandDestination(agentGroupId)) return {};
+  if (!config || !(await agentGroupHasBandDestination(agentGroupId))) return {};
   return mirrorBandEnv({ ...baseBandEnv(config, hostEnv), BAND_AGENT_CONTROL: 'true' });
 }
 
-registerChannelContainerConfig(BAND_CHANNEL_TYPE, ({ messagingGroup, hostEnv }) => {
+registerChannelContainerConfig(BAND_CHANNEL_TYPE, async ({ messagingGroup, hostEnv }) => {
   const config = getBandConfig();
   if (!config || !messagingGroup) return {};
   const bandEnv = {
     ...baseBandEnv(config, hostEnv),
     BAND_ROOM_ID: parseBandPlatformId(messagingGroup.platform_id),
-    BAND_IS_MAIN_CONTROL_ROOM: String(isMainRoomPlatformId(messagingGroup.platform_id)),
+    BAND_IS_MAIN_CONTROL_ROOM: String(await isMainRoomPlatformId(messagingGroup.platform_id)),
   };
   return {
     env: { NANOCLAW_CHANNEL: BAND_CHANNEL_TYPE, ...mirrorBandEnv(bandEnv) },
@@ -1437,8 +1472,8 @@ registerChannelContainerConfig(BAND_CHANNEL_TYPE, ({ messagingGroup, hostEnv }) 
 });
 
 // Agent-scoped: grant Band tools to every session of a Band-wired agent group.
-registerAgentContainerConfig(({ agentGroupId, hostEnv }) => {
-  const env = bandAgentControlEnv(agentGroupId, hostEnv);
+registerAgentContainerConfig(async ({ agentGroupId, hostEnv }) => {
+  const env = await bandAgentControlEnv(agentGroupId, hostEnv);
   return Object.keys(env).length > 0 ? { env } : {};
 });
 
