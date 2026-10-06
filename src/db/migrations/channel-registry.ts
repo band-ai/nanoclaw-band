@@ -8,13 +8,29 @@
  * channel never runs its migrations. Re-exported from index.ts so channel
  * code imports `registerChannelMigrations` from '../db/migrations/index.js'.
  */
+import { forkMigrations } from './fork.js';
 import type { Migration } from './index.js';
 
+/** Key the fork's own migrations (fork.ts) register under. */
+export const FORK_KEY = 'fork';
+
 const channelMigrations = new Map<string, Migration[]>();
+
+export function hasChannelMigrations(channel: string): boolean {
+  return channelMigrations.has(channel);
+}
 
 export function registerChannelMigrations(channel: string, list: Migration[]): void {
   if (channelMigrations.has(channel)) {
     throw new Error(`Channel migrations already registered: ${channel}`);
+  }
+  // Channel migrations may rewrite fork tables (Band's rename touches
+  // inbound_delivery_ledger), and channels register on import — before the
+  // host or any script runs migrations. The first channel therefore pulls the
+  // fork's set in ahead of itself, so no entry point can run a channel's
+  // migrations without the tables they build on.
+  if (channel !== FORK_KEY && !channelMigrations.has(FORK_KEY)) {
+    channelMigrations.set(FORK_KEY, forkMigrations);
   }
   channelMigrations.set(channel, list);
 }
