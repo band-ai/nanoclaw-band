@@ -290,12 +290,27 @@ gate on an existing key (Phase 0 already told you which case you're in):
   key, see *Re-register or rotate* at the end of this step.)
 
 - **Key missing → register one.** This needs a **create-scope** Band API key
-  (app.band.ai → Settings → API Keys), used only to mint the agent. The operator
-  pastes it at the prompt — never on `argv`, never `eval` the create-scope key:
+  (app.band.ai → Settings → API Keys), used only to mint the agent. The script
+  reads it from `BAND_USER_API_KEY` (what the app.band.ai on-ramp exports), else
+  `BAND_API_KEY`, else the operator pastes it at the prompt — never on `argv`,
+  never `eval` the create-scope key. `BAND_USER_API_KEY` wins when both are set:
+  a `BAND_API_KEY` left in the shell is often a stale agent key. Without
+  `--name` / `BAND_AGENT_NAME` the agent gets a unique default name (host +
+  timestamp), since Band rejects a second agent with the same name (HTTP 422):
 
   ```bash
   ( umask 077; "$ROOT/.claude/skills/add-band/scripts/register-agent.sh" > /tmp/band-agent.env )
   # writes:  BAND_AGENT_ID=<uuid>   and   BAND_AGENT_API_KEY=<agent-scoped key>
+  ```
+
+  The script registers against `$BAND_BASE_URL` (default `https://app.band.ai`).
+  If the operator registered against another Band host, persist that URL so the
+  host adapter and the vault secret below use the same host. Otherwise the agent
+  exists on one host while the runtime talks to the other:
+
+  ```bash
+  [ -z "${BAND_BASE_URL:-}" ] || [ "${BAND_BASE_URL%/}" = https://app.band.ai ] \
+    || pnpm exec tsx setup/index.ts --step set-env -- --key BAND_BASE_URL --value "${BAND_BASE_URL%/}"
   ```
 
   Then route the agent key to **both** places it's needed:
@@ -307,18 +322,26 @@ gate on an existing key (Phase 0 already told you which case you're in):
      `BAND_AGENT_API_KEY` is canonical; legacy `BAND_API_KEY` / `THENVOI_*` still
      work, with `BAND_*` taking precedence.
 
-  2. **OneCLI vault (container).** For hosted `app.band.ai` the container never
-     gets the raw key — OneCLI injects the `X-API-Key` header on egress. Store the
-     same key in the vault, reading it back from `.env` (never paste it). Band
+  2. **OneCLI vault (container).** The container never gets the raw key: its
+     `band_*` tools call `BAND_BASE_URL`'s host, and OneCLI injects the
+     `X-API-Key` header **only when a vault secret's host pattern matches that
+     host**. A secret on the wrong host makes every `band_*` call return 401 while
+     the host adapter looks healthy. Store the same key in the vault, reading it
+     back from `.env` (never paste it), on the host the runtime uses. Band
      authenticates with **`X-API-Key`**, not `Authorization: Bearer`:
 
      ```bash
      KEY=$(grep -E '^(BAND|THENVOI)_(AGENT_)?API_KEY=' .env | head -1 | cut -d= -f2-)
+     BASE=$(grep -E '^(BAND|THENVOI)_BASE_URL=' .env | sort | head -1 | cut -d= -f2-)
+     HOST=$(printf '%s' "${BASE:-https://app.band.ai}" | sed -E 's#^https?://##; s#/.*##')
      onecli secrets create --name Band --type generic --value "$KEY" \
-       --host-pattern app.band.ai --header-name X-API-Key --value-format '{value}'
+       --host-pattern "$HOST" --header-name X-API-Key --value-format '{value}'
      ```
 
      The agent's OneCLI `secretMode` must be `all` (or assign this secret to it).
+     (A plain-HTTP `localhost` / `127.0.0.1` base URL is the exception: for local
+     development the adapter passes the key to the container directly and the
+     vault secret is unused.)
 
   Wipe the temp file regardless of path — it holds the live key:
 
@@ -329,7 +352,7 @@ gate on an existing key (Phase 0 already told you which case you're in):
 Optional vars, all defaulted (leave unset for hosted Band):
 
 ```bash
-# BAND_BASE_URL   defaults to https://app.band.ai
+# BAND_BASE_URL   defaults to https://app.band.ai; any other host must also be the vault secret's host pattern
 # BAND_OWNER_ID   Band user UUID that owns the agent; falls back to GET /agent/me
 ```
 
@@ -346,8 +369,10 @@ The skip-on-existing-key gate assumes the key in `.env` is live. Two resets:
 
   ```bash
   onecli secrets list                 # find the "Band" secret id
+  BASE=$(grep -E '^(BAND|THENVOI)_BASE_URL=' .env | sort | head -1 | cut -d= -f2-)
+  HOST=$(printf '%s' "${BASE:-https://app.band.ai}" | sed -E 's#^https?://##; s#/.*##')
   onecli secrets update --id <secret-id> --value "$NEW_KEY" \
-    --host-pattern app.band.ai --header-name X-API-Key --value-format '{value}'
+    --host-pattern "$HOST" --header-name X-API-Key --value-format '{value}'
   ```
 
 - **Dead agent → mint fresh** — you deleted the agent on Band (the `.env` key is

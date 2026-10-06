@@ -97,14 +97,19 @@ Create the vault secret accordingly, reading the key from `.env` (never paste it
 
 ```bash
 KEY=$(grep -E '^(BAND|THENVOI)_(AGENT_)?API_KEY=' .env | head -1 | cut -d= -f2-)
+BASE=$(grep -E '^(BAND|THENVOI)_BASE_URL=' .env | sort | head -1 | cut -d= -f2-)
+HOST=$(printf '%s' "${BASE:-https://app.band.ai}" | sed -E 's#^https?://##; s#/.*##')
 onecli secrets create --name Band --type generic --value "$KEY" \
-  --host-pattern app.band.ai --header-name X-API-Key --value-format '{value}'
+  --host-pattern "$HOST" --header-name X-API-Key --value-format '{value}'
 ```
 
-The agent's OneCLI `secretMode` must be `all` (or assign this secret explicitly).
-No raw key enters the container: the MCP sends the stub `onecli-managed`, and the
-gateway replaces `X-API-Key` on egress to `app.band.ai`. band-mcp uses `httpx`,
-which honors the gateway's `SSL_CERT_FILE` and `HTTPS_PROXY` automatically.
+(Skip the create if Step 1 of the skill already made this `Band` secret for the
+same host.) The agent's OneCLI `secretMode` must be `all` (or assign this secret
+explicitly). No raw key enters the container: the MCP sends the stub
+`onecli-managed`, and the gateway replaces `X-API-Key` on egress to the secret's
+host, so that host must be the one the MCP calls (`BAND_BASE_URL` below).
+band-mcp uses `httpx`, which honors the gateway's `SSL_CERT_FILE` and
+`HTTPS_PROXY` automatically.
 
 ### 3. Wire into the global agent group's `container.json`
 
@@ -116,7 +121,7 @@ which honors the gateway's `SSL_CERT_FILE` and `HTTPS_PROXY` automatically.
     "env": {
       "BAND_AGENT_KEY": "onecli-managed",
       "THENVOI_AGENT_KEY": "onecli-managed",
-      "BAND_BASE_URL": "https://app.band.ai",
+      "BAND_BASE_URL": "https://app.band.ai",    // the same URL as BAND_BASE_URL in .env, if set
       "THENVOI_BASE_URL": "https://app.band.ai"
     }
   }
