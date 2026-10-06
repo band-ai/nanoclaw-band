@@ -1633,7 +1633,7 @@ describe('band channel migrations (M2)', () => {
     closeTestDb = closeDb;
     // Simulate an existing origin DB that already had module_state from the old
     // core migration 019. CREATE TABLE IF NOT EXISTS makes the re-run a no-op.
-    db.exec(
+    await db.exec(
       `CREATE TABLE module_state (module_name TEXT NOT NULL, key TEXT NOT NULL, value_json TEXT NOT NULL, updated_at TEXT NOT NULL, PRIMARY KEY (module_name, key));`,
     );
     registerChannelMigrations('band-idempotent', [moduleBandState]);
