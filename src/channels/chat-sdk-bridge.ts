@@ -1141,7 +1141,7 @@ async function handleForwardedEvent(
       // construction). Decode back to the real option value for downstream.
       const selectedOption = resolveSelectedOption(render, tail, tail);
       if (render?.deferResolution && questionId) {
-        await fetch(`https://discord.com/api/v10/interactions/${interactionId}/${interactionToken}/callback`, {
+        await fetch(discordInteractionCallbackUrl(interactionId, interactionToken), {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ type: 6 }),
