@@ -15,6 +15,7 @@ import type { Migration } from './index.js';
 export const moduleBandState: Migration = {
   version: 100,
   name: 'module-band-state',
+  sqliteOnly: true,
   up: (db: Database.Database) => {
     db.exec(`
       CREATE TABLE IF NOT EXISTS module_state (
