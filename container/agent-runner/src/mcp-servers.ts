@@ -26,16 +26,12 @@ export function addExtraMcpServers(
   env: NodeJS.ProcessEnv = process.env,
 ): void {
   const mcpEnv = fullMcpEnv(env);
-  const extra = ((): Record<string, { command: string; args: string[]; env?: Record<string, string> }> => {
-    try {
-      return JSON.parse(env.NANOCLAW_EXTRA_MCP_SERVERS ?? '{}') as Record<
-        string,
-        { command: string; args: string[]; env?: Record<string, string> }
-      >;
-    } catch {
-      return {};
-    }
-  })();
+  let extra: Record<string, { command: string; args: string[]; env?: Record<string, string> }> = {};
+  try {
+    extra = JSON.parse(env.NANOCLAW_EXTRA_MCP_SERVERS ?? '{}');
+  } catch (err) {
+    log?.(`Ignoring malformed NANOCLAW_EXTRA_MCP_SERVERS: ${err instanceof Error ? err.message : String(err)}`);
+  }
 
   for (const [name, serverConfig] of Object.entries(extra)) {
     mcpServers[name] = {

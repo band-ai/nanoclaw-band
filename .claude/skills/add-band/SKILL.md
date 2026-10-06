@@ -36,9 +36,9 @@ permission three steps in.
    untrusted-code integration. That is by design, not an error. Before step 1,
    tell the operator plainly:
 
-   > Installing Band copies 14 files from `https://github.com/band-ai/nanoclaw-band`
-   > (branch `band/adapter`) and installs `@band-ai/sdk@0.1.6` +
-   > `@band-ai/rest-client@0.0.121`. Both will ask for your approval.
+   > Installing Band copies the Band payload files (the list prints in Phase 1 step 2) from `https://github.com/band-ai/nanoclaw-band`
+   > (branch `band/adapter`) and installs the pinned `@band-ai/sdk` +
+   > `@band-ai/rest-client` (versions in `versions.json` next to this skill). Both will ask for your approval.
 
    Then agree how to clear them: either the operator pre-grants (re-run in a mode
    that permits it, or add Bash rules for `git show:*` / `pnpm add` / `bun add`),
@@ -78,14 +78,8 @@ Then detect everything the rest of the skill branches on, in one pass:
 
 ```bash
 echo "=== base seams (must all pass) ==="
-missing=0
-grep -q 'registerChannelMigrations' src/db/migrations/index.ts                   || { echo "MISSING: channel-migration registry"; missing=1; }
-grep -q 'supportsDeliveryAck'        src/channels/adapter.ts                      || { echo "MISSING: delivery-ack capability"; missing=1; }
-grep -q 'needsGracefulStop'          src/channels/adapter.ts                      || { echo "MISSING: graceful-stop capability"; missing=1; }
-grep -q 'userVisibleTools'           src/fork/session-contribution.ts             || { echo "MISSING: userVisibleTools contribution"; missing=1; }
-test -f container/agent-runner/src/lifecycle.ts                                   || { echo "MISSING: container lifecycle hooks"; missing=1; }
-test -f container/agent-runner/src/mcp-servers.ts                                 || { echo "MISSING: buildMcpServers"; missing=1; }
-[ "$missing" = 0 ] && echo "seams: present — base is ready" || echo "seams: STOP — base lacks the channel seams"
+# Symbol-based, so a seam moving between fork-owned and upstream files cannot false-STOP.
+"$ROOT/.claude/skills/add-band/scripts/check-seams.sh"
 
 echo "=== Band already installed? ==="
 { test -f src/channels/band.ts && grep -q "import './band.js';" src/channels/index.ts; } \
@@ -155,28 +149,21 @@ shell).
 
 ### 2. Copy the Band files in (repo-root anchored, then validated)
 
-The full tested set is 14 files (adapter, config, two channel migrations, the
-container MCP tool + memory hooks + lifecycle registration, and their tests). Copy
-them and **immediately validate** against the branch, so a wrong cwd or partial
-copy is caught now, not three steps later:
+The payload is whatever `band/adapter` adds on top of `main` — the branch is a
+purely additive overlay (enforced by `band-payload-guard.yml`), so the file list
+is **derived from the branch, not hardcoded**: new Band files are picked up
+automatically and the skill cannot drift behind the adapter. Typically that is
+the adapter, config, channel migrations, the container MCP tool + memory hooks
++ lifecycle registration, and their tests. Copy them and **immediately validate**
+against the branch, so a wrong cwd or partial copy is caught now, not three
+steps later:
 
 ```bash
-FILES="
-src/channels/band.ts
-src/channels/band.test.ts
-src/modules/band-config.ts
-src/db/migrations/module-band-state.ts
-src/db/migrations/020-band-rename.ts
-container/agent-runner/src/mcp-tools/band.ts
-container/agent-runner/src/mcp-tools/band.test.ts
-container/agent-runner/src/mcp-tools/band.instructions.md
-container/agent-runner/src/band-lifecycle.ts
-container/agent-runner/src/band-lifecycle.test.ts
-container/agent-runner/src/band-memory-load.ts
-container/agent-runner/src/band-memory-load.test.ts
-container/agent-runner/src/band-memory-consolidate.ts
-container/agent-runner/src/band-memory-consolidate.test.ts
-"
+# --diff-filter=A: files the payload adds. Anything outside src/ or container/ is not payload.
+FILES=$(git diff --name-only --diff-filter=A "$FORK_REMOTE/main" "$FORK_REMOTE/band/adapter" \
+  | grep -E '^(src|container)/')
+[ -n "$FILES" ] || { echo "no payload files found on $FORK_REMOTE/band/adapter — do not proceed"; exit 1; }
+echo "payload ($(echo "$FILES" | wc -l | tr -d ' ') files):"; echo "$FILES" | sed 's/^/  /'
 for f in $FILES; do
   mkdir -p "$ROOT/$(dirname "$f")"
   git show "$FORK_REMOTE/band/adapter:$f" > "$ROOT/$f"
@@ -189,7 +176,7 @@ for f in $FILES; do
   [ "$(git hash-object "$ROOT/$f")" = "$(git rev-parse "$FORK_REMOTE/band/adapter:$f")" ] \
     || { echo "MISMATCH: $f"; bad=1; }
 done
-[ "$bad" = 0 ] && echo "copy: 13/13 present and byte-identical" || echo "copy: FAILED — do not proceed"
+[ "$bad" = 0 ] && echo "copy: $(echo "$FILES" | wc -l | tr -d ' ') present and byte-identical" || echo "copy: FAILED — do not proceed"
 ```
 
 (This is the first of the two approval gates from **Before you start** — the
@@ -224,18 +211,22 @@ import './band-lifecycle.js';
 
 ### 4. Install the pinned dependencies
 
-Exact versions only (never a range, per the supply-chain policy). The host needs
+Exact versions only (never a range, per the supply-chain policy), read from
+[versions.json](versions.json) — the single place the pins live. The host needs
 the SDK and the REST client; the agent-runner container tree needs the SDK only:
 
 ```bash
-pnpm add @band-ai/sdk@0.1.6 @band-ai/rest-client@0.0.121
-( cd "$ROOT/container/agent-runner" && bun add @band-ai/sdk@0.1.6 )
+PINS="$ROOT/.claude/skills/add-band/versions.json"
+SDK=$(node -p "require('$PINS')['band-sdk']"); REST=$(node -p "require('$PINS')['band-rest-client']")
+echo "Band SDK pins: @band-ai/sdk@$SDK @band-ai/rest-client@$REST"
+pnpm add "@band-ai/sdk@$SDK" "@band-ai/rest-client@$REST"
+( cd "$ROOT/container/agent-runner" && bun add "@band-ai/sdk@$SDK" )
 ```
 
 (Second approval gate from **Before you start** — the classifier may hold the
 `@band-ai/*` install. Surface it; don't work around it.)
 
-> `@band-ai/sdk@0.1.6` still exports its link class under the **pre-rename** name
+> The pinned `@band-ai/sdk` still exports its link class under the **pre-rename** name
 > `ThenvoiLink`. The host adapter imports it as `ThenvoiLink as BandLink`; the
 > container modules import `ThenvoiLink` directly (plus `AgentTools` from
 > `@band-ai/sdk/runtime`). This is expected — do not "fix" it to a `BandLink`

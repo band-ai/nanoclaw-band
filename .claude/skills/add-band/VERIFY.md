@@ -57,7 +57,7 @@ those, the build/typecheck fails here.
 
 ## 2. @band-ai/sdk exports the link class under the pre-rename name
 
-Guards against version skew. Published `@band-ai/sdk@0.1.6` exports the class as
+Guards against version skew. The pinned `@band-ai/sdk` (see `versions.json`) exports the class as
 `ThenvoiLink` (not `BandLink`). The host adapter aliases it locally
 (`ThenvoiLink as BandLink`); the package itself must still export `ThenvoiLink`:
 
@@ -67,14 +67,16 @@ node -e "const m = require('@band-ai/sdk'); if (typeof m.ThenvoiLink !== 'functi
 
 If this fails, the installed `@band-ai/sdk` version is incompatible with the
 imports in the Band files — re-pin to a version that exports `ThenvoiLink`
-(0.1.6) or update the imports in `band.ts`, `mcp-tools/band.ts`,
+(the one in `versions.json`) or update the imports in `band.ts`, `mcp-tools/band.ts`,
 `band-memory-load.ts`, and `band-memory-consolidate.ts`.
 
 ## 3. Dependencies are pinned in both trees
 
 ```bash
-grep -E '"@band-ai/(sdk|rest-client)"' package.json                 # host: sdk@0.1.6 + rest-client@0.0.121
-grep -E '"@band-ai/sdk"' container/agent-runner/package.json        # container: sdk@0.1.6
+PINS=.claude/skills/add-band/versions.json
+SDK=$(node -p "require('./$PINS')['band-sdk']"); REST=$(node -p "require('./$PINS')['band-rest-client']")
+grep -F "\"@band-ai/sdk\": \"$SDK\"" package.json container/agent-runner/package.json
+grep -F "\"@band-ai/rest-client\": \"$REST\"" package.json
 ```
 
 ## 4. The three self-registration imports are present

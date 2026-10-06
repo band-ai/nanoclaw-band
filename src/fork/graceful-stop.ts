@@ -10,6 +10,7 @@
 import { getChannelAdapter } from '../channels/channel-registry.js';
 import { getMessagingGroup } from '../db/messaging-groups.js';
 import type { Session } from '../types.js';
+import { GRACEFUL_STOP_TAG } from './stop-grace.js';
 
 async function sessionNeedsGracefulStop(session: Session): Promise<boolean> {
   if (!session.messaging_group_id) return false;
@@ -20,5 +21,5 @@ async function sessionNeedsGracefulStop(session: Session): Promise<boolean> {
 }
 
 export async function absoluteCeilingStopReason(session: Session): Promise<string> {
-  return (await sessionNeedsGracefulStop(session)) ? 'absolute-ceiling graceful' : 'absolute-ceiling';
+  return (await sessionNeedsGracefulStop(session)) ? `absolute-ceiling ${GRACEFUL_STOP_TAG}` : 'absolute-ceiling';
 }

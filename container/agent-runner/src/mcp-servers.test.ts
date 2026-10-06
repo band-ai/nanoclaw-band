@@ -41,10 +41,13 @@ describe('addExtraMcpServers', () => {
     expect(nanoclaw.type === 'http' ? undefined : nanoclaw.env?.K).toBe('from-server');
   });
 
-  it('ignores malformed NANOCLAW_EXTRA_MCP_SERVERS without throwing', () => {
+  it('reports and ignores malformed NANOCLAW_EXTRA_MCP_SERVERS without throwing', () => {
     const result = servers();
-    addExtraMcpServers(result, undefined, { NANOCLAW_EXTRA_MCP_SERVERS: 'not json' });
+    const logged: string[] = [];
+    addExtraMcpServers(result, (msg) => logged.push(msg), { NANOCLAW_EXTRA_MCP_SERVERS: 'not json' });
     expect(Object.keys(result)).toEqual(['nanoclaw']);
+    expect(logged).toHaveLength(1);
+    expect(logged[0]).toContain('NANOCLAW_EXTRA_MCP_SERVERS');
   });
 });
 

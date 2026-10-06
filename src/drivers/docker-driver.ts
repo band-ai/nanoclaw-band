@@ -48,6 +48,8 @@ import {
   type SessionStatus,
   type SessionWatch,
 } from './types.js';
+// Fork: reason-aware stop grace (graceful channel shutdown window).
+import { stopGraceForReason } from '../fork/stop-grace.js';
 
 export interface DockerDriverOptions extends MountPolicy {
   cli?: Cli;
@@ -577,7 +579,7 @@ class DockerHandle implements SessionHandle {
   async stop(reason: string): Promise<void> {
     this.#stopping = true;
     log.info('Stopping session container', { containerName: this.name, reason });
-    const grace = String(this.pendingSpec?.stopGraceSeconds ?? 1);
+    const grace = String(stopGraceForReason(reason, this.pendingSpec?.stopGraceSeconds ?? 1)); // Fork
     try {
       this.cli.run(['stop', '-t', grace, this.name]);
     } catch {

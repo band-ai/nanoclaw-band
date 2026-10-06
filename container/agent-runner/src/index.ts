@@ -139,10 +139,11 @@ async function main(): Promise<void> {
       systemContext: { instructions },
       signal: installShutdownSignal(log),
     });
+    // Fork: stop hooks need the session DB (continuation lookup), so they run before the mailbox closes.
+    await runStopHooksAfterLoop({ provider, providerName, cwd: CWD });
   } finally {
     await mailbox.stop();
   }
-  await runStopHooksAfterLoop({ provider, providerName, cwd: CWD });
 }
 
 main().catch((err) => {

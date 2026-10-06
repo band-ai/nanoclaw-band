@@ -1,15 +1,15 @@
 /**
  * Fork regression test: the graceful-stop tag on absolute-ceiling kills.
  *
- * `stopGraceForReason` (container-runtime.ts) grants GRACEFUL_STOP_GRACE_SEC
- * (30 min) instead of FAST_STOP_GRACE_SEC (10 s) only when the kill reason
+ * `stopGraceForReason` (src/fork/stop-grace.ts) grants GRACEFUL_STOP_GRACE_SEC
+ * (30 min) instead of the spec's base grace (FAST_STOP_GRACE_SEC, 10 s) only when the kill reason
  * contains 'graceful'. The producer of that tag is enforceRunningContainerSla,
  * which asks sessionNeedsGracefulStop whether the adapter handling the
  * session's messaging group declared `needsGracefulStop`. Band depends on it to
  * consolidate memory before the container dies.
  *
- * The CONSUMER side is pinned by container-runner.test.ts
- * (`describe('stopGraceForReason')`). This pins the PRODUCER, which upstream
+ * The CONSUMER side is pinned by src/drivers/docker-driver.fork.test.ts
+ * (`DockerHandle.stop grace`). This pins the PRODUCER, which upstream
  * does not have and which has already moved module once — host-sweep.ts →
  * reconcile-session.ts, during the 294ef2ae→858421af sync, when upstream
  * extracted the sweep into the reconcile-* modules. That relocation was

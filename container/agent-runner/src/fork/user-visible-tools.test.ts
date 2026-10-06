@@ -1,4 +1,5 @@
 import { describe, it, expect } from 'bun:test';
+import type { SDKAssistantMessage } from '@anthropic-ai/claude-agent-sdk';
 
 import {
   isUserVisibleToolName,
@@ -40,7 +41,7 @@ describe('userVisibleToolEvents', () => {
           { type: 'tool_use', name: 'mcp__nanoclaw__send_message' },
         ],
       },
-    };
+    } as unknown as SDKAssistantMessage;
     expect([...userVisibleToolEvents(message)]).toEqual([
       { type: 'user_visible_tool', name: 'mcp__nanoclaw__send_message' },
     ]);

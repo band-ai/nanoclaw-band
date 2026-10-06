@@ -15,6 +15,8 @@
  * - The poll loop owns one `UserVisibleToolTurn` per query: it records those
  *   events and, at each result, decides whether the result text is suppressed.
  */
+import type { SDKAssistantMessage } from '@anthropic-ai/claude-agent-sdk';
+
 import type { ProviderEvent } from '../providers/types.js';
 
 function log(msg: string): void {
@@ -31,7 +33,7 @@ export function isUserVisibleToolName(name: string): boolean {
   return userVisibleTools.has(name);
 }
 
-/** Seed from a JSON array of tool names. Malformed JSON is a no-op; non-string entries are skipped. */
+/** Seed from a JSON array of tool names. Malformed JSON is logged and ignored; non-string entries are skipped. */
 export function seedUserVisibleTools(raw: string | undefined): void {
   if (!raw) return;
   try {
@@ -39,23 +41,19 @@ export function seedUserVisibleTools(raw: string | undefined): void {
     for (const name of names) {
       if (typeof name === 'string') markUserVisibleTool(name);
     }
-  } catch {
-    // malformed JSON — no-op
+  } catch (err) {
+    log(`Ignoring malformed NANOCLAW_USER_VISIBLE_TOOLS: ${err instanceof Error ? err.message : String(err)}`);
   }
 }
 
 seedUserVisibleTools(process.env.NANOCLAW_USER_VISIBLE_TOOLS);
 
 /** One `user_visible_tool` event per registered tool name used in an SDK assistant message. */
-export function* userVisibleToolEvents(message: unknown): Generator<ProviderEvent> {
-  if (!message || typeof message !== 'object' || !('message' in message)) return;
-  const inner = message.message;
-  if (!inner || typeof inner !== 'object' || !('content' in inner) || !Array.isArray(inner.content)) return;
-
-  for (const part of inner.content) {
-    if (!part || typeof part !== 'object' || !('type' in part) || part.type !== 'tool_use') continue;
-    if (!('name' in part) || typeof part.name !== 'string') continue;
-    if (isUserVisibleToolName(part.name)) yield { type: 'user_visible_tool', name: part.name };
+export function* userVisibleToolEvents(message: SDKAssistantMessage): Generator<ProviderEvent> {
+  for (const block of message.message.content) {
+    if (block.type === 'tool_use' && isUserVisibleToolName(block.name)) {
+      yield { type: 'user_visible_tool', name: block.name };
+    }
   }
 }
 
