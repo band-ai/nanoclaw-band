@@ -19,25 +19,6 @@ export {
 } from './coordination.js';
 export type { MigrationMode, MigrationRunOptions } from './migrations/index.js';
 export {
-  beginInboundDelivery,
-  canPlatformProcessFromLedger,
-  getInboundDelivery,
-  markInboundDeliveryDropped,
-  markInboundDeliveryFailed,
-  markInboundDeliveryPersisted,
-  markInboundDeliveryProcessed,
-  type InboundDeliveryKey,
-  type InboundDeliveryRow,
-  type InboundDeliveryStatus,
-} from './inbound-delivery-ledger.js';
-export {
-  deleteModuleState,
-  getModuleState,
-  listModuleState,
-  setModuleState,
-  type ModuleStateRow,
-} from './module-state.js';
-export {
   createAgentGroup,
   getAgentGroup,
   getAgentGroupByFolder,
@@ -67,8 +48,6 @@ export {
   findSessionByAgentGroup,
   getSessionsByAgentGroup,
   getActiveSessions,
-  getActiveSessionsByMessagingGroup,
-  closeActiveSessionsForMessagingGroup,
   getRunningSessions,
   updateSession,
   deleteSession,
@@ -90,3 +69,5 @@ export {
   updateContainerConfigJson,
   deleteContainerConfig,
 } from './container-configs.js';
+// Fork: ledger, module-state, and Band session exports.
+export * from './fork-exports.js';

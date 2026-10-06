@@ -1,7 +1,8 @@
 name: Sync main with upstream NanoClaw
 
-# Keep this fork's main current with upstream nanocoai/nanoclaw. Every 4 hours
-# (or manual dispatch): measure drift, try the merge, validate it, push main —
+# Keep this fork's main current with upstream nanocoai/nanoclaw. Manual dispatch
+# only (the 4-hourly schedule was removed; GitHub's fork sync covers routine
+# catch-up): measure drift, try the merge, validate it, push main —
 # and when any of that can't happen, hand a human an owned, reviewable PR.
 #
 # Three hard-won constraints shape this job; changing it without them in mind
@@ -57,8 +58,6 @@ on:
         required: false
         type: boolean
         default: false
-  schedule:
-    - cron: '17 */4 * * *'
 
 # Never let two syncs race on pushing main.
 concurrency:

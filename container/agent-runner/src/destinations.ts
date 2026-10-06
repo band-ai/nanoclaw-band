@@ -12,6 +12,8 @@
  */
 import { getAgentMailbox } from './mailbox/index.js';
 import type { Destination } from './mailbox/types.js';
+// Fork: destination label wording.
+import { destinationLabel as forkDestinationLabel } from './fork/destination-label.js';
 
 export interface DestinationEntry {
   name: string;
@@ -64,18 +66,29 @@ export function buildSystemPromptAddendum(assistantName?: string, mode: SessionM
   const sections: string[] = [];
 
   if (assistantName) {
-    sections.push(
-      [
-        '# You are ' + assistantName,
-        '',
-        `Your name is **${assistantName}**. Use it when the channel asks who you are, when introducing yourself, and when signing any message that explicitly calls for a signature.`,
-      ].join('\n'),
-    );
+    sections.push(['# You are ' + assistantName, '', `Your name is **${assistantName}**. Use it when the channel asks who you are, when introducing yourself, and when signing any message that explicitly calls for a signature.`].join('\n'));
   }
 
   sections.push(buildDestinationsSection(mode));
+  if (mode.kind === 'chat') sections.push(buildReadingSection());
 
   return sections.join('\n\n');
+}
+
+/**
+ * What the inbound blocks are. Chat only: task runs have no messaging group, so they
+ * never receive echo or history rows. The three tags are the ones
+ * formatter.ts emits; keep the two in step.
+ */
+function buildReadingSection(): string {
+  return [
+    '## Reading messages',
+    '',
+    'Chat turns can include:',
+    '',
+    '- `<message>` — the message you are answering. `<dm-history>` and `<channel-history>` are this thread\'s own earlier timeline.',
+    '- `<cross-session-context>` — a copy of something from elsewhere in this conversation: another thread, or a message you or a scheduled task posted here. Its `from` says which. If you can\'t tell whether the current message refers to it or to this thread, ask.',
+  ].join('\n');
 }
 
 function buildDestinationsSection(mode: SessionMode): string {
@@ -134,13 +147,6 @@ function buildDestinationsSection(mode: SessionMode): string {
   return lines.join('\n');
 }
 
-// Label includes the display name and the kind of destination (channel type,
-// e.g. "Band"/"Telegram", or "agent") so the model can map a user's natural
-// reference ("send it on Band") to the right local name.
 function destinationLabel(d: DestinationEntry): string {
-  const parts: string[] = [];
-  if (d.displayName && d.displayName !== d.name) parts.push(d.displayName);
-  if (d.type === 'agent') parts.push('agent');
-  else if (d.channelType) parts.push(d.channelType.charAt(0).toUpperCase() + d.channelType.slice(1));
-  return parts.length ? ` (${parts.join(' — ')})` : '';
+  return forkDestinationLabel(d);
 }

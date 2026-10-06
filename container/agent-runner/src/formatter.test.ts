@@ -254,7 +254,9 @@ describe('stripInternalTags', () => {
   });
 
   it('strips multi-line internal tags', () => {
-    expect(stripInternalTags('hello <internal>\nsecret\nstuff\n</internal> world')).toBe('hello  world');
+    expect(stripInternalTags('hello <internal>\nsecret\nstuff\n</internal> world')).toBe(
+      'hello  world',
+    );
   });
 
   it('strips multiple internal tag blocks', () => {
@@ -270,7 +272,9 @@ describe('stripInternalTags', () => {
   });
 
   it('preserves content that surrounds internal tags', () => {
-    expect(stripInternalTags('<internal>thinking</internal>The answer is 42')).toBe('The answer is 42');
+    expect(stripInternalTags('<internal>thinking</internal>The answer is 42')).toBe(
+      'The answer is 42',
+    );
   });
 });
 

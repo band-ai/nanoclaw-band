@@ -15,15 +15,18 @@
  *     `name`, so pick any unused number)
  *   - add the migration to `forkMigrations` below — never to index.ts
  *
- * Registered under the reserved 'fork' key. Call registerForkMigrations() once,
- * before runMigrations() (see src/index.ts) and from any test that needs the
- * fork's tables.
+ * Registered under the reserved 'fork' key. The host calls
+ * registerForkMigrations() before runMigrations() (see src/index.ts); the first
+ * channel to register migrations also pulls this set in ahead of itself
+ * (channel-registry.ts), so scripts and tests that run migrations with a
+ * channel installed need no call. Calling it again is a no-op.
  */
-import { registerChannelMigrations, type Migration } from './index.js';
+import { FORK_KEY, hasChannelMigrations, registerChannelMigrations } from './channel-registry.js';
+import type { Migration } from './index.js';
 import { routeFoundationState } from './fork-route-foundation-state.js';
 
 export const forkMigrations: Migration[] = [routeFoundationState];
 
 export function registerForkMigrations(): void {
-  registerChannelMigrations('fork', forkMigrations);
+  if (!hasChannelMigrations(FORK_KEY)) registerChannelMigrations(FORK_KEY, forkMigrations);
 }

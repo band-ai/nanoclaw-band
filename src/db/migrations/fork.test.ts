@@ -6,7 +6,7 @@
 import { describe, it, expect, afterEach } from 'vitest';
 
 import { initTestDb, closeDb, hasTable } from '../connection.js';
-import { runMigrations, migrations, _resetChannelMigrationsForTesting } from './index.js';
+import { runMigrations, migrations, registerChannelMigrations, _resetChannelMigrationsForTesting } from './index.js';
 import { registerForkMigrations, forkMigrations } from './fork.js';
 
 afterEach(async () => {
@@ -53,5 +53,23 @@ describe('fork migration registry', () => {
 
   it('pins the migration name (installs key idempotency on it — never rename)', () => {
     expect(forkMigrations.map((m) => m.name)).toContain('route-foundation-state');
+  });
+
+  it('a channel registering first still gets the fork set ahead of its own migrations', async () => {
+    // Channels register on import, long before the host (or any script) runs
+    // migrations; Band's rename rewrites inbound_delivery_ledger rows.
+    registerChannelMigrations('early-channel', [
+      {
+        version: 300,
+        name: 'early-channel-needs-ledger',
+        sqliteOnly: true,
+        up: (db) => {
+          db.prepare('UPDATE inbound_delivery_ledger SET platform_id = platform_id').run();
+        },
+      },
+    ]);
+    registerForkMigrations(); // host startup after the channel import: must not throw or reorder
+
+    await runMigrations(await initTestDb());
   });
 });

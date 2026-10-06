@@ -7,8 +7,11 @@
  */
 import Database from 'better-sqlite3';
 
-import { createInboundRecord, type InboundWrite, type InboundRecord } from '../model.js';
+import { createInboundRecord } from '../model.js';
+import type { InboundWrite } from '../model.js';
 import { INBOUND_SCHEMA, OUTBOUND_SCHEMA } from './schema.js';
+// Fork: idempotent inbound insert (replayed platform messages).
+import { inboundAlreadyStored } from './fork-inbound-dedupe.js';
 
 /** Apply the inbound or outbound schema to a DB file. Idempotent. */
 export function ensureSchema(dbPath: string, schema: 'inbound' | 'outbound'): void {
@@ -92,36 +95,9 @@ export function nextEvenSeq(db: Database.Database): number {
   return maxSeq < 2 ? 2 : maxSeq + 2 - (maxSeq % 2);
 }
 
-function normalizeDbValue(value: unknown): string | number | null {
-  return value === undefined ? null : (value as string | number | null);
-}
-
-function existingMessageMatches(existing: Record<string, unknown>, record: InboundRecord): boolean {
-  return (
-    existing.kind === record.kind &&
-    existing.timestamp === record.timestamp &&
-    normalizeDbValue(existing.platform_id) === record.platformId &&
-    normalizeDbValue(existing.channel_type) === record.channelType &&
-    normalizeDbValue(existing.thread_id) === record.threadId &&
-    existing.content === record.content &&
-    normalizeDbValue(existing.process_after) === record.processAfter &&
-    normalizeDbValue(existing.recurrence) === record.recurrence &&
-    existing.trigger === (record.trigger ? 1 : 0) &&
-    normalizeDbValue(existing.source_session_id) === record.sourceSessionId
-  );
-}
-
 export function insertMessage(db: Database.Database, message: InboundWrite, sequence = nextEvenSeq(db)): void {
   const record = createInboundRecord(message, sequence);
-  const existing = db.prepare('SELECT * FROM messages_in WHERE id = ?').get(message.id) as
-    | Record<string, unknown>
-    | undefined;
-  if (existing) {
-    if (!existingMessageMatches(existing, record)) {
-      throw new Error(`Conflicting messages_in row for id ${message.id}`);
-    }
-    return;
-  }
+  if (inboundAlreadyStored(db, message.id, record)) return;
   db.prepare(
     `INSERT INTO messages_in (id, seq, kind, timestamp, status, platform_id, channel_type, thread_id, content, process_after, recurrence, series_id, trigger, source_session_id, on_wake)
      VALUES (@id, @sequence, @kind, @timestamp, @status, @platformId, @channelType, @threadId, @content, @processAfter, @recurrence, @seriesId, @trigger, @sourceSessionId, @onWake)`,

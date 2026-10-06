@@ -25,6 +25,10 @@ import { migration021 } from './021-approval-question.js';
 import { migration022 } from './022-messaging-group-detached.js';
 import { migration023 } from './023-approvals-instance.js';
 import { migration024 } from './024-host-coordination.js';
+import { migration025 } from './025-container-config-speed.js';
+// Fork: channel-migration registry (Band etc.), re-exported so channels import registerChannelMigrations from here.
+import { getChannelMigrations } from './channel-registry.js';
+export { registerChannelMigrations, _resetChannelMigrationsForTesting } from './channel-registry.js';
 
 interface MigrationBase {
   version: number;
@@ -91,6 +95,7 @@ export const migrations: Migration[] = [
   migration022,
   migration023,
   migration024,
+  migration025,
 ];
 
 /**
@@ -116,31 +121,8 @@ export function registerMigration(migration: ModuleMigration): void {
   moduleMigrations.push(migration);
 }
 
-// Channel-migration registry. Channels (Band, etc.) register their own
-// migrations here on import. runMigrations appends them after core and
-// module migrations, keyed on `name` like core — so an already-applied
-// channel migration is skipped by name, and a base install that never
-// registers a channel never runs its migrations.
-const channelMigrations = new Map<string, Migration[]>();
-
-export function registerChannelMigrations(channel: string, list: Migration[]): void {
-  if (channelMigrations.has(channel)) {
-    throw new Error(`Channel migrations already registered: ${channel}`);
-  }
-  channelMigrations.set(channel, list);
-}
-
-/** Test-only: clears the channel-migration registry. The registry is a
- *  module-level Map, so without this it leaks across `it()` blocks in the
- *  same file — re-registering the same real migration (e.g. module-band-state)
- *  would surface it twice in getRegisteredMigrations() and violate schema_version's
- *  UNIQUE(name). Never call this in production code paths. */
-export function _resetChannelMigrationsForTesting(): void {
-  channelMigrations.clear();
-}
-
 export function getRegisteredMigrations(): readonly Migration[] {
-  return [...migrations, ...moduleMigrations, ...[...channelMigrations.values()].flat()];
+  return [...migrations, ...moduleMigrations, ...getChannelMigrations()];
 }
 
 /** Row shape of PRAGMA foreign_key_check. Child rowids are stable across a
@@ -225,8 +207,13 @@ async function applyMigration(db: DbDriver, migration: Migration): Promise<void>
   // no-op inside one); foreign_key_check runs INSIDE so a violating
   // recreate rolls back atomically with nothing committed.
   if (disableForeignKeys) raw!.pragma('foreign_keys = OFF');
+  let applied = false;
   try {
-    await db.transaction(async () => {
+    applied = await db.transaction(async () => {
+      // Another process may have migrated since we selected the pending list.
+      // SQLite's BEGIN IMMEDIATE holds the write lock for this recheck and up().
+      if (await db.get('SELECT name FROM schema_version WHERE name = ?', migration.name)) return false;
+
       // Snapshot violations BEFORE up() runs: live DBs can carry latent
       // FK orphans. A migration must fail only for violations it introduces.
       const preexisting = disableForeignKeys
@@ -256,9 +243,10 @@ async function applyMigration(db: DbDriver, migration: Migration): Promise<void>
         migration.name,
         new Date().toISOString(),
       );
+      return true;
     });
   } finally {
     if (disableForeignKeys) raw!.pragma('foreign_keys = ON');
   }
-  log.info('Migration applied', { name: migration.name });
+  if (applied) log.info('Migration applied', { name: migration.name });
 }

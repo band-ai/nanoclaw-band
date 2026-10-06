@@ -2,7 +2,6 @@
  * Session lifecycle: folders, mailboxes, messages, and container status.
  * Storage layout and consistency belong to the registered mailbox.
  */
-import { randomUUID } from 'crypto';
 import { AsyncLocalStorage } from 'async_hooks';
 import fs from 'fs';
 import path from 'path';
@@ -27,6 +26,8 @@ import { log } from './log.js';
 import { getAgentMailbox, type InboundMessage, type MailboxSession } from './mailbox/index.js';
 import { enqueueSessionReconcile } from './reconcile-feeds.js';
 import type { Session } from './types.js';
+// Fork: collision-resistant id suffix.
+import { randomUUID } from 'crypto';
 
 /** Root directory for all session data. */
 export function sessionsBaseDir(): string {
@@ -216,8 +217,10 @@ export async function destroySessionMailbox(agentGroupId: string, sessionId: str
 /**
  * Write the current chat/thread routing for a session into its inbound mailbox.
  *
- * The container uses this to preserve thread_id when an explicitly named
- * destination resolves to the conversation this session is bound to.
+ * The container reads this for tools that take no destination (`ask_user_question`,
+ * `send_card`) and to detect a task session (`system:tasks:<id>` thread). Reply
+ * threads are not resolved from here — thread_id is null for every session that
+ * isn't per-thread — but from the latest messages_in row for the channel.
  * Derived from session.messaging_group_id → messaging_groups row + session.thread_id.
  *
  * Called on every container wake alongside the agent-to-agent module's

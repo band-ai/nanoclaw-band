@@ -18,7 +18,7 @@ production. This document specifies both contracts, why they differ, and what co
 | Returns | `ChannelRegistration['containerConfig']` — static data | `ChannelContainerConfigFn \| undefined` — a function |
 | Declared in | `src/channels/adapter.ts:348` | `src/channels/channel-container-registry.ts:11` |
 | Registered via | `registerChannelAdapter(name, { containerConfig })` | `registerChannelContainerConfig(channelType, fn)` |
-| Production callers | **none** | `src/container-runner.ts:31, 536` |
+| Production callers | **none** | `src/fork/session-contribution.ts` (`resolveSessionContribution`) |
 | Test-only callers | `src/channels/channel-registry.test.ts:87, 98` | `src/channels/channel-container-registry.test.ts:4, 47` |
 
 The name clash is currently harmless only because no module imports both. Any file that needs
@@ -79,7 +79,8 @@ export type AgentContainerConfigFn = (
 ```
 
 The contribution type (`src/providers/provider-container-registry.ts`) is shared with the
-provider seam:
+provider seam; the fork adds `mcpServers` and `userVisibleTools` to it by module augmentation in
+`src/fork/session-contribution.ts`, leaving the upstream file untouched:
 
 ```ts
 export interface ProviderContainerContribution {
@@ -104,13 +105,20 @@ registrants.
 
 ### Fan-in and precedence
 
-`resolveContainerContribution` (`src/container-runner.ts:516-553`) merges three tiers:
+The spawn path in `src/container-runner.ts` keeps upstream's `resolveProviderContribution`
+untouched and layers the fork's tiers on top (`src/fork/session-contribution.ts`):
+`resolveSessionContribution` merges channel → agent-scoped, then `mergeContainerContributions`
+folds that over the provider contribution:
 
 ```
 provider  →  channel  →  agent-scoped
 ```
 
-`mergeContainerContributions` (`src/container-runner.ts:555-564`) merges field-wise:
+Channel/agent-scoped `mounts` are appended by `applySessionMounts` right after `buildMounts`
+returns, so they are mounted even when the provider declares a host contract (upstream skips the
+legacy provider `mounts` in that case).
+
+`mergeContainerContributions` merges field-wise:
 
 | Field | Strategy | Collision winner |
 |---|---|---|
@@ -124,7 +132,7 @@ So on an `env` or `mcpServers` name clash: agent-scoped beats channel, channel b
 ### Downstream consumption
 
 Two contribution fields have no upstream equivalent and are consumed at spawn time
-(`src/container-runner.ts:789-798`):
+(`forkContributionEnv` in `src/fork/session-contribution.ts`, called from `composeSessionSpec`):
 
 - `mcpServers` → `NANOCLAW_EXTRA_MCP_SERVERS` (JSON) → read at
   `container/agent-runner/src/index.ts:118` and passed as `extraMcpJson` to `buildMcpServers()`
@@ -172,8 +180,8 @@ Ordered by how hard each blocks adoption:
 3. **Agent-scoped contributions have no upstream analogue.** Upstream's map is keyed by channel
    name, so it cannot express "applies to every session of this agent group whatever the channel".
 4. **`/add-band` hard-depends on the richer contract.** Its Phase 0 preflight
-   (`.claude/skills/add-band/SKILL.md:85`) aborts the install when
-   `src/providers/provider-container-registry.ts` lacks `userVisibleTools`, alongside checks for
+   (`.claude/skills/add-band/SKILL.md`) aborts the install when
+   `src/fork/session-contribution.ts` lacks `userVisibleTools`, alongside checks for
    `supportsDeliveryAck`, `needsGracefulStop`, `registerChannelMigrations`,
    `container/agent-runner/src/lifecycle.ts` and `container/agent-runner/src/mcp-servers.ts`.
    The skill refuses to copy Band onto a base without these seams rather than fail the build
@@ -185,8 +193,8 @@ Ordered by how hard each blocks adoption:
 
 Rename `getChannelContainerConfig` → `getChannelContainerContribution` (and
 `registerChannelContainerConfig` → `registerChannelContainerContribution`) in
-`src/channels/channel-container-registry.ts`, its test, and the single import at
-`src/container-runner.ts:31`.
+`src/channels/channel-container-registry.ts`, its test, and the single import in
+`src/fork/session-contribution.ts`.
 
 - Cost: three files, mechanical, zero behavior change.
 - Removes the name collision and makes each seam's role legible at the callsite.
@@ -233,11 +241,11 @@ it would create a real conflict on every future sync.
 - `userVisibleTools` must keep reaching `NANOCLAW_USER_VISIBLE_TOOLS`, or poll-loop
   double-delivery suppression silently dies — it fails as a behavior regression, not a build error.
 - Merge order must stay provider → channel → agent-scoped.
-  `src/container-runner.test.ts:502` (`describe('mergeContainerContributions')`) pins the
-  concatenate-vs-override split per field; `:535` pins `stopGraceForReason`, `:547` pins
-  `rewriteOneCliProxyEnv`.
+  `src/fork/session-contribution.test.ts` (`describe('mergeContainerContributions')`) pins the
+  concatenate-vs-override split per field; `src/fork/stop-grace.test.ts` pins `stopGraceForReason`,
+  `src/fork/compose-deployment.test.ts` pins `rewriteOneCliProxyEnv`.
 - The channel registry's duplicate-registration throw is load-bearing for idempotent
   `/add-<channel>` re-runs.
 - `/add-band`'s Phase 0 preflight greps for literal symbol names. Renaming
-  `userVisibleTools` in `src/providers/provider-container-registry.ts` breaks the installer even
+  `userVisibleTools` in `src/fork/session-contribution.ts` breaks the installer even
   if the code still compiles.

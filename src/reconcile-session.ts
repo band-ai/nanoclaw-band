@@ -34,14 +34,14 @@ import fs from 'fs';
 import { getSessionClaim } from './db/coordination.js';
 import { getSession, isTaskThread, updateSession } from './db/sessions.js';
 import { getAgentGroup } from './db/agent-groups.js';
-import { getMessagingGroup } from './db/messaging-groups.js';
-import { getChannelAdapter } from './channels/channel-registry.js';
 import { log } from './log.js';
 import { heartbeatPath, withExistingMailboxSession } from './session-manager.js';
 import { getContainerStartedAtMs, isContainerRunning, killContainer } from './container-runner.js';
 import { requestWake } from './request-wake.js';
 import type { Session } from './types.js';
 import type { ContainerState, InboundMailbox, OutboundMailbox } from './mailbox/index.js';
+// Fork: graceful-stop tag for channels that need a long shutdown window.
+import { absoluteCeilingStopReason } from './fork/graceful-stop.js';
 
 // Absolute idle ceiling for a running container. If the heartbeat file hasn't
 // been touched in this long, the container is either stuck or doing genuinely
@@ -217,19 +217,6 @@ function bashTimeoutMs(state: ContainerState | null): number | null {
 }
 
 /**
- * Fork: returns true when the adapter handling the session's messaging group
- * declares needsGracefulStop. The SLA sweep uses this to tag ceiling kills with
- * 'graceful' so stopGraceForReason grants the long window.
- */
-async function sessionNeedsGracefulStop(session: Session): Promise<boolean> {
-  if (!session.messaging_group_id) return false;
-  const mg = await getMessagingGroup(session.messaging_group_id);
-  if (!mg) return false;
-  const adapter = getChannelAdapter(mg.instance ?? mg.channel_type);
-  return adapter?.needsGracefulStop === true;
-}
-
-/**
  * The incarnation gate: evidence that predates the current incarnation's
  * durable claim time is not evidence against this container. A heartbeat
  * mtime older than the claim is the previous incarnation's file — treated as
@@ -279,12 +266,7 @@ async function enforceRunningContainerSla(
       heartbeatAgeMs: decision.heartbeatAgeMs,
       ceilingMs: decision.ceilingMs,
     });
-    // Fork: tag the kill 'graceful' when the session's channel adapter asks for
-    // it, so stopGraceForReason grants the long shutdown window (Band memory
-    // consolidation) instead of the 10s fast one. The bookkeeping reason passed
-    // to resetStuckProcessingRows stays plain 'absolute-ceiling'.
-    const stopReason = (await sessionNeedsGracefulStop(session)) ? 'absolute-ceiling graceful' : 'absolute-ceiling';
-    killContainer(session.id, stopReason);
+    killContainer(session.id, await absoluteCeilingStopReason(session));
     resetStuckProcessingRows(inDb, outDb, session, 'absolute-ceiling');
     return;
   }

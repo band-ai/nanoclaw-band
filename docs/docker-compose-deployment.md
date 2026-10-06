@@ -218,6 +218,10 @@ docker compose --env-file .env.compose run --rm agent-build
 docker compose --env-file .env.compose down -v --remove-orphans
 ```
 
+## Security model
+
+The optional Compose deployment for the outer NanoClaw process does not change the runtime model in [SECURITY.md](SECURITY.md). NanoClaw still launches agent runs as sibling `docker run` containers, which means the `nanoclaw` service mounts the Docker socket and joins the sibling containers to the Compose network. That is a deliberate operator tradeoff, not a new sandbox boundary. The security properties still come from the per-agent container mounts, host-path remapping, and credential injection path, not from the Compose service itself.
+
 ## How secrets and env vars work here
 
 Compose does not change NanoClaw's current split:
