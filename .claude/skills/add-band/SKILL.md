@@ -30,26 +30,30 @@ permission three steps in.
    should I take this?" later — Phase 0 detects what's already done and resumes
    from there.
 
-2. **Two approval gates are expected — name the source up front.** Copying Band's
+2. **Two steps pull external code — name the source up front.** Copying Band's
    files and installing the `@band-ai/*` packages pull code from an **external
-   fork**, so Claude Code's auto-mode security classifier will gate both steps as
-   untrusted-code integration. That is by design, not an error. Before step 1,
-   tell the operator plainly:
+   fork**. Before step 1, tell the operator plainly:
 
    > Installing Band copies 14 files from `https://github.com/band-ai/nanoclaw-band`
    > (branch `band/adapter`) and installs `@band-ai/sdk@0.1.6` +
-   > `@band-ai/rest-client@0.0.121`. Both will ask for your approval.
+   > `@band-ai/rest-client@0.0.121`.
 
-   Then agree how to clear them: either the operator pre-grants (re-run in a mode
-   that permits it, or add Bash rules for `git show:*` / `pnpm add` / `bun add`),
-   or they run the two commands themselves with the `!` prefix and you continue.
-   **Never route around the classifier** — surface it and let the operator decide.
+   How those two steps are gated depends on the Claude Code permission mode. In
+   the default mode they surface as ordinary permission prompts. In **auto mode**
+   there is no prompt: the classifier denies the command outright with
+   `Permission for this action was denied by the Claude Code auto mode classifier. Reason: [Untrusted Code Integration]`.
+   That denial is expected, not an error, and retrying will not change it. Agree
+   up front how to clear it: the operator either adds allow rules for these
+   commands (`Bash(git show:*)`, `Bash(pnpm add:*)`, `Bash(pnpm dlx:*)`) or
+   switches out of auto mode, or runs the two commands themselves with the `!`
+   prefix and tells you to continue. **Never route around the classifier**:
+   surface the denial and let the operator decide.
 
 3. **Human touchpoints (everything else is automatic):** possibly pasting a
    create-scope Band key *only if no credentials exist yet*; opening or DMing a
-   Band room so it's discoverable; **choosing the access level** to grant the
-   owner's Band identity (owner / admin / member — Step 6); and sending the final
-   test message. Phase 0 below tells you which of these actually apply.
+   Band room so it's discoverable; optionally **choosing a role** for the
+   owner's Band identity (Step 6); and sending the final test message. Phase 0
+   below tells you which of these actually apply.
 
 4. **A stale-marker tripwire trip on restart is expected on old installs — it's
    not this skill breaking something.** Phase 1 Step 5's `pnpm run build`
@@ -192,8 +196,8 @@ done
 [ "$bad" = 0 ] && echo "copy: 13/13 present and byte-identical" || echo "copy: FAILED — do not proceed"
 ```
 
-(This is the first of the two approval gates from **Before you start** — the
-classifier may hold the `git show` copy. Surface it; don't work around it.)
+(This is the first of the two external-code steps from **Before you start**: an
+auto-mode classifier denial lands here. Surface it; don't work around it.)
 
 `src/channels/band.ts` registers the two Band channel migrations on import
 (`registerChannelMigrations('band', [...])`), so the copied files carry their own
@@ -225,15 +229,23 @@ import './band-lifecycle.js';
 ### 4. Install the pinned dependencies
 
 Exact versions only (never a range, per the supply-chain policy). The host needs
-the SDK and the REST client; the agent-runner container tree needs the SDK only:
+the SDK and the REST client; the agent-runner container tree needs the SDK only.
+
+The agent-runner is a separate **Bun** package tree: the image build installs it
+with `bun install --frozen-lockfile`, so the dependency must land in its
+`package.json` **and** `bun.lock`. Setup never installs Bun on the host, so don't
+call a host `bun`. Run the Bun release the image pins (`ARG BUN_VERSION` in
+`container/Dockerfile`) through `pnpm dlx`. That keeps the lockfile in the
+format the image build reads, with nothing installed globally:
 
 ```bash
 pnpm add @band-ai/sdk@0.1.6 @band-ai/rest-client@0.0.121
-( cd "$ROOT/container/agent-runner" && bun add @band-ai/sdk@0.1.6 )
+BUN_VERSION=$(sed -n 's/^ARG BUN_VERSION=//p' "$ROOT/container/Dockerfile")
+( cd "$ROOT/container/agent-runner" && pnpm dlx "bun@$BUN_VERSION" add @band-ai/sdk@0.1.6 )
 ```
 
-(Second approval gate from **Before you start** — the classifier may hold the
-`@band-ai/*` install. Surface it; don't work around it.)
+(This is the second external-code step from **Before you start**: an auto-mode
+classifier denial lands here. Surface it; don't work around it.)
 
 > `@band-ai/sdk@0.1.6` still exports its link class under the **pre-rename** name
 > `ThenvoiLink`. The host adapter imports it as `ThenvoiLink as BandLink`; the
@@ -254,11 +266,13 @@ agent-runner overlay pick up the copied container files.
 
 ### 6. Verify
 
-Run [VERIFY.md](VERIFY.md). At minimum:
+Run [VERIFY.md](VERIFY.md). At minimum (the container tests run under the
+image's Bun release, no host Bun needed):
 
 ```bash
-( cd "$ROOT" && pnpm test -- src/channels/band.test.ts )
-( cd "$ROOT/container/agent-runner" && bun test src/mcp-tools/band.test.ts src/band-lifecycle.test.ts )
+( cd "$ROOT" && pnpm exec vitest run src/channels/band.test.ts )
+BUN_VERSION=$(sed -n 's/^ARG BUN_VERSION=//p' "$ROOT/container/Dockerfile")
+( cd "$ROOT/container/agent-runner" && pnpm dlx "bun@$BUN_VERSION" test src/mcp-tools/band.test.ts src/band-lifecycle.test.ts )
 ```
 
 ## Bring Band online (end-to-end)
@@ -280,12 +294,27 @@ gate on an existing key (Phase 0 already told you which case you're in):
   key, see *Re-register or rotate* at the end of this step.)
 
 - **Key missing → register one.** This needs a **create-scope** Band API key
-  (app.band.ai → Settings → API Keys), used only to mint the agent. The operator
-  pastes it at the prompt — never on `argv`, never `eval` the create-scope key:
+  (app.band.ai → Settings → API Keys), used only to mint the agent. The script
+  reads it from `BAND_USER_API_KEY` (what the app.band.ai on-ramp exports), else
+  `BAND_API_KEY`, else the operator pastes it at the prompt — never on `argv`,
+  never `eval` the create-scope key. `BAND_USER_API_KEY` wins when both are set:
+  a `BAND_API_KEY` left in the shell is often a stale agent key. Without
+  `--name` / `BAND_AGENT_NAME` the agent gets a unique default name (host +
+  timestamp), since Band rejects a second agent with the same name (HTTP 422):
 
   ```bash
   ( umask 077; "$ROOT/.claude/skills/add-band/scripts/register-agent.sh" > /tmp/band-agent.env )
   # writes:  BAND_AGENT_ID=<uuid>   and   BAND_AGENT_API_KEY=<agent-scoped key>
+  ```
+
+  The script registers against `$BAND_BASE_URL` (default `https://app.band.ai`).
+  If the operator registered against another Band host, persist that URL so the
+  host adapter and the vault secret below use the same host. Otherwise the agent
+  exists on one host while the runtime talks to the other:
+
+  ```bash
+  [ -z "${BAND_BASE_URL:-}" ] || [ "${BAND_BASE_URL%/}" = https://app.band.ai ] \
+    || pnpm exec tsx setup/index.ts --step set-env -- --key BAND_BASE_URL --value "${BAND_BASE_URL%/}"
   ```
 
   Then route the agent key to **both** places it's needed:
@@ -297,18 +326,26 @@ gate on an existing key (Phase 0 already told you which case you're in):
      `BAND_AGENT_API_KEY` is canonical; legacy `BAND_API_KEY` / `THENVOI_*` still
      work, with `BAND_*` taking precedence.
 
-  2. **OneCLI vault (container).** For hosted `app.band.ai` the container never
-     gets the raw key — OneCLI injects the `X-API-Key` header on egress. Store the
-     same key in the vault, reading it back from `.env` (never paste it). Band
+  2. **OneCLI vault (container).** The container never gets the raw key: its
+     `band_*` tools call `BAND_BASE_URL`'s host, and OneCLI injects the
+     `X-API-Key` header **only when a vault secret's host pattern matches that
+     host**. A secret on the wrong host makes every `band_*` call return 401 while
+     the host adapter looks healthy. Store the same key in the vault, reading it
+     back from `.env` (never paste it), on the host the runtime uses. Band
      authenticates with **`X-API-Key`**, not `Authorization: Bearer`:
 
      ```bash
      KEY=$(grep -E '^(BAND|THENVOI)_(AGENT_)?API_KEY=' .env | head -1 | cut -d= -f2-)
+     BASE=$(grep -E '^(BAND|THENVOI)_BASE_URL=' .env | sort | head -1 | cut -d= -f2-)
+     HOST=$(printf '%s' "${BASE:-https://app.band.ai}" | sed -E 's#^https?://##; s#/.*##')
      onecli secrets create --name Band --type generic --value "$KEY" \
-       --host-pattern app.band.ai --header-name X-API-Key --value-format '{value}'
+       --host-pattern "$HOST" --header-name X-API-Key --value-format '{value}'
      ```
 
      The agent's OneCLI `secretMode` must be `all` (or assign this secret to it).
+     (A plain-HTTP `localhost` / `127.0.0.1` base URL is the exception: for local
+     development the adapter passes the key to the container directly and the
+     vault secret is unused.)
 
   Wipe the temp file regardless of path — it holds the live key:
 
@@ -319,7 +356,7 @@ gate on an existing key (Phase 0 already told you which case you're in):
 Optional vars, all defaulted (leave unset for hosted Band):
 
 ```bash
-# BAND_BASE_URL   defaults to https://app.band.ai
+# BAND_BASE_URL   defaults to https://app.band.ai; any other host must also be the vault secret's host pattern
 # BAND_OWNER_ID   Band user UUID that owns the agent; falls back to GET /agent/me
 ```
 
@@ -336,8 +373,10 @@ The skip-on-existing-key gate assumes the key in `.env` is live. Two resets:
 
   ```bash
   onecli secrets list                 # find the "Band" secret id
+  BASE=$(grep -E '^(BAND|THENVOI)_BASE_URL=' .env | sort | head -1 | cut -d= -f2-)
+  HOST=$(printf '%s' "${BASE:-https://app.band.ai}" | sed -E 's#^https?://##; s#/.*##')
   onecli secrets update --id <secret-id> --value "$NEW_KEY" \
-    --host-pattern app.band.ai --header-name X-API-Key --value-format '{value}'
+    --host-pattern "$HOST" --header-name X-API-Key --value-format '{value}'
   ```
 
 - **Dead agent → mint fresh** — you deleted the agent on Band (the `.env` key is
@@ -352,12 +391,11 @@ The skip-on-existing-key gate assumes the key in `.env` is live. Two resets:
 ### Step 2 — Rebuild the image if it's stale
 
 The agent image is slug-scoped and must contain the Band container files **and the
-`@band-ai/sdk` dependency**. This matters more than it looks: the container MCP
-barrel imports `band.js` unconditionally, and `band.ts` imports `@band-ai/sdk` at
-module load — so a missing dep throws and the **entire MCP server fails to start,
-killing every tool on every session** (Band, CLI, Telegram, and core), not just the
-`band_*` tools. The agent still chats (the text reply path needs no MCP) but
-silently has zero tools. Rebuild, then **verify the dep actually landed** —
+`@band-ai/sdk` dependency**. The container loads the SDK lazily: if the image
+lacks it, the agent runs and keeps every other tool, but the agent container logs
+`[band] @band-ai/sdk unavailable — Band tools disabled. Rebuild the agent image (./container/build.sh).`
+and no `band_*` tool is registered, so the agent can't act in Band rooms.
+Rebuild, then **verify the dep actually landed**:
 `package.json` having it does not prove the image does (the image may predate the
 install, or buildkit may serve a stale COPY layer; see "Container Build Cache" in
 CLAUDE.md):
@@ -473,22 +511,21 @@ ncl destinations list --agent-group-id "$AGID" | grep -q "$BAND_MG" \
 ncl groups restart --id "$AGID"   # respawns with the Band destination in its prompt
 ```
 
-### Step 6 — Recognize the owner's Band identity (ask the access level)
+### Step 6 — Owner's Band identity (optional role)
 
-Wiring routes the room, but a sender still has to clear the agent group's **access
-gate**. When Band is added to an install that **already has an owner on another
-channel** (e.g. Telegram), the owner's *Band* identity — `band:<owner-uuid>` — is a
-brand-new platform id with **no role and no membership**, so their first Band
-message is dropped:
+Band rooms need **no access grant**. The adapter marks every Band messaging group
+`unknown_sender_policy='public'`, both at discovery and on every restart for a row
+created some other way (e.g. `setup --step register`). It auto-wires rooms with
+`sender_scope='all'`. Band's own room membership and mention gating decide who
+reaches the agent, so the owner's first Band message gets through even when
+their Band identity (`band:<owner-uuid>`) has no role, including on an install
+whose owner lives on another channel.
 
-```
-MESSAGE DROPPED — unknown sender (approval requested)  userId="band:<uuid>"  accessReason="not_member"
-```
-
-(The unknown-sender approval fallback can't even reach them if that other channel's
-adapter isn't loaded in this checkout.)
-
-Resolve the owner's Band UUID — try, in order:
+A role on that identity only matters for **privileged actions from Band**. Admin
+slash commands (`/clear`, `/compact`, `/context`, `/cost`, `/files`,
+`/upload-trace`) are checked against `user_roles`, and approval cards prefer an
+admin reachable on the platform the request came from. If the operator wants
+that from Band, resolve the owner's Band UUID. Try, in order:
 
 ```bash
 grep -oE 'ownerId="[0-9a-f-]+"' logs/nanoclaw.log | tail -1   # hub-creation log line
@@ -496,26 +533,17 @@ grep -E '^BAND_OWNER_ID=' .env                                # or explicit env
 ncl users list | grep '^band:'                                # or the auto-registered band: user
 ```
 
-(A `band:` user row auto-appears the instant a message arrives — **even when it was
-dropped** — so after a failed first attempt the identity is already in `ncl users
-list`.)
+Then **ask the operator which role to grant** (AskUserQuestion):
 
-Check whether that identity already has a role or membership; if not, **ask the
-operator what level to grant** (AskUserQuestion) — exactly as `/init-first-agent`
-does for the first channel:
+- **owner**: global, full control. The usual choice for the operator's own hub.
+  `ncl roles grant --user "band:<uuid>" --role owner`
+- **admin**: run admin commands and approve actions, globally or for one agent
+  group. `ncl roles grant --user "band:<uuid>" --role admin [--group <agent-group-id>]`
+- **none**: leave it. Messaging in Band rooms works without a role.
 
-- **owner** — global, full control. The right default when it's the operator's own
-  hub. `ncl roles grant --user "band:<uuid>" --role owner`
-- **admin** — manage groups + approve actions; global, or `--agent-group-id <id>`
-  to scope. `ncl roles grant --user "band:<uuid>" --role admin [--agent-group-id <id>]`
-- **member** — least privilege; this group only, no admin.
-  `ncl members add --user "band:<uuid>" --group <agent-group-id>`
-
-> The role/member verbs take `--user` / `--group` (**not** `--user-id` /
-> `--agent-group-id`, despite the field list those verbs print).
-
-A message that was **already dropped is not reprocessed** — have the operator send a
-fresh one after the grant.
+> `ncl roles grant` / `revoke` scope with `--group`. `--agent-group-id` (the column
+> name the verb's help prints) is rejected rather than silently granting a global
+> role.
 
 ### Step 7 — Verify end-to-end
 
@@ -610,11 +638,14 @@ pnpm exec tsx scripts/q.ts data/v2.db "SELECT id, channel_type, platform_id, nam
 pnpm exec tsx scripts/q.ts data/v2.db "SELECT messaging_group_id, agent_group_id, session_mode FROM messaging_group_agents"
 ```
 
-Your Band message is dropped — `MESSAGE DROPPED — unknown sender` /
-`accessReason="not_member"` in the logs → the sender's Band identity
-(`band:<uuid>`) has no role or membership on the wired agent group. Common when an
-owner already exists on another channel: their Band identity is a separate platform
-id. Grant access per **Step 6**, then resend (dropped messages are not reprocessed).
+Your Band message is dropped — `MESSAGE DROPPED — unknown sender` in the logs →
+the Band room is not `public`, or its wiring was changed to `sender_scope='known'`.
+Neither is a Band default. Check both, then restart the service so discovery
+re-asserts `public` (dropped messages are not reprocessed; resend):
+
+```bash
+pnpm exec tsx scripts/q.ts data/v2.db "SELECT mg.platform_id, mg.unknown_sender_policy, mga.sender_scope FROM messaging_groups mg LEFT JOIN messaging_group_agents mga ON mga.messaging_group_id = mg.id WHERE mg.channel_type='band'"
+```
 
 Agent replies but nothing shows up in Band — often paired with a
 `No adapter for channel type` warning and an outbound row whose `channel_type` is
@@ -626,9 +657,10 @@ the destination block in **Step 5**. Confirm with:
 ncl destinations list --agent-group-id <agent-group-id>   # expect a target_type=channel row for the Band messaging group
 ```
 
-Tools missing inside the container → confirm the session is Band-backed, that the
-image was rebuilt after the copy (Step 2), and that
-`container/agent-runner/src/mcp-tools/index.ts` imports `./band.js`.
+Tools missing inside the container → confirm the session is Band-backed, that
+`container/agent-runner/src/mcp-tools/index.ts` imports `./band.js`, and look for
+`[band] @band-ai/sdk unavailable — Band tools disabled` in the agent container's
+logs: that means the image predates the SDK install, so rebuild it (Step 2).
 
 Memory tools return disabled/unavailable → leave them disabled for that run; do
 not claim memory was stored unless a `band_store_memory` call succeeded.

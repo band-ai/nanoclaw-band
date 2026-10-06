@@ -11,10 +11,10 @@ source setup/lib/install-slug.sh   # launchd_label / systemd_unit / container_im
 ## 0. The agent image actually contains the Band files + SDK
 
 A slug-scoped image built **before** the Band files were copied — or before
-`@band-ai/sdk` was installed — breaks the container. The MCP barrel imports
-`band.js` unconditionally and `band.ts` imports `@band-ai/sdk` at load, so a missing
-dep throws and crashes the **whole MCP server** (every tool on every session, not
-just `band_*`); the agent still chats but has no tools. The build date alone is not
+`@band-ai/sdk` was installed — has no Band tools. The container loads the SDK
+lazily, so a missing dep doesn't take down the MCP server: every other tool still
+works, but the container logs `[band] @band-ai/sdk unavailable — Band tools
+disabled…` and the agent has no `band_*` tools. The build date alone is not
 enough — verify the image's contents directly:
 
 ```bash
@@ -43,7 +43,7 @@ dependency — rebuild.
 
 ```bash
 pnpm run build
-cd container/agent-runner && bun run typecheck && cd -
+pnpm exec tsc -p container/agent-runner/tsconfig.json --noEmit
 ```
 
 A clean build proves the **source** typechecks and the **host** tree resolves the

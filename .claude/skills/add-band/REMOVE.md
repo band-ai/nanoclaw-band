@@ -37,9 +37,13 @@ there is no core migration-barrel edit to revert.
 
 ## 3. Uninstall the dependencies
 
+The agent-runner tree is a Bun package; use the Bun release the image pins (no
+host Bun needed):
+
 ```bash
 pnpm remove @band-ai/sdk @band-ai/rest-client
-cd container/agent-runner && bun remove @band-ai/sdk && cd -
+BUN_VERSION=$(sed -n 's/^ARG BUN_VERSION=//p' container/Dockerfile)
+( cd container/agent-runner && pnpm dlx "bun@$BUN_VERSION" remove @band-ai/sdk )
 ```
 
 ## 4. Credentials, image, restart
