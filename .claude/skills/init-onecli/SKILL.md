@@ -56,10 +56,13 @@ If `@onecli-sh/sdk` is NOT in package.json, the codebase hasn't been updated to 
 
 ### Install the gateway and CLI
 
+Install through setup's OneCLI step. It installs the gateway and CLI at the versions pinned in `versions.json` (`onecli-gateway`, `onecli-cli`), points the CLI at the gateway, and writes `ONECLI_URL` to `.env`. Do not run the bare `onecli.sh` installers: without a pin they install whatever "latest" is, which is not the stack NanoClaw is tested against.
+
 ```bash
-curl -fsSL onecli.sh/install | sh
-curl -fsSL onecli.sh/cli/install | sh
+pnpm exec tsx setup/index.ts --step onecli
 ```
+
+The installer always uses the Docker Compose project `onecli`, so it takes over any existing `onecli_*` volumes on this host. If another OneCLI gateway here already serves other apps, run the step with `--reuse` instead: it keeps the running gateway and only records its URL. If the install fails with `Could not safely determine a bind address`, set `ONECLI_BIND_HOST` to the docker0 bridge IP (or install `iproute2` so the installer can detect it) and re-run.
 
 Verify: `onecli version`
 
@@ -73,18 +76,12 @@ grep -q '.local/bin' ~/.zshrc 2>/dev/null || echo 'export PATH="$HOME/.local/bin
 
 Re-verify with `onecli version`.
 
-### Configure the CLI
+### Read back ONECLI_URL
 
-Point the CLI at the local OneCLI instance, the ONECLI_URL was output from the install script above:
-
-```bash
-onecli config set api-host ${ONECLI_URL}
-```
-
-### Set ONECLI_URL in .env
+The step above already set the CLI's `api-host` and wrote `ONECLI_URL` to `.env`. Load it for the steps below:
 
 ```bash
-grep -q 'ONECLI_URL' .env 2>/dev/null || echo 'ONECLI_URL=${ONECLI_URL}' >> .env
+ONECLI_URL=$(grep '^ONECLI_URL=' .env | cut -d= -f2-)
 ```
 
 ### Wait for gateway readiness
