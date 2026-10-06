@@ -1,6 +1,22 @@
 import { getDb } from '../../db/connection.js';
 import { registerResource } from '../crud.js';
 
+/**
+ * Resolve a role's scope from `--group`. The table column is `agent_group_id`
+ * (and other verbs take `--agent-group-id`), so that flag is an easy mistake
+ * here — and silently ignoring it turns a scoped grant into a global one, or a
+ * scoped revoke into removing the global role. Reject it unless it agrees with
+ * `--group`, which is the case when the dispatcher auto-fills both for a
+ * group-scoped agent caller.
+ */
+function roleScope(args: Record<string, unknown>): string | null {
+  const groupId = (args.group as string) ?? null;
+  if (args.agent_group_id !== undefined && args.agent_group_id !== groupId) {
+    throw new Error('roles are scoped with --group <agent-group-id>; --agent-group-id is not supported');
+  }
+  return groupId;
+}
+
 registerResource({
   name: 'role',
   plural: 'roles',
@@ -33,7 +49,7 @@ registerResource({
       handler: async (args) => {
         const userId = args.user as string;
         const role = args.role as string;
-        const groupId = (args.group as string) ?? null;
+        const groupId = roleScope(args);
         const grantedBy = (args.granted_by as string) ?? null;
         if (!userId) throw new Error('--user is required');
         if (!role || !['owner', 'admin'].includes(role)) throw new Error('--role must be owner or admin');
@@ -57,7 +73,7 @@ registerResource({
       handler: async (args) => {
         const userId = args.user as string;
         const role = args.role as string;
-        const groupId = (args.group as string) ?? null;
+        const groupId = roleScope(args);
         if (!userId) throw new Error('--user is required');
         if (!role) throw new Error('--role is required');
         const result = await getDb().run(
