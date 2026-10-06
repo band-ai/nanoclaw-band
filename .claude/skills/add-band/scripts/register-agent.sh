@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 #
 # Register a Band external agent from a Band API key, using only curl + a JSON
-# parser. A portable, dependency-light alternative to the Hermes plugin's
-# hermes_band_platform/skills/add-band/scripts/register_agent.py: no Python SDK,
-# no hermes_cli, no cloned repo — so a bootstrap can mint a Band agent before it
-# installs anything (the same shape openclaw/bootstrap.sh uses).
+# parser — no Python SDK, no hermes_cli, no cloned repo — so a bootstrap can mint
+# a Band agent before it installs anything (the shape the nanoclaw/openclaw and
+# Hermes bootstraps use). The Hermes bootstrap evals this helper's output and
+# persists the agent-scoped pair through hermes_cli's env writer.
 #
-# Security: the key is read from $BAND_API_KEY (or its alias $BAND_USER_API_KEY,
-# never an argument) and handed to
+# Security: the key is read from $BAND_USER_API_KEY or $BAND_API_KEY (the
+# user-scoped name wins when both are set; never an argument) and handed to
 # curl through a --config heredoc on stdin, so it never appears in any process's
 # argv (`ps`). Only the returned agent-scoped id + key are printed; the Band API
 # key is never echoed.
@@ -17,7 +17,7 @@
 #   BAND_AGENT_API_KEY=<agent-key>
 #
 # Usage:
-#   export BAND_API_KEY=...                  # or BAND_USER_API_KEY, or paste at the prompt
+#   export BAND_USER_API_KEY=...             # or BAND_API_KEY (BAND_USER_API_KEY wins), or paste at the prompt
 #   eval "$(scripts/register-agent.sh)"      # prompts for name + description, then
 #                                            # sets BAND_AGENT_ID + BAND_AGENT_API_KEY
 #   eval "$(scripts/register-agent.sh --name MyBot --description 'A helpful bot')"
@@ -32,7 +32,10 @@
 #            prompt), BAND_USER_AGENT.
 set -euo pipefail
 
-name_default="Band agent"
+# Agent names are unique per account, so a fixed default fails with HTTP 422
+# ("name has been taken") on the second registration. Host + timestamp keeps the
+# default unique per run and inside Band's name rules (3-100 chars, no @ or /).
+name_default="Band Agent ($(hostname -s 2>/dev/null || echo local) $(date +%Y%m%d-%H%M%S))"
 desc_default="An agent on the Band platform."
 
 usage() {
@@ -47,8 +50,8 @@ Options:
   -d, --description DESC     agent description (prompted if omitted)
   -h, --help                 show this help and exit
 
-The Band API key is read from \$BAND_API_KEY (or \$BAND_USER_API_KEY), or
-pasted at the prompt.
+The Band API key is read from \$BAND_USER_API_KEY or \$BAND_API_KEY
+(\$BAND_USER_API_KEY wins when both are set), or pasted at the prompt.
 USAGE
 }
 
@@ -103,11 +106,14 @@ fi
 name=${name:-$name_default}
 desc=${desc:-$desc_default}
 
-# Read the Band API key: prompt on /dev/tty when unset (curl|bash makes stdin the
-# script), or accept a pre-set BAND_API_KEY (BAND_USER_API_KEY is honored as an
-# alias). The prompt writes to /dev/tty, not stdout, so it never pollutes the
-# eval-able output above.
-: "${BAND_API_KEY:=${BAND_USER_API_KEY:-}}"
+# Read the Band API key. BAND_USER_API_KEY (the explicit user-scoped name) wins
+# over BAND_API_KEY when both are set — integrations persist agent-scoped keys
+# under the name BAND_API_KEY in their .env files, and a stale one sourced into
+# the shell must not hijack the user-scoped key the caller was told to export.
+# When neither is set, prompt on /dev/tty (curl|bash makes stdin the script);
+# the prompt writes to /dev/tty, not stdout, so it never pollutes the eval-able
+# output above.
+BAND_API_KEY="${BAND_USER_API_KEY:-${BAND_API_KEY:-}}"
 if [ -z "${BAND_API_KEY:-}" ]; then
   [ -r /dev/tty ] || { echo "band: no terminal here to ask on — set BAND_API_KEY and run again." >&2; exit 1; }
   printf 'Paste your Band API key (hidden as you type): ' >/dev/tty
@@ -135,12 +141,26 @@ case "$code" in
   *) echo "band: registration failed (HTTP ${code:-?}): $(printf '%.300s' "$out")" >&2; exit 1 ;;
 esac
 
+# Find a Python 3 that actually runs. `command -v` alone is not enough:
+# Windows ships a python3.exe App Execution Alias that passes the lookup but
+# opens the Microsoft Store instead of executing, and a bare `python` may be
+# Python 2, whose print() would emit a tuple repr that corrupts the parsed
+# credentials — so probe with a version-checked run. Candidates are
+# word-split on purpose ("py -3" is a command plus its flag).
+find_python() {
+  local cand
+  for cand in python3 python "py -3"; do
+    if $cand -c 'import sys; sys.exit(sys.version_info[0] != 3)' >/dev/null 2>&1; then printf '%s' "$cand"; return 0; fi
+  done
+  return 1
+}
+
 # Pull the agent id + key from the response shapes Band may return.
 if command -v jq >/dev/null 2>&1; then
   id=$(printf '%s' "$out" | jq -r '.data.agent.id // .agent.id // .data.id // .agent_id // .id // empty')
   key=$(printf '%s' "$out" | jq -r '.data.credentials.api_key // .credentials.api_key // .data.api_key // .api_key // .key // .token // empty')
-elif command -v python3 >/dev/null 2>&1; then
-  read -r id key < <(printf '%s' "$out" | python3 -c '
+elif py=$(find_python); then
+  read -r id key < <(printf '%s' "$out" | $py -c '
 import sys, json
 d = json.load(sys.stdin)
 def g(*path):
@@ -155,7 +175,7 @@ k = g("data","credentials","api_key") or g("credentials","api_key") or g("data",
 print(str(i).strip(), str(k).strip())
 ')
 else
-  echo "band: need jq or python3 to parse the registration response" >&2
+  echo "band: need jq or a working Python (python3 / python / py -3) to parse the registration response" >&2
   exit 1
 fi
 
