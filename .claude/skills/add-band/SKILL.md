@@ -17,6 +17,14 @@ channel-migration registry, container lifecycle hooks, and user-visible-tool
 registry — already live in trunk, so nothing in core changes. The Band channel
 migrations register themselves on import.
 
+## Band authentication recovery
+
+Successful setup asks no deployment questions. A Band HTTP 401/403 at registration,
+startup, or verification enters [recovery](reference/configuration.md#authentication-recovery)
+before any generic stop or retry. Ask missing context through `AskUserQuestion`
+with free-text input, or ordinary chat when unavailable. Provider authentication
+and ordinary timeouts follow their own investigation.
+
 ## Before you start (decide once, then run autonomously)
 
 This skill is **pointed**: it auto-detects state and only stops for the few
@@ -270,6 +278,11 @@ message round-trip — don't stop at the build.
 
 ### Step 1 — Credentials (detect → skip / register / rotate)
 
+First apply [connection settings](reference/configuration.md#connection-settings)
+from existing environment/configuration, with cloud defaults when absent. This
+exports the registration destination, initializes `BAND_HOST` for vault commands,
+and persists the base for startup. It adds no deployment questions on success.
+
 The host adapter reads an **agent-scoped** key from `.env`. **`register-agent.sh`
 is not idempotent — each run mints a brand-new Band agent (new id + key).** So
 gate on an existing key (Phase 0 already told you which case you're in):
@@ -280,7 +293,7 @@ gate on an existing key (Phase 0 already told you which case you're in):
   key, see *Re-register or rotate* at the end of this step.)
 
 - **Key missing → register one.** This needs a **create-scope** Band API key
-  (app.band.ai → Settings → API Keys), used only to mint the agent. The operator
+  (the established Band site → Settings → API Keys), used only to mint the agent. The operator
   pastes it at the prompt — never on `argv`, never `eval` the create-scope key:
 
   ```bash
@@ -305,7 +318,7 @@ gate on an existing key (Phase 0 already told you which case you're in):
      ```bash
      KEY=$(grep -E '^(BAND|THENVOI)_(AGENT_)?API_KEY=' .env | head -1 | cut -d= -f2-)
      onecli secrets create --name Band --type generic --value "$KEY" \
-       --host-pattern app.band.ai --header-name X-API-Key --value-format '{value}'
+       --host-pattern "$BAND_HOST" --header-name X-API-Key --value-format '{value}'
      ```
 
      The agent's OneCLI `secretMode` must be `all` (or assign this secret to it).
@@ -328,7 +341,11 @@ Memory pre-load/consolidation and contact-event handling are off by default
 
 #### Re-register or rotate the key
 
-The skip-on-existing-key gate assumes the key in `.env` is live. Two resets:
+The skip-on-existing-key gate assumes the key in `.env` is live. On Band 401/403,
+complete [recovery](reference/configuration.md#authentication-recovery) first.
+For every rotation, including routine rotation without an error, apply
+[connection settings](reference/configuration.md#connection-settings) before the
+vault commands. Preserve credentials from any other deployment separately. Two resets:
 
 - **Rotate, same agent** — you regenerated the key on Band; the agent still
   exists. Put the new key in `.env` (`BAND_AGENT_API_KEY`), then point the vault
@@ -337,7 +354,7 @@ The skip-on-existing-key gate assumes the key in `.env` is live. Two resets:
   ```bash
   onecli secrets list                 # find the "Band" secret id
   onecli secrets update --id <secret-id> --value "$NEW_KEY" \
-    --host-pattern app.band.ai --header-name X-API-Key --value-format '{value}'
+    --host-pattern "$BAND_HOST" --header-name X-API-Key --value-format '{value}'
   ```
 
 - **Dead agent → mint fresh** — you deleted the agent on Band (the `.env` key is
