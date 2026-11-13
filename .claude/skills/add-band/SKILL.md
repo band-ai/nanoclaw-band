@@ -278,6 +278,11 @@ message round-trip — don't stop at the build.
 
 ### Step 1 — Credentials (detect → skip / register / rotate)
 
+First apply [connection settings](reference/configuration.md#connection-settings)
+from existing environment/configuration, with cloud defaults when absent. This
+exports the registration destination, initializes `BAND_HOST` for vault commands,
+and persists the base for startup. It adds no deployment questions on success.
+
 The host adapter reads an **agent-scoped** key from `.env`. **`register-agent.sh`
 is not idempotent — each run mints a brand-new Band agent (new id + key).** So
 gate on an existing key (Phase 0 already told you which case you're in):
@@ -288,7 +293,7 @@ gate on an existing key (Phase 0 already told you which case you're in):
   key, see *Re-register or rotate* at the end of this step.)
 
 - **Key missing → register one.** This needs a **create-scope** Band API key
-  (app.band.ai → Settings → API Keys), used only to mint the agent. The operator
+  (the established Band site → Settings → API Keys), used only to mint the agent. The operator
   pastes it at the prompt — never on `argv`, never `eval` the create-scope key:
 
   ```bash
@@ -337,8 +342,9 @@ Memory pre-load/consolidation and contact-event handling are off by default
 #### Re-register or rotate the key
 
 The skip-on-existing-key gate assumes the key in `.env` is live. On Band 401/403,
-complete [recovery](reference/configuration.md#authentication-recovery) first;
-confirm the deployment and set `BAND_HOST` from its connection URL before these
+complete [recovery](reference/configuration.md#authentication-recovery) first.
+For every rotation, including routine rotation without an error, apply
+[connection settings](reference/configuration.md#connection-settings) before the
 vault commands. Preserve credentials from any other deployment separately. Two resets:
 
 - **Rotate, same agent** — you regenerated the key on Band; the agent still

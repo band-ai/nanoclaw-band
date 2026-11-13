@@ -4,6 +4,30 @@ Deep configuration for memory and contact-event handling, plus the optional
 outbound-origination Band MCP. All default to off — the base `/add-band` install
 does not need any of this.
 
+## Connection settings
+
+Before registration, vault creation/rotation, or optional MCP configuration,
+resolve the existing connection base without asking deployment questions. Use the
+first nonempty value in runtime order: process `BAND_BASE_URL`, process
+`THENVOI_BASE_URL`, `.env` `BAND_BASE_URL`, `.env` `THENVOI_BASE_URL`, then
+`https://app.band.ai`. Read only those settings as data, without sourcing `.env`
+or printing credentials. If the selected value comes from `.env`, export it as
+`BAND_BASE_URL` for the commands below. After authentication recovery, use the
+confirmed replacement value and remove stale overrides instead.
+
+Run this in the same shell as registration and the vault commands:
+
+```bash
+export BAND_BASE_URL="${BAND_BASE_URL:-${THENVOI_BASE_URL:-https://app.band.ai}}"
+BAND_HOST=$(node -e 'process.stdout.write(new URL(process.env.BAND_BASE_URL).host)') || exit 1
+```
+
+Keep `BAND_BASE_URL` with the agent credentials in `.env` and align the service's
+active environment. The registration helper reads the exported base; the vault
+commands use `BAND_HOST`; the host and container runtime read the persisted base.
+A successful setup uses these existing settings without entering authentication
+recovery. The browser site is not an alternative source for API paths.
+
 ## Authentication recovery
 
 For a Band 401/403 during setup, follow the [shared recovery guide](https://github.com/band-ai/add-band/blob/main/ONBOARDING-RECOVERY.md)
@@ -26,12 +50,9 @@ versus HTTPS, but derives REST origin and `/api/v1/socket` on the same host. Arb
 independent REST/WS hosts or prefixes are unsupported; seek compatible administrator
 settings rather than inventing variables. Use the known browser site for UI links.
 
-Before the skill's vault commands, set `BAND_HOST` to the host of the confirmed
-connection URL (never a guessed host). After exporting that confirmed base:
-
-```bash
-BAND_HOST=$(node -e 'process.stdout.write(new URL(process.env.BAND_BASE_URL).host)')
-```
+Apply [connection settings](#connection-settings) with the confirmed base before
+any vault update. Keep each agent key bound to its existing deployment; if the
+destination changes, reconcile the appropriate identity first as described below.
 
 Update the existing Band vault secret's host
 pattern and preserve its protections/assignments. The host adapter reads `.env`;
@@ -145,9 +166,8 @@ policy — check the PyPI release date and pin deliberately when bumping.)
 Band's API authenticates with the **`X-API-Key`** header. `Authorization: Bearer
 <key>` returns `401 "Invalid JWT token"` — the README's curl example is misleading.
 Create the vault secret accordingly, reading the key from `.env` (never paste it).
-Set `BAND_HOST` from the confirmed connection URL as described in
-[authentication recovery](#authentication-recovery), using existing configuration
-without extra questions on successful setup:
+Apply [connection settings](#connection-settings) before the vault command,
+using existing configuration without extra questions on successful setup:
 
 ```bash
 KEY=$(grep -E '^(BAND|THENVOI)_(AGENT_)?API_KEY=' .env | head -1 | cut -d= -f2-)
