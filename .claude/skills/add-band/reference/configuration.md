@@ -4,6 +4,57 @@ Deep configuration for memory and contact-event handling, plus the optional
 outbound-origination Band MCP. All default to off — the base `/add-band` install
 does not need any of this.
 
+## Authentication recovery
+
+For a Band 401/403 during setup, follow the [shared recovery guide](https://github.com/band-ai/add-band/blob/main/ONBOARDING-RECOVERY.md)
+before retrying. Reuse known context and compare the destination actually used.
+If the guide cannot be loaded, ask only missing context: “Band rejected the request.
+The key or Band address may be different. What website do you normally open to use
+Band?” Explain why the comparison helps. A browser address does not establish API
+paths; resolve them from deployment documentation or available configuration.
+If details are missing, offer: “I use Band at <website>. Please send connection
+details compatible with NanoClaw's Band integration and how to obtain an agent-create
+key for that site.” When the destination is confirmed but still rejects, verify
+same-site key provenance, permission, and OneCLI host/secret assignment. Do not
+infer revocation or a separate deployment from the error alone.
+
+Configure the confirmed `BAND_BASE_URL` for the user in `.env` and the active
+registration/service environment. Inspect `THENVOI_BASE_URL` too: process variables
+(including legacy ones) override persisted values. Replace or clear stale overrides,
+including an explicit cloud value on return to cloud. The runtime preserves HTTP
+versus HTTPS, but derives REST origin and `/api/v1/socket` on the same host. Arbitrary
+independent REST/WS hosts or prefixes are unsupported; seek compatible administrator
+settings rather than inventing variables. Use the known browser site for UI links.
+
+Before the skill's vault commands, set `BAND_HOST` to the host of the confirmed
+connection URL (never a guessed host). After exporting that confirmed base:
+
+```bash
+BAND_HOST=$(node -e 'process.stdout.write(new URL(process.env.BAND_BASE_URL).host)')
+```
+
+Update the existing Band vault secret's host
+pattern and preserve its protections/assignments. The host adapter reads `.env`;
+its container contribution derives `BAND_REST_URL`. Update optional MCP settings
+below too when installed, through the group's supported config interface.
+Restart the host and affected groups, then verify an actual reply in Band.
+
+Preserve successful registrations and their destination. An existing-key gate must
+not skip endpoint repairs. If the destination changes, retain/report the old identity
+separately and reconcile credentials on the confirmed site before continuing; never
+send the old site's key to the new site. After interruption or an uncertain POST,
+check the site's existing agents in UI/configuration before creating anything else.
+A name conflict requires the same reconciliation. Stop dependent work on cancellation;
+do not blindly retry, delete agents, or echo credential-bearing responses.
+
+After a bootstrap failure,
+`env -u BAND_USER_API_KEY -u BAND_API_KEY -u BAND_AGENT_API_KEY claude /add-band`
+starts this recovery without inherited keys. Obtain any replacement secret
+through the existing local hidden prompt, never chat or LLM environment. If no
+assistant is available, give the guide and administrator request without retrying.
+Once repaired, resume only unfinished steps. LLM-provider failures and ordinary
+reply timeouts are separate; neither alone justifies deployment questions.
+
 ## Memory knobs
 
 ```bash
@@ -93,20 +144,28 @@ policy — check the PyPI release date and pin deliberately when bumping.)
 
 Band's API authenticates with the **`X-API-Key`** header. `Authorization: Bearer
 <key>` returns `401 "Invalid JWT token"` — the README's curl example is misleading.
-Create the vault secret accordingly, reading the key from `.env` (never paste it):
+Create the vault secret accordingly, reading the key from `.env` (never paste it).
+Set `BAND_HOST` from the confirmed connection URL as described in
+[authentication recovery](#authentication-recovery), using existing configuration
+without extra questions on successful setup:
 
 ```bash
 KEY=$(grep -E '^(BAND|THENVOI)_(AGENT_)?API_KEY=' .env | head -1 | cut -d= -f2-)
 onecli secrets create --name Band --type generic --value "$KEY" \
-  --host-pattern app.band.ai --header-name X-API-Key --value-format '{value}'
+  --host-pattern "$BAND_HOST" --header-name X-API-Key --value-format '{value}'
 ```
 
 The agent's OneCLI `secretMode` must be `all` (or assign this secret explicitly).
 No raw key enters the container: the MCP sends the stub `onecli-managed`, and the
-gateway replaces `X-API-Key` on egress to `app.band.ai`. band-mcp uses `httpx`,
+gateway replaces `X-API-Key` on egress to the confirmed host. band-mcp uses `httpx`,
 which honors the gateway's `SSL_CERT_FILE` and `HTTPS_PROXY` automatically.
 
-### 3. Wire into the global agent group's `container.json`
+### 3. Wire into the global agent group's configuration
+
+The JSON below illustrates cloud defaults. Set both base URL entries to the
+confirmed connection URL, preserving the stub credentials. Use `ncl groups config`
+or the supported self-mod flow; `container.json` is materialized from group config
+at spawn, so editing only that generated file does not persist the repair.
 
 ```jsonc
 "mcpServers": {
@@ -124,7 +183,7 @@ which honors the gateway's `SSL_CERT_FILE` and `HTTPS_PROXY` automatically.
 ```
 
 Cleaner still: add it via the `add_mcp_server` self-mod flow (single admin
-approval, restarts the group) rather than hand-editing `container.json`.
+approval, restarts the group) through the supported group configuration.
 
 Tools surface as `mcp__band__*` and are auto-allowlisted (the runner maps each
 configured MCP server name to an allow pattern) — no `claude.ts` edit needed.

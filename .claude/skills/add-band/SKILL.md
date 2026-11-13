@@ -17,6 +17,14 @@ channel-migration registry, container lifecycle hooks, and user-visible-tool
 registry — already live in trunk, so nothing in core changes. The Band channel
 migrations register themselves on import.
 
+## Band authentication recovery
+
+Successful setup asks no deployment questions. A Band HTTP 401/403 at registration,
+startup, or verification enters [recovery](reference/configuration.md#authentication-recovery)
+before any generic stop or retry. Ask missing context through `AskUserQuestion`
+with free-text input, or ordinary chat when unavailable. Provider authentication
+and ordinary timeouts follow their own investigation.
+
 ## Before you start (decide once, then run autonomously)
 
 This skill is **pointed**: it auto-detects state and only stops for the few
@@ -305,7 +313,7 @@ gate on an existing key (Phase 0 already told you which case you're in):
      ```bash
      KEY=$(grep -E '^(BAND|THENVOI)_(AGENT_)?API_KEY=' .env | head -1 | cut -d= -f2-)
      onecli secrets create --name Band --type generic --value "$KEY" \
-       --host-pattern app.band.ai --header-name X-API-Key --value-format '{value}'
+       --host-pattern "$BAND_HOST" --header-name X-API-Key --value-format '{value}'
      ```
 
      The agent's OneCLI `secretMode` must be `all` (or assign this secret to it).
@@ -328,7 +336,10 @@ Memory pre-load/consolidation and contact-event handling are off by default
 
 #### Re-register or rotate the key
 
-The skip-on-existing-key gate assumes the key in `.env` is live. Two resets:
+The skip-on-existing-key gate assumes the key in `.env` is live. On Band 401/403,
+complete [recovery](reference/configuration.md#authentication-recovery) first;
+confirm the deployment and set `BAND_HOST` from its connection URL before these
+vault commands. Preserve credentials from any other deployment separately. Two resets:
 
 - **Rotate, same agent** — you regenerated the key on Band; the agent still
   exists. Put the new key in `.env` (`BAND_AGENT_API_KEY`), then point the vault
@@ -337,7 +348,7 @@ The skip-on-existing-key gate assumes the key in `.env` is live. Two resets:
   ```bash
   onecli secrets list                 # find the "Band" secret id
   onecli secrets update --id <secret-id> --value "$NEW_KEY" \
-    --host-pattern app.band.ai --header-name X-API-Key --value-format '{value}'
+    --host-pattern "$BAND_HOST" --header-name X-API-Key --value-format '{value}'
   ```
 
 - **Dead agent → mint fresh** — you deleted the agent on Band (the `.env` key is
